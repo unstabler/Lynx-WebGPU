@@ -17,12 +17,14 @@ Lynx 연동: `docs/LYNX-INTEGRATION.md` · 번들(JS) 작성: `docs/JS-AUTHORING
 ```zsh
 # macOS 개발 루프 — Lynx 없이 엔진/트랜스파일러만 빌드·테스트 (가장 빠르다)
 swift build
-swift test                                   # 92개 테스트, ~7초
+swift test                                   # 106개 테스트, ~7초
 swift test --filter LynxWebGPUShaderTests    # WGSL → MSL 트랜스파일러만
 swift test --filter RenderPipelineTests      # GPU 오프스크린 렌더 검증
 
-# JS 클라이언트(shim) 테스트 — 의존성 없음, node 내장 러너
-cd JS && npm test
+# JS 클라이언트(shim) — 런타임 의존성 0. TypeScript는 **검사·선언 생성 전용**이다 (빌드 산출물 없음)
+cd JS && npm test            # node 내장 러너, 17개
+cd JS && npm run typecheck   # JSDoc 기준 타입 검사 (tsc --noEmit)
+cd JS && npm run types       # webgpu.d.ts 를 JSDoc에서 다시 생성
 
 # iOS 컴파일 확인 — Lynx 브리지 포함 (SPM 크로스 빌드)
 # 루트에 Tuist 워크스페이스(LynxWebGPUDemo.xcworkspace)가 있으면 xcodebuild가 패키지 스킴
@@ -86,9 +88,12 @@ Tests/
 ├── LynxWebGPUCoreTests/    — 디스크립터 디코딩, 핸들 레지스트리
 ├── LynxWebGPUShaderTests/  — 트랜스파일 + **실제 Metal 컴파일러 통과 검증**(MetalCompilerHarness)
 └── LynxWebGPUTests/        — 오프스크린 GPU 렌더 검증(RenderHarness) + 커맨드 해석기 계약
-JS/                     — webgpu.js(클라이언트 shim) / webgpu.d.ts / elements.d.ts
+JS/                     — webgpu.js(클라이언트 shim) / webgpu.d.ts(**JSDoc에서 생성**) / elements.d.ts
+                          lynx-env.d.ts(호스트 전역·네이티브 모듈 선언) · tsconfig.json(검사·선언 생성 전용)
+                          tests/(node:test — 코덱·캔버스 크기·수명)
 Examples/HelloTriangle.tsx  — ReactLynx 최소 예제
 Projects/WebGPUDemo/    — Tuist 데모 호스트 앱 (Sources/) + 데모 번들 rspeedy 소스 (DemoSrc/)
+                          Tools/ — 빌드 시점 애셋 변환 (HDR HEIC → GPU가 바로 먹는 바이너리)
 Tuist.swift · Workspace.swift — 데모 앱 전용. 라이브러리 자체는 SPM만으로 완결된다
 docs/                   — ARCHITECTURE / WEBGPU-API / WGSL / LYNX-INTEGRATION / JS-AUTHORING / TESTING
 .claude/skills/         — webgpu-command / wgsl-feature / gpu-smoke
@@ -124,6 +129,25 @@ git tag -a 0.2.0 -m "0.2.0 — 요약"
   JS 스레드와 메인 스레드가 공유하므로, 컴파일러 격리 대신 `WGPUObjectRegistry`/컨텍스트의 명시적 락으로 동시성을 보장한다.
 - **커맨드 실행은 JS 스레드에서 그대로 한다.** Metal 인코딩은 메인 스레드를 요구하지 않으므로 넘기면 UI와 경쟁만 한다.
   단 `CAMetalLayer` 프로퍼티 설정은 메인 스레드 전용이라 **비동기**로 넘긴다 (`main.sync`는 교착 위험 — `WGPUMetalLayerSurface` 참고).
+- **`JS/webgpu.js`를 고치면 JSDoc을 반드시 함께 쓰거나 갱신한다.** 공개 선언 `JS/webgpu.d.ts`는
+  손으로 쓰는 파일이 아니라 **JSDoc에서 뽑아내는 산출물**이다 (`cd JS && npm run types`).
+  - **고쳤으면 반드시 이 두 개를 직접 돌린다** — 훅이 대신해 주지 않는다:
+    ```zsh
+    cd JS && npm run typecheck   # JSDoc이 빠졌으면 여기서 걸린다
+    cd JS && npm run types       # webgpu.d.ts 재생성
+    ```
+    타입 없이 커밋하면 `npm run typecheck`가 CI/다음 작업에서 터지고, `npm run types`를
+    빠뜨리면 공개 선언이 구현보다 뒤처진다 (지금까지 실제로 반복된 드리프트다).
+  - **파일에 `// @ts-check`를 넣지 말 것.** 데모(`Projects/WebGPUDemo/DemoSrc/src/`)가 이 파일을
+    복사해 쓰는데 거기엔 `lynx-env.d.ts`가 없어 빌드가 깨진다. 검사는 `JS/tsconfig.json`의
+    `checkJs`가 켠다.
+  - 호스트 전역(`NativeModules.WebGPU` 등)의 시그니처는 `JS/lynx-env.d.ts`에 있고,
+    **`WebGPUNativeModule.swift`의 `methodLookup`과 짝이 맞아야 한다.** 한쪽만 고치면 런타임에 깨진다.
+  - shim을 고쳤으면 데모 사본도 맞춘다:
+    `cp JS/webgpu.js JS/webgpu.d.ts Projects/WebGPUDemo/DemoSrc/src/`
+- **커맨드 스트림의 필드 이름은 타입 검사가 잡아 주지 않는다.** JS는 `Record<string, any>`로 싣고
+  Swift는 문자열 키로 읽으므로, 이름이 어긋나도 양쪽 다 컴파일된다. op를 추가·수정할 때는
+  `.claude/skills/webgpu-command/SKILL.md`의 순서를 그대로 따라 양쪽을 함께 고칠 것.
 - 트랜스파일러를 고칠 때는 **반드시 `MetalCompilerHarness.assertCompiles`가 붙은 테스트**를 추가한다.
   문자열만 맞고 컴파일이 안 되는 MSL을 막기 위한 장치다.
 - Metal 검증 레이어는 디스크립터 `label`에 nil을 넣으면 단언으로 죽는다. `if let label = …` 로 감쌀 것.
@@ -139,6 +163,9 @@ git tag -a 0.2.0 -m "0.2.0 — 요약"
   "번들이 없다"를 띄운다** — glob은 생성 시점에 펼쳐진다. 라이브러리 쪽은 SPM이라 재생성이 필요 없다.
 - **시뮬레이터에는 터치 주입 수단이 없다** (`simctl`에 탭 API가 없고 `osascript` 클릭은 접근성 권한이 필요).
   터치로만 보이는 상태는 런치 인자로 고정해 캡처한다 (`-cardTilt` 참고 — initData로 JS까지 전달된다).
+- **EDR(HDR 출력)은 시뮬레이터에서 확인할 수 없다.** 실기기 디스플레이 기능이라 스크린샷에도
+  안 잡힌다. `hdr` 씬의 EDR 버튼은 실기기에서만 의미가 있다 (`docs/WEBGPU-API.md` §2).
+  값이 실제로 1.0을 넘는지는 같은 씬의 **클리핑 표시**로 확인한다 — 그건 화면과 무관하다.
 - **`<webgpu-canvas>`의 터치는 Lynx 표준 이벤트를 쓴다** (`bindtouchstart` 등). UIKit `touchesBegan`을
   가로채면 Lynx의 hitTest·pointer-events·버블링·제스처 아레나를 우회해 웹과 다르게 동작한다
   (`docs/LYNX-INTEGRATION.md` §5).

@@ -17,6 +17,9 @@ export default defineConfig({
       msl: './src/msl/index.tsx',
       interactive: './src/interactive/index.tsx',
       wgsl: './src/wgsl/index.tsx',
+      arraybuffer: './src/arraybuffer/index.tsx',
+      bench: './src/bench/index.tsx',
+      hdr: './src/hdr/index.tsx',
     },
   },
   output: {
