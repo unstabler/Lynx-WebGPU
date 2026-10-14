@@ -41,6 +41,8 @@ public final class WGPUMetalBackend: WGPUBackend {
     private var renderEncoder: MTLRenderCommandEncoder?
     private var computeEncoder: MTLComputeCommandEncoder?
     private var blitEncoder: MTLBlitCommandEncoder?
+    /// The pipeline set in the **open** pass — both are cleared when a pass opens or closes, so one
+    /// pass type's pipeline never leaks into the next pass of the other type within the same batch.
     private var currentRenderPipeline: WGPURenderPipelineObject?
     private var currentComputePipeline: WGPUComputePipelineObject?
     /// Binding size per Metal buffer index — `arrayLength()` looks it up in this table.
@@ -188,6 +190,8 @@ public final class WGPUMetalBackend: WGPUBackend {
         computeEncoder = nil
         blitEncoder?.endEncoding()
         blitEncoder = nil
+        currentRenderPipeline = nil
+        currentComputePipeline = nil
     }
 
     /// The pass-scope target for debug groups and markers — blit is excluded as an internal encoder
@@ -575,6 +579,7 @@ public final class WGPUMetalBackend: WGPUBackend {
         if let label = pass.label { encoder.label = label }
         renderEncoder = encoder
         currentRenderPipeline = nil
+        currentComputePipeline = nil
     }
 
     public func beginComputePass(_ pass: WGPUResolvedComputePass<WGPUMetalBackend>) throws {
@@ -599,6 +604,7 @@ public final class WGPUMetalBackend: WGPUBackend {
         }
         if let label = pass.label { encoder.label = label }
         computeEncoder = encoder
+        currentRenderPipeline = nil
         currentComputePipeline = nil
     }
 
@@ -625,7 +631,11 @@ public final class WGPUMetalBackend: WGPUBackend {
     }
 
     public func applyBindGroup(_ group: WGPUMetalBindGroup, at groupIndex: Int, dynamicOffsets: [Int]) throws {
-        guard let layout = currentRenderPipeline?.layout ?? currentComputePipeline?.layout else { return }
+        // The layout comes from the open pass's own pipeline — never "whichever is set": a render
+        // pipeline left over from an earlier pass would map a compute pass's groups to its own Metal
+        // indices (silently wrong bindings, or a bogus "no @group" error that drops the dispatch).
+        let layout = renderEncoder != nil ? currentRenderPipeline?.layout : currentComputePipeline?.layout
+        guard let layout else { return }
         var offsetCursor = 0
         for binding in group.bindings {
             guard let metalIndex = layout.assignment.index(group: groupIndex, binding: binding.binding) else {
