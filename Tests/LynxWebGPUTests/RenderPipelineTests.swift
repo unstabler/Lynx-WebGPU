@@ -654,6 +654,105 @@ final class RenderPipelineTests: XCTestCase {
         try harness.assertPixel(x: 32, y: 32, equals: (255, 0, 0, 255), "the front one (red) must remain")
     }
 
+    // MARK: - Depth bias
+
+    /// Two full-screen triangles at the same depth (0.5): red and green.
+    private static let depthBiasShader = """
+    @vertex
+    fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+        var positions = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+        return vec4f(positions[index], 0.5, 1.0);
+    }
+    @fragment
+    fn fs_red() -> @location(0) vec4f {
+        return vec4f(1.0, 0.0, 0.0, 1.0);
+    }
+    @fragment
+    fn fs_green() -> @location(0) vec4f {
+        return vec4f(0.0, 1.0, 0.0, 1.0);
+    }
+    """
+
+    /// Pipeline 4 (red) pushes its fragments back with a large `depthBias`; pipeline 5 (green) has none.
+    /// The depth buffer is cleared to 0.6 with compare `less`, so at depth 0.5:
+    /// - red only passes **without** its bias (0.5 + bias ≥ 0.6 is rejected);
+    /// - green only passes **without** a bias (it must not inherit red's).
+    /// Drawing red then green therefore leaves green. Black = green inherited the bias, red = the bias never applied.
+    private func depthBiasResources() -> [[String: Any]] {
+        // Constant bias on a float depth format is scaled by 2^(e - 23) — 2^-24 at depth 0.5 — so this
+        // moves red by ~0.6, far past the 0.1 margin. An implementation that clamps to 1.0 rejects it too.
+        let depthBias = 10_000_000
+        return [
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+            ["op": "createShaderModule", "id": 1, "code": Self.depthBiasShader],
+            ["op": "createTexture", "id": 2, "size": ["width": 64, "height": 64],
+             "format": "depth32float", "usage": TestUsage.renderAttachment],
+            ["op": "createTextureView", "id": 3, "texture": 2],
+            ["op": "createRenderPipeline", "id": 4, "layout": "auto",
+             "vertex": ["module": 1, "entryPoint": "vs_main"],
+             "fragment": ["module": 1, "entryPoint": "fs_red", "targets": [["format": "rgba8unorm"]]],
+             "depthStencil": ["format": "depth32float", "depthWriteEnabled": true, "depthCompare": "less",
+                              "depthBias": depthBias]],
+            ["op": "createRenderPipeline", "id": 5, "layout": "auto",
+             "vertex": ["module": 1, "entryPoint": "vs_main"],
+             "fragment": ["module": 1, "entryPoint": "fs_green", "targets": [["format": "rgba8unorm"]]],
+             "depthStencil": ["format": "depth32float", "depthWriteEnabled": true, "depthCompare": "less"]],
+            ["op": "getCurrentTexture", "id": 10, "canvas": "test"],
+            ["op": "createTextureView", "id": 11, "texture": 10],
+        ]
+    }
+
+    private let depthBiasPass: [String: Any] = [
+        "op": "beginRenderPass",
+        "colorAttachments": [[
+            "view": 11, "loadOp": "clear", "storeOp": "store",
+            "clearValue": ["r": 0, "g": 0, "b": 0, "a": 1],
+        ]],
+        "depthStencilAttachment": [
+            "view": 3, "depthClearValue": 0.6, "depthLoadOp": "clear", "depthStoreOp": "store",
+        ],
+    ]
+
+    func test_aPipelineWithoutDepthBiasDoesNotInheritThePreviousPipelinesBias() throws {
+        // Metal's depth bias is encoder state that outlives `setRenderPipelineState` — in WebGPU it
+        // belongs to the pipeline, so the second pipeline in the same pass must draw unbiased.
+        harness.executeExpectingSuccess(depthBiasResources() + [
+            depthBiasPass,
+            ["op": "setPipeline", "pipeline": 4],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "setPipeline", "pipeline": 5],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+        ])
+
+        try harness.assertPixel(
+            x: 32, y: 32, equals: (0, 255, 0, 255),
+            "green must draw unbiased (black = it inherited red's depthBias, red = the bias never applied)"
+        )
+    }
+
+    func test_aBundlePipelineWithoutDepthBiasDoesNotInheritThePassPipelinesBias() throws {
+        // The same carry-over across a bundle boundary — the replayed `setPipeline` goes down the same path.
+        harness.executeExpectingSuccess(depthBiasResources() + [
+            ["op": "createRenderBundle", "id": 12, "colorFormats": ["rgba8unorm"],
+             "depthStencilFormat": "depth32float",
+             "commands": [
+                ["op": "setPipeline", "pipeline": 5],
+                ["op": "draw", "vertexCount": 3],
+             ]],
+            depthBiasPass,
+            ["op": "setPipeline", "pipeline": 4],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "executeBundles", "bundles": [12]],
+            ["op": "endPass"],
+        ])
+
+        try harness.assertPixel(
+            x: 32, y: 32, equals: (0, 255, 0, 255),
+            "the bundle's green must draw unbiased (black = it inherited the pass pipeline's depthBias)"
+        )
+    }
+
     // MARK: - HDR readback
 
     func test_anRGBA16FloatSurfaceDoesNotLoseValuesOutsideSDR() throws {

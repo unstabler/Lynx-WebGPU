@@ -607,14 +607,19 @@ public final class WGPUMetalBackend: WGPUBackend {
         encoder.setRenderPipelineState(pipeline.state)
         encoder.setCullMode(pipeline.cullMode)
         encoder.setFrontFacing(pipeline.winding)
+        // Only pipelines with `depthStencil` carry a state object. In valid WebGPU its format must match
+        // the pass's depth attachment, so within one encoder either every pipeline has one or none does —
+        // a fresh encoder starts from Metal's default. (The engine does not check that match itself; the
+        // Metal validation layer does.)
         if let depthStencilState = pipeline.depthStencilState {
             encoder.setDepthStencilState(depthStencilState)
         }
-        if pipeline.depthBias != 0 || pipeline.depthBiasSlopeScale != 0 {
-            encoder.setDepthBias(
-                pipeline.depthBias, slopeScale: pipeline.depthBiasSlopeScale, clamp: pipeline.depthBiasClamp
-            )
-        }
+        // Depth bias is pipeline state in WebGPU but sticky encoder state in Metal — it survives
+        // `setRenderPipelineState`. Set it **unconditionally** (zeros for a pipeline without bias), or a
+        // pipeline without bias drawn after a shadow/decal pipeline inherits that pipeline's offset.
+        encoder.setDepthBias(
+            pipeline.depthBias, slopeScale: pipeline.depthBiasSlopeScale, clamp: pipeline.depthBiasClamp
+        )
         currentRenderPipeline = pipeline
     }
 
