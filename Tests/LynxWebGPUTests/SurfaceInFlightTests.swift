@@ -146,6 +146,70 @@ final class SurfaceInFlightTests: XCTestCase {
         XCTAssertTrue(context.isReadyForNextFrame)
     }
 
+    // MARK: - Canvas usage → backing texture
+
+    /// A drawable is framebuffer-only **only** when the canvas is nothing but a render attachment.
+    ///
+    /// It used to key on `COPY_SRC` alone, so a canvas configured for `COPY_DST` (copying a render
+    /// target in), `TEXTURE_BINDING` or `STORAGE_BINDING` (compute writing to the canvas) still got
+    /// framebuffer-only drawables — Metal's validation layer asserts on the blit or shader access.
+    func test_aLayerCanvasIsFramebufferOnlyOnlyForRenderAttachmentUsage() throws {
+        let context = try LynxWebGPUContext(device: device)
+        let surface = WGPUMetalLayerSurface(identifier: "usage", layer: CAMetalLayer())
+        context.registerSurface(surface)
+
+        let cases: [(usage: Int, framebufferOnly: Bool)] = [
+            (TestUsage.renderAttachment, true),
+            (TestUsage.renderAttachment | TestUsage.textureCopySrc, false),
+            (TestUsage.renderAttachment | TestUsage.textureCopyDst, false),
+            (TestUsage.renderAttachment | TestUsage.textureBinding, false),
+            (TestUsage.renderAttachment | TestUsage.textureStorageBinding, false),
+            (TestUsage.textureCopyDst, false),
+            (TestUsage.textureStorageBinding, false),
+        ]
+        for (usage, expected) in cases {
+            // Configure from the main thread (as the test runs) applies the layer properties synchronously.
+            let result = context.execute(commands: [
+                ["op": "configureCanvas", "canvas": "usage", "format": "bgra8unorm", "usage": usage],
+            ])
+            XCTAssertEqual(result["ok"] as? Bool, true, "\(result)")
+            XCTAssertEqual(surface.layer.framebufferOnly, expected, "usage 0x\(String(usage, radix: 16))")
+        }
+
+        // Omitting usage means RENDER_ATTACHMENT (the spec default) — back to framebuffer-only.
+        let result = context.execute(commands: [
+            ["op": "configureCanvas", "canvas": "usage", "format": "bgra8unorm"],
+        ])
+        XCTAssertEqual(result["ok"] as? Bool, true, "\(result)")
+        XCTAssertTrue(surface.layer.framebufferOnly)
+    }
+
+    /// The offscreen surface honours the canvas usage too — `STORAGE_BINDING` needs a writable texture.
+    func test_anOffscreenCanvasWithStorageUsageIsShaderWritable() throws {
+        let surface = WGPUOffscreenSurface(identifier: "store", size: CGSize(width: 8, height: 8), device: device)
+        let context = try LynxWebGPUContext(device: device)
+        context.registerSurface(surface)
+
+        var result = context.execute(commands: [
+            ["op": "configureCanvas", "canvas": "store", "format": "rgba8unorm"],
+        ])
+        XCTAssertEqual(result["ok"] as? Bool, true, "\(result)")
+        XCTAssertFalse(try XCTUnwrap(surface.texture).usage.contains(.shaderWrite))
+
+        result = context.execute(commands: [
+            ["op": "configureCanvas", "canvas": "store", "format": "rgba8unorm",
+             "usage": TestUsage.renderAttachment | TestUsage.textureStorageBinding],
+        ])
+        XCTAssertEqual(result["ok"] as? Bool, true, "\(result)")
+        let texture = try XCTUnwrap(surface.texture)
+        XCTAssertTrue(texture.usage.contains(.shaderWrite))
+        XCTAssertTrue(texture.usage.contains(.renderTarget), "the harness still draws into it")
+
+        // A resize rebuilds the texture with the same usage.
+        surface.updateDrawableSize(CGSize(width: 16, height: 16))
+        XCTAssertTrue(try XCTUnwrap(surface.texture).usage.contains(.shaderWrite))
+    }
+
     /// **The process must not die** even when the size arrives as NaN, infinity or negative.
     ///
     /// The size comes from UI layout (`bounds × pixelRatio`) — a frame before measurement or a strange
