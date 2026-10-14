@@ -654,6 +654,98 @@ final class RenderPipelineTests: XCTestCase {
         try harness.assertPixel(x: 32, y: 32, equals: (255, 0, 0, 255), "the front one (red) must remain")
     }
 
+    // MARK: - Multisample resolve
+
+    /// `storeOp: "store"` on a resolving attachment keeps the **multisample samples** too — the spec
+    /// applies storeOp to the view and resolves on top. Mapping every resolve to Metal's
+    /// `.multisampleResolve` discarded them, so a second pass that loads the MSAA texture (the usual
+    /// "draw in several passes, resolve each time" pattern) read undefined samples.
+    ///
+    /// Pass 1 clears the MSAA texture blue, draws red over the left half, stores + resolves. Pass 2
+    /// loads it, draws green into the bottom-right quadrant only and resolves again. The canvas holds
+    /// pass 2's resolve, so pass 1's red and blue surviving there proves the samples were kept.
+    ///
+    /// It discriminates on Apple Silicon (tile memory is only written back on store) — on IMR Mac GPUs
+    /// (Intel/AMD) the old `.multisampleResolve` may keep the samples anyway.
+    func test_aStoringResolvePassKeepsTheMultisampleContentsForALaterLoad() throws {
+        try assertStoringResolveKeepsTheMultisampleContents()
+    }
+
+    /// The same contract through the emulation used where `.storeAndMultisampleResolve` is missing
+    /// (the iOS simulator): store in the pass, resolve in a draw-less pass at its end.
+    func test_theEmulatedStoreAndResolveKeepsTheMultisampleContentsForALaterLoad() throws {
+        let context = try XCTUnwrap(harness.context, "the emulation switch is a Metal backend hook")
+        context.supportsStoreAndMultisampleResolve = false
+        try assertStoringResolveKeepsTheMultisampleContents()
+    }
+
+    private func assertStoringResolveKeepsTheMultisampleContents(
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let shader = """
+        @vertex
+        fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+            var positions = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+            return vec4f(positions[index], 0.0, 1.0);
+        }
+        @fragment
+        fn fs_red() -> @location(0) vec4f {
+            return vec4f(1.0, 0.0, 0.0, 1.0);
+        }
+        @fragment
+        fn fs_green() -> @location(0) vec4f {
+            return vec4f(0.0, 1.0, 0.0, 1.0);
+        }
+        """
+        func pipeline(id: Int, entryPoint: String) -> [String: Any] {
+            [
+                "op": "createRenderPipeline", "id": id, "layout": "auto",
+                "vertex": ["module": 1, "entryPoint": "vs_main"],
+                "fragment": ["module": 1, "entryPoint": entryPoint, "targets": [["format": "rgba8unorm"]]],
+                "multisample": ["count": 4],
+            ]
+        }
+
+        harness.executeExpectingSuccess([
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+            ["op": "createShaderModule", "id": 1, "code": shader],
+            ["op": "createTexture", "id": 2, "size": ["width": 64, "height": 64],
+             "format": "rgba8unorm", "sampleCount": 4, "usage": TestUsage.renderAttachment],
+            ["op": "createTextureView", "id": 3, "texture": 2],
+            pipeline(id: 4, entryPoint: "fs_red"),
+            pipeline(id: 5, entryPoint: "fs_green"),
+            ["op": "getCurrentTexture", "id": 10, "canvas": "test"],
+            ["op": "createTextureView", "id": 11, "texture": 10],
+
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 3, "resolveTarget": 11, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 0, "g": 0, "b": 1, "a": 1],
+            ]]],
+            ["op": "setPipeline", "pipeline": 4],
+            ["op": "setScissorRect", "x": 0, "y": 0, "width": 32, "height": 64],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 3, "resolveTarget": 11, "loadOp": "load", "storeOp": "discard",
+            ]]],
+            ["op": "setPipeline", "pipeline": 5],
+            ["op": "setScissorRect", "x": 32, "y": 32, "width": 32, "height": 32],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+        ], file: file, line: line)
+
+        try harness.assertPixel(x: 16, y: 16, equals: (255, 0, 0, 255), "pass 1's red must survive the load",
+                                file: file, line: line)
+        try harness.assertPixel(x: 16, y: 48, equals: (255, 0, 0, 255), "pass 1's red must survive the load",
+                                file: file, line: line)
+        try harness.assertPixel(x: 48, y: 16, equals: (0, 0, 255, 255), "pass 1's clear must survive the load",
+                                file: file, line: line)
+        try harness.assertPixel(x: 48, y: 48, equals: (0, 255, 0, 255), "pass 2's own draw",
+                                file: file, line: line)
+    }
+
     // MARK: - HDR readback
 
     func test_anRGBA16FloatSurfaceDoesNotLoseValuesOutsideSDR() throws {
