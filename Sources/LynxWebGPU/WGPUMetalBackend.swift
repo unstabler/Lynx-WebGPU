@@ -67,6 +67,9 @@ public final class WGPUMetalBackend: WGPUBackend {
     private var acquiredDrawables: [String: WGPUDrawable] = [:]
     /// The last committed command buffer — used when `readBuffer` waits on GPU completion.
     private(set) var lastCommittedBuffer: MTLCommandBuffer?
+    /// That batch's upload command buffer, when it was committed separately — a failed queue write
+    /// must fail the readback too, even though the frame buffer after it completed.
+    private var lastCommittedUploadBuffer: MTLCommandBuffer?
 
     public init(device: MTLDevice, queue: MTLCommandQueue) {
         self.device = device
@@ -107,6 +110,7 @@ public final class WGPUMetalBackend: WGPUBackend {
     public func reset() {
         acquiredDrawables.removeAll()
         lastCommittedBuffer = nil
+        lastCommittedUploadBuffer = nil
     }
 
     // MARK: - Batch lifetime
@@ -167,6 +171,7 @@ public final class WGPUMetalBackend: WGPUBackend {
         }
         frame.commit()
         lastCommittedBuffer = frame
+        lastCommittedUploadBuffer = commandBuffer != nil ? uploads : nil
         if present { acquiredDrawables.removeAll() }
         frameStagingBuffers.removeAll()
         commandBuffer = nil
@@ -280,17 +285,26 @@ public final class WGPUMetalBackend: WGPUBackend {
         // If submitted work is still running, read after it completes.
         // `addCompletedHandler` cannot be attached after commit (a Metal assertion), so we wait on a dedicated queue.
         let pending = lastCommittedBuffer
-        if let pending, pending.status == .error {
-            finish(pending)
+        let uploads = lastCommittedUploadBuffer
+        // Either half of the last batch failing fails the read (the uploads first — they ran first).
+        let failedBuffer: () -> MTLCommandBuffer? = {
+            if let uploads, uploads.status == .error { return uploads }
+            if let pending, pending.status == .error { return pending }
+            return nil
+        }
+        if let failed = failedBuffer() {
+            finish(failed)
             return
         }
-        guard let pending, pending.status != .completed else {
+        let running = [uploads, pending].contains { ($0?.status ?? .completed) != .completed }
+        guard running else {
             finish(nil)
             return
         }
         Self.readbackQueue.async {
-            pending.waitUntilCompleted()
-            finish(pending.status == .error ? pending : nil)
+            uploads?.waitUntilCompleted()
+            pending?.waitUntilCompleted()
+            finish(failedBuffer())
         }
     }
 
