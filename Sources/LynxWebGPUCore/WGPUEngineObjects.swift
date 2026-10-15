@@ -30,6 +30,9 @@ public final class WGPUEngineTexture<B: WGPUBackend> {
     public let format: WGPUTextureFormat
     public let size: WGPUExtent3D
     public let sampleCount: Int
+    /// Needed to bound a copy's `mipLevel` and its per-level extent before the backend sees it.
+    public let mipLevelCount: Int
+    public let dimension: WGPUTextureDimension
     /// The canvas this drawable texture came from — nil for a regular texture. Non-nil means the
     /// handle expires once the frame is presented, and views of it inherit the same canvas scope
     /// (so a per-canvas expiry can pick them out).
@@ -37,11 +40,14 @@ public final class WGPUEngineTexture<B: WGPUBackend> {
     public var isDrawable: Bool { drawableCanvas != nil }
 
     public init(raw: B.Texture, format: WGPUTextureFormat, size: WGPUExtent3D,
-                sampleCount: Int, drawableCanvas: String? = nil) {
+                sampleCount: Int, mipLevelCount: Int = 1, dimension: WGPUTextureDimension = .twoD,
+                drawableCanvas: String? = nil) {
         self.raw = raw
         self.format = format
         self.size = size
         self.sampleCount = sampleCount
+        self.mipLevelCount = mipLevelCount
+        self.dimension = dimension
         self.drawableCanvas = drawableCanvas
     }
 }
