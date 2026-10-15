@@ -45,6 +45,13 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     private var currentComputePipeline: WGPUEngineComputePipeline<B>?
     private var boundGroups: [Int: (group: WGPUEngineBindGroup<B>, offsets: [Int])] = [:]
     private var dirtyGroups: Set<Int> = []
+    /// Dynamic offset alignments, read once from the limits the backend advertises (the spec default,
+    /// 256, for one it does not list).
+    private lazy var dynamicOffsetAlignments: (uniform: Int, storage: Int) = {
+        let limits = backend.adapterInfo()["limits"] as? [String: Any] ?? [:]
+        func alignment(_ key: String) -> Int { max((limits[key] as? Int) ?? 256, 1) }
+        return (alignment("minUniformBufferOffsetAlignment"), alignment("minStorageBufferOffsetAlignment"))
+    }()
     private var indexBinding: (buffer: WGPUEngineBuffer<B>, offset: Int, format: WGPUIndexFormat, stride: Int)?
     /// Vertex buffer bindings per slot. **They do not go straight to the backend**; they gather here
     /// and go down right before a draw. That is what lets `resetPassBindings()` genuinely invalidate
@@ -883,7 +890,8 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
                     }
                     // Remembered for the draw-time check of `minBindingSize: 0` entries.
                     bufferBindings.append(WGPUEngineBufferBinding(
-                        binding: entry.binding, bufferSize: object.size, offset: offset, size: size,
+                        binding: entry.binding, type: bufferLayout.type,
+                        bufferSize: object.size, offset: offset, size: size,
                         hasDynamicOffset: bufferLayout.hasDynamicOffset,
                         prevalidatedSize: bufferLayout.minBindingSize != 0
                     ))
@@ -903,8 +911,13 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             )
         }
         let raw = try backend.makeBindGroup(layout: layout.raw, entries: entries)
+        // Binding metadata is only complete when every entry was matched against a known layout.
+        let entriesKnown = specValidation && layout.entries != nil
         registry.insert(
-            WGPUEngineBindGroup<B>(raw: raw, buffers: buffers, bufferBindings: bufferBindings), at: command.id
+            WGPUEngineBindGroup<B>(
+                raw: raw, buffers: buffers, bufferBindings: entriesKnown ? bufferBindings : nil
+            ),
+            at: command.id
         )
     }
 
@@ -1325,8 +1338,53 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             command.bindGroup, as: WGPUEngineBindGroup<B>.self, kind: "GPUBindGroup",
             path: command.fieldPath("bindGroup")
         )
+        if specValidation, let bindings = group.bufferBindings {
+            try validateDynamicOffsets(command, bindings: bindings)
+        }
         boundGroups[command.index] = (group, command.dynamicOffsets)
         dirtyGroups.insert(command.index)
+    }
+
+    /// The spec's `setBindGroup` checks on dynamic offsets — one per `hasDynamicOffset` entry, in
+    /// binding order; each a multiple of the advertised `min{Uniform,Storage}BufferOffsetAlignment`;
+    /// and the shifted range inside the buffer. The range is Dawn's stricter form — offset + dynamic
+    /// offset + **the binding's size** (to the buffer's end when `size` was omitted, so such an entry
+    /// only takes 0) — the same rule a page meets on Dawn. Unchecked, Metal binds past the buffer's end.
+    private func validateDynamicOffsets(
+        _ command: WGPUSetBindGroupCommand, bindings: [WGPUEngineBufferBinding]
+    ) throws {
+        let dynamic = bindings.filter(\.hasDynamicOffset)
+        let offsets = command.dynamicOffsets
+        guard offsets.count == dynamic.count else {
+            throw WGPUError.validation(
+                "setBindGroup got \(offsets.count) dynamic offsets, but the bind group's layout has "
+                    + "\(dynamic.count) entries with hasDynamicOffset",
+                path: command.fieldPath("dynamicOffsets")
+            )
+        }
+        for (index, (binding, dynamicOffset)) in zip(dynamic, offsets).enumerated() {
+            let path = command.fieldPath("dynamicOffsets[\(index)]")
+            let (limit, alignment) = binding.type == .uniform
+                ? ("minUniformBufferOffsetAlignment", dynamicOffsetAlignments.uniform)
+                : ("minStorageBufferOffsetAlignment", dynamicOffsetAlignments.storage)
+            guard dynamicOffset >= 0, dynamicOffset % alignment == 0 else {
+                throw WGPUError.validation(
+                    "dynamic offset \(dynamicOffset) for binding \(binding.binding) must be a non-negative "
+                        + "multiple of \(limit) (\(alignment))",
+                    path: path
+                )
+            }
+            let size = binding.size ?? max(binding.bufferSize - binding.offset, 0)
+            let (shifted, overflowA) = binding.offset.addingReportingOverflow(dynamicOffset)
+            let (end, overflowB) = shifted.addingReportingOverflow(size)
+            guard !overflowA, !overflowB, end <= binding.bufferSize else {
+                throw WGPUError.validation(
+                    "binding \(binding.binding): offset \(binding.offset) + dynamic offset \(dynamicOffset) + "
+                        + "size \(size) exceeds the buffer's \(binding.bufferSize) bytes",
+                    path: path
+                )
+            }
+        }
     }
 
     /// Returns pipeline, bind group and vertex/index buffer bindings to "unspecified".
@@ -1415,7 +1473,7 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         for (groupIndex, required) in minimumSizes.sorted(by: { $0.key < $1.key }) {
             guard let bound = boundGroups[groupIndex] else { continue }
             var dynamicIndex = 0
-            for binding in bound.group.bufferBindings {
+            for binding in bound.group.bufferBindings ?? [] {
                 var dynamicOffset = 0
                 if binding.hasDynamicOffset {
                     if dynamicIndex < bound.offsets.count { dynamicOffset = bound.offsets[dynamicIndex] }

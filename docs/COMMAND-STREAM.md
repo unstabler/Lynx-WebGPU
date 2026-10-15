@@ -229,7 +229,7 @@ Metal은 둘 다 느슨해서, 안 막으면 브라우저·Dawn에서만 거부�
 |---|---|
 | `beginRenderPass` | `colorAttachments[]` · `depthStencilAttachment` · `occlusionQuerySet` · `timestampWrites` · `label` |
 | `setPipeline` | `pipeline` (렌더/컴퓨트 공용 — 열린 패스가 어느 쪽인지 정한다) |
-| `setBindGroup` | `index` · `bindGroup` · `dynamicOffsets[]` |
+| `setBindGroup` | `index` · `bindGroup` · `dynamicOffsets[]` — 개수는 레이아웃의 `hasDynamicOffset` 항목 수와 같아야 하고(바인딩 번호 순), 각 값은 `minUniformBufferOffsetAlignment`/`minStorageBufferOffsetAlignment`의 배수, `offset + 동적 오프셋 + size ≤ 버퍼 크기` (size 생략 시 버퍼 끝까지라 0만 된다 — Dawn과 같은 규칙). 어긋나면 이 명령에서 검증 오류 |
 | `setVertexBuffer` | `slot` · `buffer` · `offset`(0) |
 | `setIndexBuffer` | `buffer` · `format`(`"uint16"`\|`"uint32"`) · `offset`(0) |
 | `setViewport` | `x`(0) · `y`(0) · `width` · `height` · `minDepth`(0) · `maxDepth`(1) |
@@ -370,7 +370,7 @@ occlusion 쿼리는 중첩할 수 없고, 한 패스에서 같은 인덱스를 �
 | `GPURenderPassColorAttachment.depthSlice` | 읽지 않는다 — 항상 0번 슬라이스에 그린다 |
 | `GPURenderPassDescriptor.maxDrawCount` | 무시한다 (드라이버 힌트) |
 | `setBindGroup`의 `Uint32Array` 오버로드 | 없다 — 배열 형태와 결과가 같고 브리지를 건널 때 어차피 배열로 펴진다 |
-| `setBindGroup`의 `dynamicOffsets` 파싱 실패 | **빈 배열로 본다.** 실제로 필요했다면 바인드 그룹 적용에서 "개수가 부족하다"로 잡힌다 |
+| `setBindGroup`의 `dynamicOffsets` 파싱 실패 | **빈 배열로 본다.** 실제로 필요했다면 `setBindGroup`의 개수 검사에서 잡힌다 |
 
 미지원 API 전체 목록은 `docs/WEBGPU-API.md` §8에 있다.
 

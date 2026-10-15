@@ -324,7 +324,10 @@ const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] 
 ```
 
 `hasDynamicOffset: true`인 바인딩은 `pass.setBindGroup(0, group, [offset])`로 오프셋을 준다.
-오프셋은 **바인딩 번호 오름차순**으로 소비된다.
+오프셋은 **바인딩 번호 오름차순**으로 소비된다. `setBindGroup`이 그 자리에서 검사한다 — 개수가
+동적 항목 수와 같은지, 각 오프셋이 `minUniformBufferOffsetAlignment`/`minStorageBufferOffsetAlignment`
+(256)의 배수인지, `offset + 동적 오프셋 + size`가 버퍼 안인지. **동적 바인딩에는 `size`를 줄 것** —
+생략하면 버퍼 끝까지라 오프셋 0만 들어간다 (Dawn과 같은 규칙).
 
 **`minBindingSize`는 명세대로 세 군데서 잰다** — 셰이더 변수의 *최소 바인딩 크기*(저장 타입의 WGSL
 `SizeOf`, 런타임 크기 배열은 원소 하나로 친다)보다 작은 범위가 셰이더에 닿지 않게 하는 장치다:

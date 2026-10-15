@@ -102,6 +102,8 @@ public final class WGPUEnginePipelineLayout<B: WGPUBackend> {
 /// One buffer entry of a bind group, as the draw-time binding size check needs it.
 public struct WGPUEngineBufferBinding {
     public let binding: Int
+    /// The layout entry's type — picks the dynamic offset alignment limit.
+    public let type: WGPUBufferBindingType
     public let bufferSize: Int
     public let offset: Int
     /// The entry's explicit `size` — nil means "to the end of the buffer", which a dynamic offset
@@ -112,9 +114,10 @@ public struct WGPUEngineBufferBinding {
     /// size and pipeline creation checked the shader against it — the spec's `[[prevalidatedSize]]`.
     public let prevalidatedSize: Bool
 
-    public init(binding: Int, bufferSize: Int, offset: Int, size: Int?,
+    public init(binding: Int, type: WGPUBufferBindingType, bufferSize: Int, offset: Int, size: Int?,
                 hasDynamicOffset: Bool, prevalidatedSize: Bool) {
         self.binding = binding
+        self.type = type
         self.bufferSize = bufferSize
         self.offset = offset
         self.size = size
@@ -135,14 +138,15 @@ public final class WGPUEngineBindGroup<B: WGPUBackend> {
     /// Buffers this group holds — needed to check "is it mapped?" right before a draw (the group
     /// pins its buffers at creation, so a buffer mapped afterwards is caught there).
     public let buffers: [WGPUEngineBuffer<B>]
-    /// Its buffer entries, sorted by binding — empty when the layout's entries were unknown.
-    public let bufferBindings: [WGPUEngineBufferBinding]
+    /// Its buffer entries, sorted by binding — the size and dynamic offset checks read them. Nil when
+    /// the layout's entries were unknown (or the backend validates natively): those checks are skipped.
+    public let bufferBindings: [WGPUEngineBufferBinding]?
 
     public init(raw: B.BindGroup, buffers: [WGPUEngineBuffer<B>],
-                bufferBindings: [WGPUEngineBufferBinding] = []) {
+                bufferBindings: [WGPUEngineBufferBinding]? = nil) {
         self.raw = raw
         self.buffers = buffers
-        self.bufferBindings = bufferBindings.sorted { $0.binding < $1.binding }
+        self.bufferBindings = bufferBindings?.sorted { $0.binding < $1.binding }
     }
 }
 

@@ -1175,6 +1175,54 @@ final class CommandInterpreterTests: XCTestCase {
         XCTAssertTrue(errors(accepted).isEmpty, "\(errors(accepted))")
     }
 
+    // MARK: - Dynamic offsets
+
+    /// setBindGroup checks its dynamic offsets — unchecked, Metal's setBuffer bound past the buffer's end.
+    func test_setBindGroupRejectsBadDynamicOffsets() {
+        let setup: [[String: Any]] = [
+            ["op": "createShaderModule", "id": 1, "code": """
+            @group(0) @binding(0) var<uniform> u: vec4f;
+            @group(0) @binding(1) var<storage, read_write> o: array<vec4f>;
+            @compute @workgroup_size(1) fn main() { o[0] = u; }
+            """],
+            ["op": "createBindGroupLayout", "id": 2, "entries": [
+                ["binding": 0, "visibility": 4, "buffer": ["type": "uniform", "hasDynamicOffset": true]],
+                ["binding": 1, "visibility": 4, "buffer": ["type": "storage"]],
+            ]],
+            ["op": "createPipelineLayout", "id": 3, "bindGroupLayouts": [2]],
+            ["op": "createComputePipeline", "id": 4, "layout": 3, "compute": ["module": 1]],
+            ["op": "createBuffer", "id": 5, "size": 256, "usage": TestUsage.uniform],
+            ["op": "createBuffer", "id": 6, "size": 16, "usage": TestUsage.storage],
+            ["op": "createBindGroup", "id": 7, "layout": 2, "entries": [
+                ["binding": 0, "resource": ["buffer": 5, "size": 64]],
+                ["binding": 1, "resource": ["buffer": 6]],
+            ]],
+        ]
+        func dispatch(_ offsets: [Int]) -> [[String: Any]] {
+            [
+                ["op": "beginComputePass"],
+                ["op": "setPipeline", "pipeline": 4],
+                ["op": "setBindGroup", "index": 0, "bindGroup": 7, "dynamicOffsets": offsets],
+                ["op": "dispatchWorkgroups", "x": 1],
+                ["op": "endPass"],
+            ]
+        }
+        XCTAssertTrue(errors(harness.execute(setup)).isEmpty)
+
+        let pastTheEnd = harness.execute(dispatch([512]))
+        XCTAssertEqual(errors(pastTheEnd).first?["path"] as? String, "commands[2].dynamicOffsets[0]")
+        XCTAssertTrue(((errors(pastTheEnd).first?["message"] as? String) ?? "").contains("exceeds the buffer"))
+
+        let unaligned = harness.execute(dispatch([4]))
+        XCTAssertTrue(((errors(unaligned).first?["message"] as? String) ?? "").contains("minUniformBufferOffsetAlignment"))
+
+        let missing = harness.execute(dispatch([]))
+        XCTAssertEqual(errors(missing).first?["path"] as? String, "commands[2].dynamicOffsets")
+
+        XCTAssertFalse(errors(harness.execute(dispatch([256]))).isEmpty, "256 + 64 bytes run past a 256-byte buffer")
+        XCTAssertTrue(errors(harness.execute(dispatch([0]))).isEmpty)
+    }
+
     /// The spec fixes each limit's **default (the minimum guarantee)**. Reporting lower makes code that
     /// works in a browser rejected only here, with the app unable to tell why.
     func test_limitsAreNotBelowTheSpecDefaults() throws {
