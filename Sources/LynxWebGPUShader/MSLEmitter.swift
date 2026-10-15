@@ -106,6 +106,14 @@ struct MSLEmitter {
         line("")
         output += MSLPrelude.source + "\n\n"
 
+        // Aliases come before the struct definitions (a struct member may be spelled with an alias),
+        // yet an alias may name a struct (`alias B = Buf;`). Forward declarations let `using B = Buf;`
+        // name a declared type; the definitions below complete it.
+        if !module.aliases.isEmpty {
+            for structure in module.structs {
+                line("struct \(MSLTypeMapping.identifier(structure.name));")
+            }
+        }
         for alias in module.aliases {
             line("using \(MSLTypeMapping.identifier(alias.name)) = \(try MSLTypeMapping.type(alias.type, module: module));")
         }

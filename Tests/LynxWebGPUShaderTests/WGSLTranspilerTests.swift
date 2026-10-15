@@ -197,6 +197,30 @@ final class WGSLTranspilerTests: XCTestCase {
         XCTAssertTrue(msl.contains("WaveSample{}"), "zero-value construction stays a plain empty init:\n\(msl)")
     }
 
+    /// An alias may name a struct, but aliases are emitted before the struct definitions (a member may
+    /// be spelled with one) — without a forward declaration Metal says "unknown type name 'S'".
+    func test_anAliasOfAStructCompilesThroughAForwardDeclaration() throws {
+        let msl = try translate("""
+        struct S { x: f32 }
+        alias T = S;
+        alias Pair = array<T, 2>;
+        @group(0) @binding(0) var<uniform> s: T;
+
+        @fragment
+        fn fs() -> @location(0) vec4f {
+            var pair: Pair;
+            pair[1] = s;
+            return vec4f(pair[1].x);
+        }
+        """, entryPoints: ["fs"])
+
+        let forward = try XCTUnwrap(msl.range(of: "struct S;"), msl)
+        let alias = try XCTUnwrap(msl.range(of: "using T = S;"), msl)
+        let definition = try XCTUnwrap(msl.range(of: #"struct alignas\(\d+\) S \{"#, options: .regularExpression), msl)
+        XCTAssertTrue(forward.lowerBound < alias.lowerBound && alias.lowerBound < definition.lowerBound, msl)
+        XCTAssertTrue(msl.contains("using Pair = array<T, 2>;"), msl)
+    }
+
     // MARK: - Recursive types
 
     /// WGSL forbids a type that contains itself — it would have infinite size. The layout calculator
