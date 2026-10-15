@@ -219,6 +219,44 @@ enum MSLTypeMapping {
         "workgroupUniformLoad": "not supported",
     ]
 
+    /// Argument counts (inclusive, per the WGSL spec) of the builtins the emitter lowers **by position**.
+    ///
+    /// Those lowerings pick arguments out by index, so a short call (`atomicLoad()`) would index past
+    /// the end and trap the host process. Shader source comes from the bundle, so a wrong count must
+    /// fail like any other invalid WGSL — `MSLEmitter` checks this table before dispatching. Builtins
+    /// passed through by name (`select`, `pack4x8unorm`, …) never index, and the Metal compiler
+    /// rejects their counts.
+    static let builtinArities: [String: ClosedRange<Int>] = {
+        var arities: [String: ClosedRange<Int>] = [
+            "bitcast": 1...1,
+            "arrayLength": 1...1,
+            "quantizeToF16": 1...1,
+            "workgroupBarrier": 0...0,
+            "storageBarrier": 0...0,
+            "atomicLoad": 1...1,
+            "atomicStore": 2...2,
+            "atomicExchange": 2...2,
+            // (t, s, coords, [array_index], …, [offset])
+            "textureSample": 3...5,
+            "textureSampleBias": 4...6,
+            "textureSampleLevel": 4...6,
+            "textureSampleGrad": 5...7,
+            "textureSampleCompare": 4...6,
+            "textureSampleCompareLevel": 4...6,
+            "textureSampleBaseClampToEdge": 3...3,
+            // (t, coords, [array_index], [level | sample_index])
+            "textureLoad": 2...4,
+            // (t, coords, [array_index], value)
+            "textureStore": 3...4,
+            "textureDimensions": 1...2,
+            "textureNumLayers": 1...1,
+            "textureNumLevels": 1...1,
+            "textureNumSamples": 1...1,
+        ]
+        for name in atomicFetchOperations.keys { arities[name] = 2...2 }
+        return arities
+    }()
+
     /// WGSL `@builtin(x)` → the MSL attribute and type.
     static func builtin(_ name: String, stage: WGSLStage, isInput: Bool) throws -> (attribute: String, type: String) {
         switch name {

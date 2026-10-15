@@ -1180,9 +1180,11 @@ struct MSLEmitter {
         if let reason = MSLTypeMapping.unsupportedBuiltins[callee] {
             throw WGPUError.unsupported("WGSL: \(callee)() — \(reason)")
         }
+        // Before anything below picks arguments out by index.
+        try Self.checkArity(callee, count: arguments.count)
 
         if callee == "bitcast" {
-            guard let target = typeArguments.first, arguments.count == 1 else {
+            guard let target = typeArguments.first else {
                 throw WGPUError.validation("WGSL: the form must be bitcast<T>(x)")
             }
             return "as_type<\(try MSLTypeMapping.type(target, module: module))>(\(try expression(arguments[0])))"
@@ -1265,6 +1267,17 @@ struct MSLEmitter {
 
         let name = MSLTypeMapping.renamedBuiltins[callee] ?? callee
         return "\(name)(\(emitted.joined(separator: ", ")))"
+    }
+
+    /// Rejects a builtin in `MSLTypeMapping.builtinArities` called with the wrong argument count —
+    /// as a compile error, not an out-of-range trap in the lowering that indexes the arguments.
+    private static func checkArity(_ callee: String, count: Int) throws {
+        guard let arity = MSLTypeMapping.builtinArities[callee], !arity.contains(count) else { return }
+        let expected = arity.lowerBound == arity.upperBound
+            ? "\(arity.lowerBound)"
+            : "\(arity.lowerBound) to \(arity.upperBound)"
+        let noun = arity.upperBound == 1 ? "argument" : "arguments"
+        throw WGPUError.validation("WGSL: \(callee)() expects \(expected) \(noun), got \(count)")
     }
 
     /// The saturating conversion helper name, when this is an integer-producing constructor (`i32`, `u32`, `vec3i`, `vec2<u32>`, …).
@@ -1426,10 +1439,8 @@ struct MSLEmitter {
 
     private mutating func atomicCall(callee: String, arguments: [WGSLExpression]) throws -> String {
         let emitted = try arguments.map { try expression($0) }
+        // Argument counts were checked against `builtinArities` by `call`.
         if let operation = MSLTypeMapping.atomicFetchOperations[callee] {
-            guard emitted.count == 2 else {
-                throw WGPUError.validation("WGSL: the form must be \(callee)(&atomic, value)")
-            }
             return "\(operation)(\(emitted[0]), \(emitted[1]), memory_order_relaxed)"
         }
         switch callee {
