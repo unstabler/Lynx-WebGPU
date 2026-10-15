@@ -378,7 +378,7 @@ final class WGSLTranspilerTests: XCTestCase {
                 + String(repeating: ", 1>", count: depth) + ";",
             "const y = " + String(repeating: "- ", count: depth) + "1;",
             "fn f() " + String(repeating: "{", count: depth) + String(repeating: "}", count: depth),
-            "fn g(a: i32) {\n if a == 0 {}" + String(repeating: " else if a == 1 {}", count: depth) + "\n}",
+            "fn g() {\n" + String(repeating: "if true { ", count: depth) + String(repeating: "}", count: depth) + "\n}",
         ]
         for source in sources {
             var failure: WGPUError?
@@ -447,6 +447,41 @@ final class WGSLTranspilerTests: XCTestCase {
             return vec4f(x);
         }
         """, entryPoints: ["fs"])
+    }
+
+    /// An `else if` chain is not nesting — generated shaders chain hundreds of arms, and Tint (so
+    /// Chrome) parses them in a loop. The chain is one flat statement here too: parsed, walked and
+    /// emitted iteratively, so its length neither counts toward the depth limit nor recurses.
+    func test_aLongElseIfChainIsFlatNotNested() throws {
+        func chain(_ arms: Int) -> String {
+            var body = "    if i == 0u { r = 0.5; }\n"
+            for arm in 1..<arms { body += "    else if i == \(arm)u { r = \(arm).0; }\n" }
+            return """
+            @group(0) @binding(0) var<uniform> i: u32;
+            @fragment fn fs() -> @location(0) vec4f {
+                var r = 0.0;
+            \(body)    else { r = -1.0; }
+                return vec4f(r);
+            }
+            """
+        }
+
+        let msl = try translate(chain(20), entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("else if ((i == 19u))") || msl.contains("else if (i == 19u)"), msl)
+        XCTAssertTrue(msl.contains("else\n"), msl)
+
+        let long = chain(1000)
+        var output: String?
+        var failure: Error?
+        onSmallStack {
+            do {
+                let module = try WGSLShaderModule(source: long)
+                let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["fs"]))
+                output = try module.translateToMSL(entryPoints: ["fs"], bindings: bindings)
+            } catch { failure = error }
+        }
+        XCTAssertNil(failure)
+        XCTAssertEqual(output?.components(separatedBy: "else if").count, 1000)
     }
 
     /// A cyclic constant used as an array length gives up with an error instead of recursing.

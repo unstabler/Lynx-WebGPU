@@ -85,7 +85,10 @@ indirect enum WGSLStatement: Equatable {
     case assignment(target: WGSLExpression, op: String, value: WGSLExpression)
     case increment(WGSLExpression)
     case decrement(WGSLExpression)
-    case ifStatement(condition: WGSLExpression, then: [WGSLStatement], elseBranch: WGSLElseBranch?)
+    /// `if c0 { … } else if c1 { … } … else { … }` — the whole chain is **one** statement with a flat
+    /// clause list, so a machine-generated chain of any length is parsed, walked and emitted by loops
+    /// rather than one recursion per `else if`.
+    case ifStatement(clauses: [WGSLIfClause], elseBody: [WGSLStatement]?)
     case forStatement(
         initializer: WGSLStatement?,
         condition: WGSLExpression?,
@@ -104,9 +107,10 @@ indirect enum WGSLStatement: Equatable {
     case block([WGSLStatement])
 }
 
-indirect enum WGSLElseBranch: Equatable {
-    case block([WGSLStatement])
-    case chained(WGSLStatement)
+/// One `if` / `else if` arm of an `ifStatement`.
+struct WGSLIfClause: Equatable {
+    var condition: WGSLExpression
+    var body: [WGSLStatement]
 }
 
 struct WGSLSwitchCase: Equatable {

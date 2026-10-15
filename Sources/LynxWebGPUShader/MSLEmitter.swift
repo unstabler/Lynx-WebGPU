@@ -801,23 +801,19 @@ struct MSLEmitter {
                 line("\(text);")
             }
 
-        case .ifStatement(let condition, let then, let elseBranch):
-            line("if (\(try expression(condition)))")
-            line("{")
-            try scoped { emitter in try emitter.statements(then) }
-            line("}")
-            switch elseBranch {
-            case .block(let statements)?:
+        case .ifStatement(let clauses, let elseBody):
+            // The chain stays flat in MSL too: `if … else if … else …`, one loop iteration per arm.
+            for (index, clause) in clauses.enumerated() {
+                line("\(index == 0 ? "if" : "else if") (\(try expression(clause.condition)))")
+                line("{")
+                try scoped { emitter in try emitter.statements(clause.body) }
+                line("}")
+            }
+            if let elseBody {
                 line("else")
                 line("{")
-                try scoped { emitter in try emitter.statements(statements) }
+                try scoped { emitter in try emitter.statements(elseBody) }
                 line("}")
-            case .chained(let nested)?:
-                // `else if` — attach the nested if after the else.
-                line("else")
-                try scoped { emitter in try emitter.emitStatement(nested) }
-            case nil:
-                break
             }
 
         case .forStatement(let initializer, let condition, let update, let body):
@@ -1024,13 +1020,9 @@ struct MSLEmitter {
                 return true
             case .block(let inner), .whileStatement(_, let inner), .forStatement(_, _, _, let inner):
                 if containsContinue(inner) { return true }
-            case .ifStatement(_, let then, let elseBranch):
-                if containsContinue(then) { return true }
-                switch elseBranch {
-                case .block(let inner)?: if containsContinue(inner) { return true }
-                case .chained(let nested)?: if containsContinue([nested]) { return true }
-                case nil: break
-                }
+            case .ifStatement(let clauses, let elseBody):
+                for clause in clauses where containsContinue(clause.body) { return true }
+                if let elseBody, containsContinue(elseBody) { return true }
             case .switchStatement(_, let cases):
                 for switchCase in cases where containsContinue(switchCase.body) { return true }
             default:

@@ -311,14 +311,8 @@ enum WGSLReflectionBuilder {
         switch statement {
         case .block(let inner):
             return [inner]
-        case .ifStatement(_, let then, let elseBranch):
-            var blocks = [then]
-            switch elseBranch {
-            case .block(let inner)?: blocks.append(inner)
-            case .chained(let nested)?: blocks.append([nested])
-            case nil: break
-            }
-            return blocks
+        case .ifStatement(let clauses, let elseBody):
+            return clauses.map(\.body) + (elseBody.map { [$0] } ?? [])
         case .forStatement(_, _, _, let body), .whileStatement(_, let body):
             return [body]
         case .loopStatement(let body, let continuing):
@@ -417,18 +411,12 @@ enum WGSLReflectionBuilder {
             collect(value, locals: locals, identifiers: &identifiers, calls: &calls)
         case .increment(let expression), .decrement(let expression), .expressionStatement(let expression):
             collect(expression, locals: locals, identifiers: &identifiers, calls: &calls)
-        case .ifStatement(let condition, let then, let elseBranch):
-            collect(condition, locals: locals, identifiers: &identifiers, calls: &calls)
-            collect(then, locals: locals, identifiers: &identifiers, calls: &calls)
-            switch elseBranch {
-            case .block(let statements)?:
-                collect(statements, locals: locals, identifiers: &identifiers, calls: &calls)
-            case .chained(let statement)?:
-                var branchLocals = locals
-                collect(statement, locals: &branchLocals, identifiers: &identifiers, calls: &calls)
-            case nil:
-                break
+        case .ifStatement(let clauses, let elseBody):
+            for clause in clauses {
+                collect(clause.condition, locals: locals, identifiers: &identifiers, calls: &calls)
+                collect(clause.body, locals: locals, identifiers: &identifiers, calls: &calls)
             }
+            if let elseBody { collect(elseBody, locals: locals, identifiers: &identifiers, calls: &calls) }
         case .forStatement(let initializer, let condition, let update, let body):
             // A declaration in a for header scopes over the condition, the increment and the body.
             var headerLocals = locals

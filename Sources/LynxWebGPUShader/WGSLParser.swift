@@ -586,22 +586,20 @@ struct WGSLParser {
         return try parseAssignmentOrCall()
     }
 
+    /// The `else if` arms are read in a loop (as Tint does) — a chain's length is not nesting, so it
+    /// neither recurses nor counts toward `maximumNestingDepth`.
     private mutating func parseIfStatement() throws -> WGSLStatement {
-        // An `else if` chain recurses here directly (and so does everything walking the result).
-        try enterNesting()
-        defer { nestingDepth -= 1 }
-        let condition = try parseExpression()
-        let thenBranch = try parseBlock()
-        var elseBranch: WGSLElseBranch?
-        if match("else") {
-            if check("if") {
-                advance()
-                elseBranch = .chained(try parseIfStatement())
-            } else {
-                elseBranch = .block(try parseBlock())
+        var clauses = [WGSLIfClause(condition: try parseExpression(), body: try parseBlock())]
+        var elseBody: [WGSLStatement]?
+        while match("else") {
+            guard check("if") else {
+                elseBody = try parseBlock()
+                break
             }
+            advance()
+            clauses.append(WGSLIfClause(condition: try parseExpression(), body: try parseBlock()))
         }
-        return .ifStatement(condition: condition, then: thenBranch, elseBranch: elseBranch)
+        return .ifStatement(clauses: clauses, elseBody: elseBody)
     }
 
     private mutating func parseForStatement() throws -> WGSLStatement {
