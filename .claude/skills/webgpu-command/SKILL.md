@@ -108,7 +108,9 @@ private func fooBar(_ command: WGPUFooBarCommand) throws {
   (`applyDrawState()`보다 인자 검증이 먼저인 이유).
 - 리소스 생성 명령이면 백엔드 동사가 돌려준 핸들을 엔진 래퍼(`WGPUEngineObjects.swift`)에
   담아 `registry.insert(_:at:)` — 검증에 필요한 메타데이터(크기·usage·포맷)를 래퍼에 새긴다.
-- 복사·업로드 명령이면 엔진의 `requireNoOpenPass()`를 먼저 — 패스 안에서는 거부된다.
+- **인코더** 복사 명령이면 엔진의 `requireNoOpenPass()`를 먼저 — 패스 안에서는 거부된다.
+  **큐 작업(`writeBuffer`·`writeTexture`·`copyExternalImageToTexture`)에는 걸지 않는다** — 명세상
+  패스가 열려 있어도 합법이고, 순서는 백엔드가 큐 타임라인으로 맞춘다 (`WGPUBackend.writeBuffer`).
 - 프레임 안에서만 유효한 핸들이면 `frameScopedHandles`에 넣는다.
 
 ## 4. JS shim (`JS/webgpu.js` + `webgpu.d.ts`)

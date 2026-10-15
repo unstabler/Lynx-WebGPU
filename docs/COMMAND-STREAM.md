@@ -120,6 +120,26 @@ shim의 `snapshotValue`가 기록 시점에 깊은 복사를 한다. 브라우�
 - 드로우/디스패치 전에 파이프라인 레이아웃이 요구하는 바인드 그룹과 정점 버퍼가 **전부**
   바인드되어 있어야 한다.
 
+### 3-5. 큐 작업의 순서
+
+스트림에는 인코더도 `submit`도 없다. 대신 **배치 하나 = 큐 작업들 + 배치 끝의 제출 하나**로 본다
+— shim이 정확히 그 모양으로 보낸다: 큐 작업(`writeBuffer`·`writeTexture`·
+`copyExternalImageToTexture`)은 호출 시점에 스트림에 실리고, 인코더 명령(패스·복사·resolve)은
+`queue.submit()`이 배치 끝에 붙인 뒤 곧바로 flush한다.
+
+- 큐 작업은 **패스가 열려 있어도 받는다.** 명세상 `GPUQueue` 호출은 언제든 합법이다 — 거부하면
+  `queue.writeBuffer(u); pass.setBindGroup(…); pass.draw()` 루프를 직접 스트림으로 옮긴 코드가
+  깨진다. (인코더 복사는 여전히 패스 밖에서만 된다.)
+- 큐 작업의 효과는 **그 배치의 인코더 명령보다 먼저**, 큐 작업끼리는 **호출 순서대로** 적용된다.
+  명세의 큐 타임라인 그대로다 — `writeBuffer` **전에** 기록했어도 **뒤에** 제출된 드로우는 새 값을
+  본다. 패스 도중의 쓰기도, 같은 배치에서 패스 **뒤에** 실린 쓰기도 그 패스보다 먼저 적용된다.
+- 앞선 배치(이미 제출된 작업) **뒤에** 적용된다 — 실행 중인 GPU 작업과 경쟁하지 않는다.
+
+백엔드 쪽 자리는 `WGPUBackend.writeBuffer`의 계약이다. Dawn은 `wgpuQueueWriteBuffer`/
+`wgpuQueueWriteTexture`가 원래 큐 타임라인이고 배치의 인코더는 배치 끝에 한 번 제출된다.
+Metal은 배치의 큐 쓰기를 **별도 커맨드 버퍼**(스테이징 + blit)에 모아 배치의 커맨드 버퍼보다
+먼저 커밋한다 — 한 큐에서는 커밋 순서가 실행 순서다.
+
 ---
 
 ## 4. op 목록 (51개)
@@ -190,6 +210,9 @@ shim의 `snapshotValue`가 기록 시점에 깊은 복사를 한다. 브라우�
 
 `bytesPerRow`·`rowsPerImage`는 **블록 단위**다 (명세 `GPUTexelCopyBufferLayout`). 비압축
 포맷은 블록이 1×1이라 픽셀 행과 같다.
+
+`writeBuffer`·`writeTexture`·`copyExternalImageToTexture`는 패스가 열려 있어도 받고, 그 배치의
+인코더 명령보다 먼저 적용된다 (§3-5).
 
 ### 4-4. 복사
 

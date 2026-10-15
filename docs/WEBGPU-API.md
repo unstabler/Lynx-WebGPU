@@ -163,6 +163,14 @@ texture.dimension · format · usage · textureBindingViewDimension
 > `writeBuffer`는 스테이징 버퍼 + blit으로 큐에 **순서를 태워** 올라간다. 직접 memcpy 하면
 > 직전 프레임 GPU 작업과 경쟁하기 때문이다. 스테이징 버퍼는 네이티브가 풀로 재사용하므로
 > (프레임 완료 시 회수, 총량 상한) 매 프레임 불러도 할당이 쌓이지 않는다.
+>
+> 큐 작업이라 **패스 인코더가 열려 있어도 부를 수 있다** — `queue.writeBuffer(u); pass.setBindGroup(…);
+> pass.draw()`를 객체마다 반복하는 루프가 그대로 된다. 효과는 **호출 시점에 큐 타임라인에 들어가**
+> 그 뒤에 제출되는 커맨드 버퍼 전체보다 앞선다 — 쓰기 **전에** 기록했더라도 쓰기 **뒤에** 제출한
+> 드로우는 새 값을 본다 (브라우저·Dawn과 같다). 그래서 한 프레임에 같은 유니폼을 여러 번 덮어쓰면
+> 모든 드로우가 **마지막 값**을 본다 — 객체마다 다른 값이 필요하면 오프셋을 나누거나
+> 동적 오프셋을 쓴다. Metal 백엔드는 배치의 큐 쓰기를 별도 커맨드 버퍼에 모아 그 배치의 인코더
+> 작업보다 먼저 커밋한다 (`docs/COMMAND-STREAM.md` §3-5).
 
 ### 텍스처 · 샘플러
 
@@ -177,8 +185,9 @@ const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' 
 ```
 
 > `writeTexture`도 `writeBuffer`처럼 스테이징 + blit으로 큐에 **순서를 태워** 올라간다 —
-> 호출마다 GPU 완주를 기다리지 않으므로 동적 텍스처를 매 프레임 갱신할 수 있고, 같은 배치에서
-> 앞선 렌더 패스가 그린 내용과의 순서도 스트림 그대로 보존된다. 배열 텍스처는
+> 호출마다 GPU 완주를 기다리지 않으므로 동적 텍스처를 매 프레임 갱신할 수 있고, 앞서 제출한
+> 렌더 패스가 그린 내용 **뒤에**, 다음 `submit`의 명령 **앞에** 적용된다 (`writeBuffer`와 같은
+> 큐 타임라인 순서 — 패스가 열려 있어도 받는다). 배열 텍스처는
 > `depthOrArrayLayers`만큼 슬라이스별로 복사된다.
 
 지원 포맷: 8/16/32비트 컬러 전 계열(`r8unorm` … `rgba32float`), `bgra8unorm(-srgb)`,
@@ -461,11 +470,12 @@ device.queue.submit([encoder.finish()])   // ← 여기서 한 번에 네이티�
 ```
 
 - `beginRenderPass`는 멀티샘플 `resolveTarget`을 지원한다 (store op이 `multisampleResolve`로 바뀐다).
-- 복사 명령은 패스 **밖에서만** 쓸 수 있다.
+- 인코더의 복사 명령(`copy*`·`clearBuffer`·`resolveQuerySet`)은 패스 **밖에서만** 쓸 수 있다.
+  큐 작업(`queue.writeBuffer`·`writeTexture`·`copyExternalImageToTexture`)은 패스가 열려 있어도 된다.
 - **디버그 마커는 Xcode GPU 캡처에 구간 이름으로 뜬다** (Metal `pushDebugGroup`/`insertDebugSignpost`).
   없으면 캡처가 이름 없는 드로우 나열이라 어느 패스가 무엇인지 알 수 없다. 스코프는 두 층이다 —
-  **패스 안**에서 열면 그 패스 구간, **패스 밖**에서 열면 프레임 구간이다 (`writeBuffer`·복사가
-  속으로 여는 blit 인코더는 스코프가 아니다 — 그것까지 세면 프레임 구간이 거기서 닫히려 한다).
+  **패스 안**에서 열면 그 패스 구간, **패스 밖**에서 열면 프레임 구간이다 (복사가 속으로 여는
+  blit 인코더와 큐 쓰기용 커맨드 버퍼는 스코프가 아니다 — 그것까지 세면 프레임 구간이 거기서 닫히려 한다).
   `push`와 `pop`의 짝이 맞지 않거나 연 채로 패스가 끝나면 **Metal이 단언으로 프로세스를 죽이므로**,
   네이티브가 깊이를 세어 막고 validation 오류로 알린다 (닫아 주고 계속 간다).
 - `clearBuffer`는 `writeBuffer`로 0 배열을 미는 것과 결과가 같지만 **CPU에서 그 배열을 만들어
