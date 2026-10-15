@@ -178,12 +178,6 @@ struct WGSLFunction: Equatable {
         if attributes.has("compute") { return .compute }
         return nil
     }
-
-    var workgroupSize: (Int, Int, Int)? {
-        guard let attribute = attributes.first(named: "workgroup_size") else { return nil }
-        let values = attribute.arguments.map { Int($0) ?? 1 }
-        return (values.count > 0 ? values[0] : 1, values.count > 1 ? values[1] : 1, values.count > 2 ? values[2] : 1)
-    }
 }
 
 public enum WGSLStage: String, Equatable, Sendable {

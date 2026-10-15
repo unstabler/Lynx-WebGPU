@@ -15,7 +15,9 @@ public struct WGSLResourceInfo: Equatable {
 public struct WGSLEntryPointInfo: Equatable {
     public let name: String
     public let stage: WGSLStage
-    /// A compute entry point's `@workgroup_size`.
+    /// A compute entry point's `@workgroup_size` with every `override` at its declared default — nil
+    /// when the size depends on an override that has no usable default. A pipeline dispatches
+    /// `WGSLShaderModule.workgroupSize(of:constants:limits:)` instead (its `constants` may change it).
     public let workgroupSize: (x: Int, y: Int, z: Int)?
     /// Names of module-scope variables this entry point actually uses (following the call graph).
     public let usedGlobals: Set<String>
@@ -75,11 +77,10 @@ enum WGSLReflectionBuilder {
 
         let entryPoints: [WGSLEntryPointInfo] = module.functions.compactMap { function in
             guard let stage = function.stage else { return nil }
-            let workgroupSize = function.workgroupSize.map { (x: $0.0, y: $0.1, z: $0.2) }
             return WGSLEntryPointInfo(
                 name: function.name,
                 stage: stage,
-                workgroupSize: workgroupSize,
+                workgroupSize: try? module.workgroupSize(of: function),
                 usedGlobals: (usage[function.name] ?? []).intersection(globalNames)
             )
         }

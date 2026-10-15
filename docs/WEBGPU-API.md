@@ -369,7 +369,9 @@ const compute = device.createComputePipeline({                // createComputePi
 - `vertex` / `fragment` / `compute` 각각 `constants: { name: value }` 로 셰이더의 `override` 값을 준다
   (`docs/WGSL.md` §2-2). 같은 셰이더라도 상수가 다르면 별도로 컴파일·캐시된다.
 - 정점 버퍼 슬롯은 **최대 8개**, `arrayStride: 0`은 미지원.
-- 컴퓨트 워크그룹 크기는 WGSL의 `@workgroup_size`에서 리플렉션으로 가져온다 (MSL 모듈은 (1,1,1)).
+- 컴퓨트 워크그룹 크기는 WGSL의 `@workgroup_size`를 **파이프라인의 `constants`를 적용한 뒤 계산**해
+  threadsPerThreadgroup으로 쓴다 (MSL 모듈은 (1,1,1)). 어댑터가 알리는 `maxComputeWorkgroupSizeX/Y/Z` ·
+  `maxComputeInvocationsPerWorkgroup`을 넘으면 파이프라인 생성 validation 오류다 (`docs/WGSL.md` §2-2).
 
 ### 비동기 생성 — 실패를 그 자리에서 안다
 

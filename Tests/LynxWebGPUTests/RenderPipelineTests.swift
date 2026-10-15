@@ -408,6 +408,47 @@ final class RenderPipelineTests: XCTestCase {
         XCTAssertEqual(output, [2, 4, 6, 8, 10, 12, 14, 16])
     }
 
+    func test_anOverrideWorkgroupSizeDispatchesThatManyThreads() throws {
+        // `@workgroup_size(blockSize)` used to be read as 1 — one workgroup filled one slot, not eight.
+        let shader = """
+        override blockSize: u32 = 1u;
+        @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+
+        @compute @workgroup_size(blockSize)
+        fn fill(@builtin(global_invocation_id) id: vec3u) {
+            out[id.x] = id.x + 1u;
+        }
+        """
+        harness.executeExpectingSuccess([
+            ["op": "createShaderModule", "id": 1, "code": shader],
+            ["op": "createBuffer", "id": 2, "size": 32, "usage": TestUsage.storage | TestUsage.copySrc],
+            ["op": "createComputePipeline", "id": 3, "layout": "auto",
+             "compute": ["module": 1, "entryPoint": "fill", "constants": ["blockSize": 8]]],
+            ["op": "getBindGroupLayout", "id": 4, "pipeline": 3, "index": 0],
+            ["op": "createBindGroup", "id": 5, "layout": 4, "entries": [
+                ["binding": 0, "resource": ["buffer": 2]],
+            ]],
+            ["op": "beginComputePass"],
+            ["op": "setPipeline", "pipeline": 3],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 5],
+            ["op": "dispatchWorkgroups", "x": 1],
+            ["op": "endPass"],
+        ])
+        let output = try harness.readBufferSync(handle: 2, as: UInt32.self, size: 32)
+        XCTAssertEqual(output, [1, 2, 3, 4, 5, 6, 7, 8])
+
+        // Past the device limit it is a pipeline-creation validation error — never a Metal assertion.
+        let rejected = harness.execute([
+            ["op": "createComputePipeline", "id": 6, "layout": "auto",
+             "compute": ["module": 1, "entryPoint": "fill", "constants": ["blockSize": 65536]]],
+        ])
+        XCTAssertEqual(rejected["ok"] as? Bool, false)
+        XCTAssertTrue(
+            harness.describeErrors(rejected).contains("exceeds maxComputeWorkgroupSizeX"),
+            harness.describeErrors(rejected)
+        )
+    }
+
     func test_arrayLengthReturnsTheBoundSize() throws {
         // A shader cannot know a buffer's size, so the runtime plugs a size table into the reserved index.
         // What is checked here: (1) a whole binding, (2) a partial binding, (3) an array at the end of a struct.

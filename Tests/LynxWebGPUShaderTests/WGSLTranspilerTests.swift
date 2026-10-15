@@ -1072,6 +1072,180 @@ final class WGSLTranspilerTests: XCTestCase {
         MetalCompilerHarness.assertCompiles(msl)
     }
 
+    // MARK: - @workgroup_size
+
+    func test_workgroupSizeArgumentsAreEvaluatedAsExpressions() throws {
+        // Each argument used to be read as `Int(text) ?? 1` — every one of these dispatched 1 thread.
+        let source = """
+        const BLOCK = 8u;
+        @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+
+        @compute @workgroup_size(64u)
+        fn suffixed(@builtin(global_invocation_id) id: vec3u) { out[id.x] = 1u; }
+
+        @compute @workgroup_size(0x10, BLOCK, 2)
+        fn hexAndConst(@builtin(global_invocation_id) id: vec3u) { out[id.x] = 2u; }
+
+        @compute @workgroup_size(BLOCK * 2, (1i), u32(4))
+        fn expressions(@builtin(global_invocation_id) id: vec3u) { out[id.x] = 3u; }
+        """
+        let module = try WGSLShaderModule(source: source)
+        let expected = ["suffixed": [64, 1, 1], "hexAndConst": [16, 8, 2], "expressions": [16, 1, 4]]
+        for (entry, size) in expected.sorted(by: { $0.key < $1.key }) {
+            let evaluated = try XCTUnwrap(module.workgroupSize(of: entry), entry)
+            XCTAssertEqual([evaluated.x, evaluated.y, evaluated.z], size, entry)
+            let reflected = try XCTUnwrap(module.reflection.entryPoint(named: entry)?.workgroupSize, entry)
+            XCTAssertEqual([reflected.x, reflected.y, reflected.z], size, entry)
+            _ = try translate(source, entryPoints: [entry])
+        }
+    }
+
+    func test_anOverrideWorkgroupSizeTakesThePipelineConstants() throws {
+        // webgpu-samples' gameOfLife: `@workgroup_size(blockSize, blockSize)`.
+        let source = """
+        override blockSize: u32 = 8u;
+        override depth: u32;
+        @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+
+        @compute @workgroup_size(blockSize, blockSize)
+        fn main(@builtin(global_invocation_id) id: vec3u) { out[id.x] = blockSize; }
+
+        @compute @workgroup_size(4, 1, depth)
+        fn deep(@builtin(global_invocation_id) id: vec3u) { out[id.x] = depth; }
+        """
+        let module = try WGSLShaderModule(source: source)
+
+        // The default, then a supplied value.
+        let byDefault = try XCTUnwrap(module.workgroupSize(of: "main"))
+        XCTAssertEqual([byDefault.x, byDefault.y, byDefault.z], [8, 8, 1])
+        XCTAssertEqual(module.reflection.entryPoint(named: "main")?.workgroupSize?.x, 8)
+        let supplied = try XCTUnwrap(module.workgroupSize(of: "main", constants: ["blockSize": 4, "depth": 1]))
+        XCTAssertEqual([supplied.x, supplied.y, supplied.z], [4, 4, 1])
+
+        // No default: unknown until the pipeline supplies it — a clear error, never 1.
+        XCTAssertNil(module.reflection.entryPoint(named: "deep")?.workgroupSize)
+        XCTAssertThrowsError(try module.workgroupSize(of: "deep")) { error in
+            let message = (error as? WGPUError)?.message ?? ""
+            XCTAssertTrue(message.contains("override 'depth' has no value"), message)
+            XCTAssertTrue(message.contains("@workgroup_size(4, 1, depth)"), message)
+        }
+        let deep = try XCTUnwrap(module.workgroupSize(of: "deep", constants: ["depth": 16]))
+        XCTAssertEqual([deep.x, deep.y, deep.z], [4, 1, 16])
+
+        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["main"]))
+        let msl = try module.translateToMSL(
+            entryPoints: ["main"], bindings: bindings, constants: ["blockSize": 4, "depth": 1]
+        )
+        MetalCompilerHarness.assertCompiles(msl)
+    }
+
+    func test_workgroupMemoryZeroInitStridesByTheEvaluatedSize() throws {
+        // The zero-init loop strides by the thread count. Too large a stride leaves slots never zeroed,
+        // so it must be the size the pipeline dispatches — constants applied.
+        let source = """
+        override blockSize: u32 = 8u;
+        const ROWS = 0x2;
+        @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+        var<workgroup> tile: array<f32, 256>;
+
+        @compute @workgroup_size(blockSize, ROWS)
+        fn main(@builtin(local_invocation_index) index: u32) {
+            tile[index] = f32(index);
+            workgroupBarrier();
+            out[index] = tile[255u - index];
+        }
+        """
+        let module = try WGSLShaderModule(source: source)
+        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["main"]))
+        for (constants, stride) in [([String: Double](), 16), (["blockSize": 32], 64), (["blockSize": 1], 2)] {
+            let msl = try module.translateToMSL(entryPoints: ["main"], bindings: bindings, constants: constants)
+            XCTAssertTrue(msl.contains("wgpu_zi += \(stride)u"), "\(constants) → stride \(stride):\n\(msl)")
+            let size = try XCTUnwrap(module.workgroupSize(of: "main", constants: constants))
+            XCTAssertEqual(size.x * size.y * size.z, stride, "the dispatch and the zero-init agree")
+            MetalCompilerHarness.assertCompiles(msl)
+        }
+    }
+
+    func test_aWorkgroupSizeThatIsNotAPositiveIntegerIsAShaderCreationError() {
+        let cases: [(attribute: String, prelude: String, reason: String)] = [
+            ("@workgroup_size(0)", "", "must be at least 1"),
+            ("@workgroup_size(8, -1)", "", "must be at least 1"),
+            ("@workgroup_size(4, 4, ZERO)", "const ZERO = 0u;", "must be at least 1"),
+            ("@workgroup_size(1.5)", "", "not an integer"),
+            ("@workgroup_size(0x)", "", "not a valid integer literal"),
+            ("@workgroup_size(missing)", "", "not a module-scope const"),
+            ("@workgroup_size()", "", "one to three arguments"),
+            ("@workgroup_size(1, 1, 1, 1)", "", "one to three arguments"),
+            ("@workgroup_size(1<<2)", "", "not supported"),
+        ]
+        for testCase in cases {
+            let source = """
+            \(testCase.prelude)
+            @compute \(testCase.attribute) fn main() {}
+            """
+            XCTAssertThrowsError(try WGSLShaderModule(source: source), testCase.attribute) { error in
+                let error = error as? WGPUError
+                let message = error?.message ?? ""
+                XCTAssertTrue(message.contains(testCase.attribute), "names the attribute: \(message)")
+                XCTAssertTrue(message.contains(testCase.reason), "says why (\(testCase.reason)): \(message)")
+                XCTAssertEqual(error?.line, 2, message)
+            }
+        }
+
+        // A compute entry point must declare one — dispatching 1 thread silently is what this replaces.
+        XCTAssertThrowsError(try WGSLShaderModule(source: "@compute fn main() {}")) { error in
+            let message = (error as? WGPUError)?.message ?? ""
+            XCTAssertTrue(message.contains("has no @workgroup_size"), message)
+        }
+
+        // An override argument is left to pipeline creation, even when its default is 0.
+        XCTAssertNoThrow(try WGSLShaderModule(source: """
+        override size: u32 = 0u;
+        @compute @workgroup_size(size) fn main() {}
+        """))
+    }
+
+    func test_aWorkgroupSizeOutsideTheLimitsIsAPipelineCreationError() throws {
+        let module = try WGSLShaderModule(source: """
+        override wx: i32 = 64;
+        override wy: u32 = 1u;
+        @compute @workgroup_size(wx, wy) fn byOverride() {}
+        @compute @workgroup_size(512) fn wide() {}
+        @compute @workgroup_size(1, 1, 65) fn deep() {}
+        @compute @workgroup_size(16, 32) fn many() {}
+        @compute @workgroup_size(1024) fn large() {}
+        """)
+        func assertRejected(
+            _ entry: String, constants: [String: Double] = [:], limits: WGSLWorkgroupLimits = .specDefaults,
+            _ reason: String, line: UInt = #line
+        ) {
+            XCTAssertThrowsError(
+                try module.workgroupSize(of: entry, constants: constants, limits: limits), entry, line: line
+            ) { error in
+                let error = error as? WGPUError
+                XCTAssertEqual(error?.kind, .validation, line: line)
+                XCTAssertTrue(error?.message.contains(reason) == true, "\(reason): \(error?.message ?? "")", line: line)
+            }
+        }
+
+        // The spec's default limits: 256 × 256 × 64, 256 invocations.
+        assertRejected("wide", "512 exceeds maxComputeWorkgroupSizeX (256)")
+        assertRejected("deep", "65 exceeds maxComputeWorkgroupSizeZ (64)")
+        assertRejected("many", "512 invocations exceed maxComputeInvocationsPerWorkgroup (256)")
+        assertRejected("byOverride", constants: ["wy": 300], "300 exceeds maxComputeWorkgroupSizeY (256)")
+        assertRejected("byOverride", constants: ["wx": 0], "must be at least 1")
+        assertRejected("byOverride", constants: ["wx": -2], "must be at least 1")
+        assertRejected("byOverride", constants: ["wx": 2.5], "not an integer")
+
+        // A device that advertises more lets more through — the backend passes its own limits.
+        let generous = WGSLWorkgroupLimits(maxSizeX: 1024, maxSizeY: 1024, maxSizeZ: 1024, maxInvocations: 1024)
+        let large = try XCTUnwrap(module.workgroupSize(of: "large", limits: generous))
+        XCTAssertEqual([large.x, large.y, large.z], [1024, 1, 1])
+        assertRejected("large", "1024 exceeds maxComputeWorkgroupSizeX (256)")
+        let fits = try XCTUnwrap(module.workgroupSize(of: "byOverride", constants: ["wx": 16, "wy": 16]))
+        XCTAssertEqual([fits.x, fits.y, fits.z], [16, 16, 1])
+    }
+
     // MARK: - External textures
 
     func test_anExternalTextureTranslatesToEdgeClampedSampling() throws {

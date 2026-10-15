@@ -40,6 +40,7 @@ struct WGSLParser {
         var parser = WGSLParser(tokens: try WGSLLexer.tokenize(source))
         var module = try parser.parseModule()
         try module.resolveIntegerAttributes()
+        try module.validateWorkgroupSizes()
         return module
     }
 

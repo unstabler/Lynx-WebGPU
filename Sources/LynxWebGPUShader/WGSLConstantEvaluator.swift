@@ -70,6 +70,9 @@ struct WGSLConstantEvaluator {
     /// Why a value could not be computed. Callers wrap it into a `WGPUError` with their own context.
     struct Failure: Error, Equatable {
         var reason: String
+        /// The expression names an `override` where overrides are not allowed. An override-expression
+        /// position (`@workgroup_size`) evaluated before pipeline constants are known defers on this.
+        var referencesOverride = false
     }
 
     let module: WGSLModule
@@ -151,7 +154,10 @@ struct WGSLConstantEvaluator {
 
         if let constant = module.constants.first(where: { $0.name == name }) {
             if constant.isOverride, !allowsOverrides {
-                throw Failure(reason: "'\(name)' is an override — this position needs a const-expression")
+                throw Failure(
+                    reason: "'\(name)' is an override — this position needs a const-expression",
+                    referencesOverride: true
+                )
             }
             guard let value = constant.value else {
                 throw Failure(reason: "override '\(name)' has no value (no default and none supplied)")
@@ -261,16 +267,19 @@ extension WGSLModule {
         }
     }
 
+    /// A validation error quoting the attribute as written, with its line and the reason.
+    static func attributeError(_ attribute: WGSLAttribute, _ reason: String) -> WGPUError {
+        let written = "@\(attribute.name)(\(attribute.arguments.joined(separator: ", ")))"
+        return WGPUError(
+            kind: .validation,
+            message: "WGSL attribute error (line \(attribute.line)): \(written) — \(reason)",
+            line: attribute.line
+        )
+    }
+
     private static func integerValue(of attribute: WGSLAttribute, module: WGSLModule) throws -> Int? {
         guard let rule = integerRequirement(of: attribute.name) else { return nil }
-        let written = "@\(attribute.name)(\(attribute.arguments.joined(separator: ", ")))"
-        func failure(_ reason: String) -> WGPUError {
-            WGPUError(
-                kind: .validation,
-                message: "WGSL attribute error (line \(attribute.line)): \(written) — \(reason)",
-                line: attribute.line
-            )
-        }
+        func failure(_ reason: String) -> WGPUError { attributeError(attribute, reason) }
 
         guard attribute.arguments.count == 1 else { throw failure("takes exactly one argument") }
         guard let expression = attribute.expressions.first ?? nil else {
@@ -287,5 +296,90 @@ extension WGSLModule {
         guard value <= Int(UInt32.max) else { throw failure("\(value) does not fit in u32") }
         guard rule.valid(value) else { throw failure("\(value) \(rule.text)") }
         return value
+    }
+}
+
+// MARK: - @workgroup_size
+
+/// The device limits a compute entry point's `@workgroup_size` is checked against at pipeline
+/// creation (`maxComputeWorkgroupSizeX/Y/Z`, `maxComputeInvocationsPerWorkgroup`).
+public struct WGSLWorkgroupLimits: Equatable, Sendable {
+    public var maxSizeX: Int
+    public var maxSizeY: Int
+    public var maxSizeZ: Int
+    public var maxInvocations: Int
+
+    public init(maxSizeX: Int, maxSizeY: Int, maxSizeZ: Int, maxInvocations: Int) {
+        self.maxSizeX = maxSizeX
+        self.maxSizeY = maxSizeY
+        self.maxSizeZ = maxSizeZ
+        self.maxInvocations = maxInvocations
+    }
+
+    /// The spec's default limits — what every device guarantees.
+    public static let specDefaults = WGSLWorkgroupLimits(maxSizeX: 256, maxSizeY: 256, maxSizeZ: 64, maxInvocations: 256)
+}
+
+extension WGSLModule {
+    /// Shader-creation checks on `@workgroup_size` — and a compute entry point must have one.
+    ///
+    /// The arguments are override-expressions: one that names an `override` is settled at pipeline
+    /// creation (`workgroupSize(of:)` on the module the constants were applied to), a const one must
+    /// already be at least 1. Each argument used to be read as `Int(text) ?? 1`, so `64u`, `0x40` or a
+    /// `const` name silently dispatched one thread per workgroup.
+    func validateWorkgroupSizes() throws {
+        for function in functions {
+            guard let attribute = function.attributes.first(named: "workgroup_size") else {
+                if function.stage == .compute, let compute = function.attributes.first(named: "compute") {
+                    throw Self.attributeError(
+                        compute, "compute entry point '\(function.name)' has no @workgroup_size"
+                    )
+                }
+                continue
+            }
+            _ = try workgroupDimensions(of: attribute, allowsOverrides: false)
+        }
+    }
+
+    /// An entry point's `@workgroup_size`, evaluated — nil when it has none. Missing y / z are 1.
+    ///
+    /// Overrides resolve to their values **in this module**, so call it on the module the pipeline's
+    /// `constants` were applied to. The dispatch size and the emitter's `var<workgroup>` zero-init
+    /// stride both come from here — if they disagreed, slots past the real thread count would never
+    /// be zeroed.
+    func workgroupSize(of function: WGSLFunction) throws -> (x: Int, y: Int, z: Int)? {
+        guard let attribute = function.attributes.first(named: "workgroup_size") else { return nil }
+        // With overrides allowed nothing is deferred, so every dimension has a value.
+        let values = try workgroupDimensions(of: attribute, allowsOverrides: true).map { $0 ?? 1 }
+        return (values[0], values.count > 1 ? values[1] : 1, values.count > 2 ? values[2] : 1)
+    }
+
+    /// Each argument's value — nil for one that names an override while overrides are not allowed yet.
+    private func workgroupDimensions(of attribute: WGSLAttribute, allowsOverrides: Bool) throws -> [Int?] {
+        func failure(_ reason: String) -> WGPUError { Self.attributeError(attribute, reason) }
+        guard (1...3).contains(attribute.arguments.count) else { throw failure("takes one to three arguments") }
+
+        var values: [Int?] = []
+        for index in attribute.arguments.indices {
+            guard index < attribute.expressions.count, let expression = attribute.expressions[index] else {
+                throw failure("'\(attribute.arguments[index])' is not an expression")
+            }
+            var evaluator = WGSLConstantEvaluator(
+                module: self, allowsOverrides: allowsOverrides, allowsFunctionConstants: false
+            )
+            let value: Int
+            do {
+                value = try evaluator.evaluate(expression)
+            } catch let error as WGSLConstantEvaluator.Failure {
+                if error.referencesOverride, !allowsOverrides {
+                    values.append(nil)
+                    continue
+                }
+                throw failure(error.reason)
+            }
+            guard value >= 1 else { throw failure("\(value) — each dimension must be at least 1") }
+            values.append(value)
+        }
+        return values
     }
 }

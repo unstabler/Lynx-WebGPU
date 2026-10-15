@@ -572,9 +572,9 @@ struct MSLEmitter {
                 try emitter.emitLocalGlobal(global)
             }
             if stage == .compute, !workgroupGlobals.isEmpty {
-                try emitter.emitWorkgroupZeroInit(
-                    workgroupGlobals, threadsPerGroup: function.workgroupSize ?? (1, 1, 1)
-                )
+                // The module here has the pipeline constants applied — the same size the dispatch uses.
+                let threadsPerGroup = try emitter.module.workgroupSize(of: function) ?? (1, 1, 1)
+                try emitter.emitWorkgroupZeroInit(workgroupGlobals, threadsPerGroup: threadsPerGroup)
             }
             for statement in interface.prelude { emitter.line(statement) }
 
