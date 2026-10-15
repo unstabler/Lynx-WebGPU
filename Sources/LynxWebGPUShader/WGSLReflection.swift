@@ -190,6 +190,10 @@ enum WGSLReflectionBuilder {
     }
 
     /// Names of globals holding a runtime-sized array (`array<T>`), directly or as a struct member.
+    ///
+    /// The struct is found through `WGSLLayout.resolveStruct`, as the emitter does — a store type
+    /// spelled with an alias (`alias B = Buf;`) must still bring the table, or the emitted clamp reads
+    /// a table nobody passed in. A pointer (`let p = &g;`) needs nothing extra: it names `g` here.
     private static func runtimeArrayGlobalNames(in module: WGSLModule) -> Set<String> {
         var names = Set<String>()
         for global in module.globals {
@@ -197,7 +201,7 @@ enum WGSLReflectionBuilder {
             case .array(_, nil):
                 names.insert(global.name)
             case .named(let structName):
-                guard let structure = module.structNamed(structName) else { continue }
+                guard let structure = WGSLLayout.resolveStruct(structName, module: module) else { continue }
                 if structure.members.contains(where: {
                     if case .array(_, nil) = $0.type { return true } else { return false }
                 }) {

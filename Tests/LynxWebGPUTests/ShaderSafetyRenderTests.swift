@@ -89,6 +89,114 @@ final class ShaderSafetyRenderTests: XCTestCase {
         XCTAssertEqual(result, [0, 0, 0, 9], "the millionth write must clamp to the buffer's last slot")
     }
 
+    /// The same write **through a `let` pointer** — the bound must follow the pointer back to the binding.
+    func test_anOutOfRangeWriteThroughALetPointerIsClamped() throws {
+        harness.executeExpectingSuccess([
+            ["op": "createShaderModule", "id": 1, "code": """
+            @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+            @group(0) @binding(1) var<uniform> idx: u32;
+            @compute @workgroup_size(1) fn cs() {
+                let p = &out;
+                (*p)[idx] = 9.0;
+            }
+            """],
+            ["op": "createBuffer", "id": 2, "size": 16,
+             "usage": TestUsage.storage | TestUsage.copySrc],
+            ["op": "createBuffer", "id": 3, "usage": TestUsage.uniform,
+             "data": [UInt32(1_000_000)].withUnsafeBufferPointer { Data(buffer: $0).base64EncodedString() }],
+            ["op": "createBuffer", "id": 4, "size": 16,
+             "usage": TestUsage.copyDst | TestUsage.mapRead],
+            ["op": "createComputePipeline", "id": 5, "layout": "auto",
+             "compute": ["module": 1, "entryPoint": "cs"]],
+            ["op": "getBindGroupLayout", "id": 6, "pipeline": 5, "index": 0],
+            ["op": "createBindGroup", "id": 7, "layout": 6, "entries": [
+                ["binding": 0, "resource": ["buffer": 2]],
+                ["binding": 1, "resource": ["buffer": 3]],
+            ]],
+            ["op": "beginComputePass"],
+            ["op": "setPipeline", "pipeline": 5],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 7],
+            ["op": "dispatchWorkgroups", "x": 1],
+            ["op": "endPass"],
+            ["op": "copyBufferToBuffer", "source": 2, "destination": 4, "size": 16],
+        ])
+        let result = try harness.readBufferSync(handle: 4, as: Float.self)
+        XCTAssertEqual(result, [0, 0, 0, 9], "a write through a pointer must clamp to the buffer's last slot")
+    }
+
+    /// A runtime-sized **member** of a struct spelled through an alias, reached through a pointer.
+    /// `items` starts at byte 4, so a 16-byte binding holds 3 elements — the last one is byte 12.
+    func test_anOutOfRangeWriteToAnAliasedStructMemberIsClamped() throws {
+        harness.executeExpectingSuccess([
+            ["op": "createShaderModule", "id": 1, "code": """
+            struct Buf { head: f32, items: array<f32> }
+            alias B = Buf;
+            @group(0) @binding(0) var<storage, read_write> buf: B;
+            @group(0) @binding(1) var<uniform> idx: u32;
+            @compute @workgroup_size(1) fn cs() {
+                let q = &buf;
+                (*q).items[idx] = 9.0;
+            }
+            """],
+            ["op": "createBuffer", "id": 2, "size": 16,
+             "usage": TestUsage.storage | TestUsage.copySrc],
+            ["op": "createBuffer", "id": 3, "usage": TestUsage.uniform,
+             "data": [UInt32(1_000_000)].withUnsafeBufferPointer { Data(buffer: $0).base64EncodedString() }],
+            ["op": "createBuffer", "id": 4, "size": 16,
+             "usage": TestUsage.copyDst | TestUsage.mapRead],
+            ["op": "createComputePipeline", "id": 5, "layout": "auto",
+             "compute": ["module": 1, "entryPoint": "cs"]],
+            ["op": "getBindGroupLayout", "id": 6, "pipeline": 5, "index": 0],
+            ["op": "createBindGroup", "id": 7, "layout": 6, "entries": [
+                ["binding": 0, "resource": ["buffer": 2]],
+                ["binding": 1, "resource": ["buffer": 3]],
+            ]],
+            ["op": "beginComputePass"],
+            ["op": "setPipeline", "pipeline": 5],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 7],
+            ["op": "dispatchWorkgroups", "x": 1],
+            ["op": "endPass"],
+            ["op": "copyBufferToBuffer", "source": 2, "destination": 4, "size": 16],
+        ])
+        let result = try harness.readBufferSync(handle: 4, as: Float.self)
+        XCTAssertEqual(result, [0, 0, 0, 9], "a write to an aliased struct's runtime array must clamp to its last slot")
+    }
+
+    /// A binding **smaller than the array's start offset** holds no element. `items` starts at byte 16
+    /// but only 4 bytes are bound: in uint32, `4 - 16` wraps to ~4e9 and would let `items[2]` land on
+    /// byte 24 — outside the binding. The count must saturate at 0 and the write must be dropped.
+    func test_aBindingSmallerThanTheArrayOffsetDropsTheWrite() throws {
+        harness.executeExpectingSuccess([
+            ["op": "createShaderModule", "id": 1, "code": """
+            struct Buf { head: vec4f, items: array<f32> }
+            @group(0) @binding(0) var<storage, read_write> buf: Buf;
+            @group(0) @binding(1) var<uniform> idx: u32;
+            @compute @workgroup_size(1) fn cs() { buf.items[idx] = 9.0; }
+            """],
+            ["op": "createBuffer", "id": 2, "size": 32,
+             "usage": TestUsage.storage | TestUsage.copySrc],
+            ["op": "createBuffer", "id": 3, "usage": TestUsage.uniform,
+             "data": [UInt32(2)].withUnsafeBufferPointer { Data(buffer: $0).base64EncodedString() }],
+            ["op": "createBuffer", "id": 4, "size": 32,
+             "usage": TestUsage.copyDst | TestUsage.mapRead],
+            ["op": "createComputePipeline", "id": 5, "layout": "auto",
+             "compute": ["module": 1, "entryPoint": "cs"]],
+            ["op": "getBindGroupLayout", "id": 6, "pipeline": 5, "index": 0],
+            ["op": "createBindGroup", "id": 7, "layout": 6, "entries": [
+                ["binding": 0, "resource": ["buffer": 2, "offset": 0, "size": 4]],
+                ["binding": 1, "resource": ["buffer": 3]],
+            ]],
+            ["op": "beginComputePass"],
+            ["op": "setPipeline", "pipeline": 5],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 7],
+            ["op": "dispatchWorkgroups", "x": 1],
+            ["op": "endPass"],
+            ["op": "copyBufferToBuffer", "source": 2, "destination": 4, "size": 32],
+        ])
+        let result = try harness.readBufferSync(handle: 4, as: Float.self)
+        XCTAssertEqual(result, [Float](repeating: 0, count: 8), "a write past a too-small binding landed in memory")
+    }
+
     /// `var<workgroup>` starts at zero — reading without writing must give 0.
     func test_workgroupMemoryStartsAtZero() throws {
         harness.executeExpectingSuccess([

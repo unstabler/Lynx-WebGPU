@@ -130,10 +130,15 @@ enum WGSLLayout {
     // MARK: - Helpers
 
     static func resolveStruct(_ name: String, module: WGSLModule) -> WGSLStruct? {
-        if let structure = module.structNamed(name) { return structure }
-        // Follow an alias one step.
-        if let alias = module.aliases.first(where: { $0.name == name }), case .named(let target) = alias.type {
-            return module.structNamed(target)
+        // Follow aliases, including chains (`alias A = B; alias B = Buf;`). WGSL forbids cycles;
+        // the visited set only keeps a malformed module from looping.
+        var name = name
+        var visited = Set<String>()
+        while visited.insert(name).inserted {
+            if let structure = module.structNamed(name) { return structure }
+            guard let alias = module.aliases.first(where: { $0.name == name }),
+                  case .named(let target) = alias.type else { return nil }
+            name = target
         }
         return nil
     }
