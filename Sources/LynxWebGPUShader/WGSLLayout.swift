@@ -27,104 +27,137 @@ enum WGSLLayout {
         var align: Int
     }
 
+    /// Every size and alignment the calculator returns is clamped to this (1 TiB) — far past any
+    /// buffer a device can bind, and small enough that summing a struct's members cannot overflow
+    /// `Int` however large the declared array lengths or `@size`/`@align` values are.
+    static let maximumByteSize = 1 << 40
+
     static func roundUp(_ alignment: Int, _ value: Int) -> Int {
         guard alignment > 0 else { return value }
         return ((value + alignment - 1) / alignment) * alignment
     }
 
     // MARK: - Alignment / size
+    //
+    // Every query goes through one `Walk`, which measures each type **once** (alignment and size
+    // together) and remembers each struct's placement. Measuring alignment and size separately, as
+    // naive recursion does, re-lays out every nested struct twice per level — `S1 { a: S0 }`,
+    // `S2 { a: S1 }`, … is then exponential in the depth, and so is a struct holding two copies
+    // of the one below it. The parser bounds the depth (`WGSLParser.maximumCompositeNesting`) and
+    // rejects recursive types; the walk also refuses to re-enter a struct it is inside, so it stays
+    // bounded whatever AST it is handed.
 
     static func align(of type: WGSLType, module: WGSLModule, uniform: Bool) -> Int {
-        switch type {
-        case .scalar(let name):
-            return name == "f16" ? 2 : 4
-        case .vector(let size, let element):
-            let elementAlign = align(of: element, module: module, uniform: uniform)
-            return (size == 2 ? 2 : 4) * elementAlign
-        case .matrix(_, let rows, let element):
-            return align(of: .vector(size: rows, element: element), module: module, uniform: uniform)
-        case .array(let element, _):
-            let elementAlign = align(of: element, module: module, uniform: uniform)
-            return uniform ? roundUp(16, elementAlign) : elementAlign
-        case .atomic:
-            return 4
-        case .named(let name):
-            guard let structure = resolveStruct(name, module: module) else { return 4 }
-            let placement = layout(of: structure, module: module, uniform: uniform)
-            return placement.align
-        case .pointer, .texture, .sampler, .void:
-            return 4
-        }
+        Walk(module: module, uniform: uniform).measure(type).align
     }
 
     static func size(of type: WGSLType, module: WGSLModule, uniform: Bool) -> Int {
-        switch type {
-        case .scalar(let name):
-            return name == "f16" ? 2 : 4
-        case .vector(let count, let element):
-            return count * size(of: element, module: module, uniform: uniform)
-        case .matrix(let columns, let rows, let element):
-            let column = WGSLType.vector(size: rows, element: element)
-            let stride = roundUp(
-                align(of: column, module: module, uniform: uniform),
-                size(of: column, module: module, uniform: uniform)
-            )
-            return columns * stride
-        case .array(let element, let count):
-            let stride = arrayStride(element: element, module: module, uniform: uniform)
-            guard let count, let literal = constantValue(count, module: module) else { return stride }
-            return literal * stride
-        case .atomic:
-            return 4
-        case .named(let name):
-            guard let structure = resolveStruct(name, module: module) else { return 4 }
-            return layout(of: structure, module: module, uniform: uniform).size
-        case .pointer, .texture, .sampler, .void:
-            return 4
-        }
+        Walk(module: module, uniform: uniform).measure(type).size
     }
 
     static func arrayStride(element: WGSLType, module: WGSLModule, uniform: Bool) -> Int {
-        let elementAlign = align(of: element, module: module, uniform: uniform)
-        let stride = roundUp(elementAlign, size(of: element, module: module, uniform: uniform))
-        return uniform ? roundUp(16, stride) : stride
+        let walk = Walk(module: module, uniform: uniform)
+        return walk.stride(of: walk.measure(element))
     }
 
     // MARK: - Struct layout
 
     static func layout(of structure: WGSLStruct, module: WGSLModule, uniform: Bool) -> StructPlacement {
-        var members: [MemberPlacement] = []
-        var offset = 0
-        var maximumAlign = 1
+        Walk(module: module, uniform: uniform).layout(of: structure)
+    }
 
-        for member in structure.members {
-            var memberAlign = align(of: member.type, module: module, uniform: uniform)
-            var memberSize = size(of: member.type, module: module, uniform: uniform)
-            if let explicit = member.attributes.first(named: "align")?.firstInt { memberAlign = explicit }
-            if let explicit = member.attributes.first(named: "size")?.firstInt { memberSize = max(memberSize, explicit) }
+    private final class Walk {
+        let module: WGSLModule
+        let uniform: Bool
+        /// Structs currently being laid out — meeting one again would be a cycle.
+        private var enclosing: [String] = []
+        private var placements: [String: StructPlacement] = [:]
 
-            offset = roundUp(memberAlign, offset)
-            members.append(MemberPlacement(
-                name: member.name, type: member.type,
-                offset: offset, size: memberSize, align: memberAlign,
-                needsPackedVector: false
-            ))
-            offset += memberSize
-            maximumAlign = max(maximumAlign, memberAlign)
+        init(module: WGSLModule, uniform: Bool) {
+            self.module = module
+            self.uniform = uniform
         }
 
-        let structAlign = uniform ? roundUp(16, maximumAlign) : maximumAlign
-        // If a member after a vec3 uses bytes 12...15, MSL `float3` (16 bytes) cannot line it up.
-        for index in members.indices {
-            guard case .vector(3, _) = members[index].type else { continue }
-            let end = members[index].offset + 16
-            let nextOffset = index + 1 < members.count
-                ? members[index + 1].offset
-                : roundUp(structAlign, offset)
-            members[index].needsPackedVector = nextOffset < end
+        func measure(_ type: WGSLType) -> (align: Int, size: Int) {
+            switch type {
+            case .scalar(let name):
+                let size = name == "f16" ? 2 : 4
+                return (size, size)
+            case .vector(let count, let element):
+                let component = measure(element)
+                return ((count == 2 ? 2 : 4) * component.align, count * component.size)
+            case .matrix(let columns, let rows, let element):
+                let column = measure(.vector(size: rows, element: element))
+                return (column.align, columns * roundUp(column.align, column.size))
+            case .array(let element, let count):
+                let measured = measure(element)
+                let align = uniform ? roundUp(16, measured.align) : measured.align
+                let elementStride = stride(of: measured)
+                guard let count, let literal = constantValue(count, module: module) else { return (align, elementStride) }
+                let (total, overflow) = literal.multipliedReportingOverflow(by: elementStride)
+                return (align, overflow ? maximumByteSize : min(total, maximumByteSize))
+            case .atomic:
+                return (4, 4)
+            case .named(let name):
+                guard let structure = resolveStruct(name, module: module) else { return (4, 4) }
+                let placement = layout(of: structure)
+                return (placement.align, placement.size)
+            case .pointer, .texture, .sampler, .void:
+                return (4, 4)
+            }
         }
 
-        return StructPlacement(members: members, size: roundUp(structAlign, offset), align: structAlign)
+        func stride(of element: (align: Int, size: Int)) -> Int {
+            let stride = roundUp(element.align, element.size)
+            return uniform ? roundUp(16, stride) : stride
+        }
+
+        func layout(of structure: WGSLStruct) -> StructPlacement {
+            if let known = placements[structure.name] { return known }
+            // A struct inside itself (or nested past the limit) has no layout — stop instead of recursing.
+            guard !enclosing.contains(structure.name), enclosing.count < WGSLParser.maximumCompositeNesting else {
+                return StructPlacement(members: [], size: 0, align: 1)
+            }
+            enclosing.append(structure.name)
+            defer { enclosing.removeLast() }
+
+            var members: [MemberPlacement] = []
+            var offset = 0
+            var maximumAlign = 1
+
+            for member in structure.members {
+                var (memberAlign, memberSize) = measure(member.type)
+                if let explicit = member.attributes.first(named: "align")?.firstInt { memberAlign = explicit }
+                if let explicit = member.attributes.first(named: "size")?.firstInt { memberSize = max(memberSize, explicit) }
+                // Attribute values come straight from the source — keep the running offset from overflowing.
+                memberAlign = min(memberAlign, maximumByteSize)
+                memberSize = min(memberSize, maximumByteSize)
+
+                offset = roundUp(memberAlign, offset)
+                members.append(MemberPlacement(
+                    name: member.name, type: member.type,
+                    offset: offset, size: memberSize, align: memberAlign,
+                    needsPackedVector: false
+                ))
+                offset = min(offset + memberSize, maximumByteSize)
+                maximumAlign = max(maximumAlign, memberAlign)
+            }
+
+            let structAlign = uniform ? roundUp(16, maximumAlign) : maximumAlign
+            // If a member after a vec3 uses bytes 12...15, MSL `float3` (16 bytes) cannot line it up.
+            for index in members.indices {
+                guard case .vector(3, _) = members[index].type else { continue }
+                let end = members[index].offset + 16
+                let nextOffset = index + 1 < members.count
+                    ? members[index + 1].offset
+                    : roundUp(structAlign, offset)
+                members[index].needsPackedVector = nextOffset < end
+            }
+
+            let placement = StructPlacement(members: members, size: roundUp(structAlign, offset), align: structAlign)
+            placements[structure.name] = placement
+            return placement
+        }
     }
 
     // MARK: - Helpers
@@ -139,28 +172,34 @@ enum WGSLLayout {
     }
 
     /// Computes a value that must be known at compile time, such as an array length. Only integer literals and module constants are supported.
-    static func constantValue(_ expression: WGSLExpression, module: WGSLModule) -> Int? {
+    ///
+    /// `depth` bounds the walk — a cyclic `const a = b; const b = a;` (invalid WGSL) gives up instead of
+    /// recursing forever, which surfaces as "the array length cannot be computed".
+    static func constantValue(_ expression: WGSLExpression, module: WGSLModule, depth: Int = 0) -> Int? {
+        guard depth < WGSLParser.maximumCompositeNesting else { return nil }
         switch expression {
         case .intLiteral(let text):
             return Int(text.filter(\.isNumber))
         case .paren(let inner):
-            return constantValue(inner, module: module)
+            return constantValue(inner, module: module, depth: depth + 1)
         case .identifier(let name):
             if let constant = module.constants.first(where: { $0.name == name }),
                let value = constant.value {
-                return constantValue(value, module: module)
+                return constantValue(value, module: module, depth: depth + 1)
             }
             // A `const` declared inside a function is a compile-time constant too (`var a: array<T, maxLayers>;`).
-            return uniqueLocalConstant(named: name, module: module)
+            return uniqueLocalConstant(named: name, module: module, depth: depth + 1)
         case .binary(let op, let left, let right):
-            guard let l = constantValue(left, module: module), let r = constantValue(right, module: module) else {
+            guard let l = constantValue(left, module: module, depth: depth + 1),
+                  let r = constantValue(right, module: module, depth: depth + 1) else {
                 return nil
             }
             switch op {
-            case "+": return l + r
-            case "-": return l - r
-            case "*": return l * r
-            case "/": return r == 0 ? nil : l / r
+            // Overflow means no usable length rather than a trap (the operands come from the source).
+            case "+": return checked(l.addingReportingOverflow(r))
+            case "-": return checked(l.subtractingReportingOverflow(r))
+            case "*": return checked(l.multipliedReportingOverflow(by: r))
+            case "/": return r == 0 ? nil : checked(l.dividedReportingOverflow(by: r))
             default: return nil
             }
         default:
@@ -174,11 +213,11 @@ enum WGSLLayout {
     /// context when settling an array size. So it is used **only when the module settles on one
     /// value** — if the same name holds different values per function we cannot tell which, so we
     /// give up and raise the error as before.
-    private static func uniqueLocalConstant(named name: String, module: WGSLModule) -> Int? {
+    private static func uniqueLocalConstant(named name: String, module: WGSLModule, depth: Int) -> Int? {
         var found: Int?
         for function in module.functions {
             for expression in localConstants(named: name, in: function.body) {
-                guard let value = constantValue(expression, module: module) else { return nil }
+                guard let value = constantValue(expression, module: module, depth: depth) else { return nil }
                 if let found, found != value { return nil }
                 found = value
             }
@@ -248,4 +287,9 @@ enum WGSLLayout {
             break
         }
     }
+}
+
+/// The value of a `…ReportingOverflow` result, or nil when it overflowed.
+private func checked(_ result: (partialValue: Int, overflow: Bool)) -> Int? {
+    result.overflow ? nil : result.partialValue
 }

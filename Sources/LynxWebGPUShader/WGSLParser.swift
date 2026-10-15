@@ -111,12 +111,15 @@ struct WGSLParser {
 
     private mutating func parseModule() throws -> WGSLModule {
         var module = WGSLModule()
+        /// Line of each struct/alias declaration — the type checks below run after parsing and point back here.
+        var declarationLines: [String: Int] = [:]
         while !isAtEnd {
             if match(";") { continue }
             let attributes = try parseAttributes()
 
             if check("struct") {
                 advance()
+                declarationLines[current.text] = declarationLines[current.text] ?? current.line
                 module.structs.append(try parseStruct())
             } else if check("fn") {
                 advance()
@@ -130,6 +133,7 @@ struct WGSLParser {
                 module.constants.append(try parseModuleConstant(isOverride: isOverride))
             } else if check("alias") || check("type") {
                 advance()
+                declarationLines[current.text] = declarationLines[current.text] ?? current.line
                 let name = try expectIdentifier("alias name")
                 try expect("=", "alias")
                 let type = try parseType()
@@ -148,7 +152,74 @@ struct WGSLParser {
                 throw error("token '\(current.text)' cannot appear at module scope")
             }
         }
+        try Self.validateTypeDeclarations(module, lines: declarationLines)
         return module
+    }
+
+    // MARK: - Type declaration checks
+
+    /// The deepest composite type nesting a module may declare (Tint's limit — the WGSL spec only
+    /// guarantees 15). It also bounds every recursive walk over a type (layout, emission).
+    static let maximumCompositeNesting = 255
+
+    /// Rejects what the grammar cannot: **recursive types** and over-deep composite nesting.
+    ///
+    /// WGSL forbids a type that contains itself — directly (`struct S { a: S }`), through an array
+    /// (`array<S, 2>`), through an alias or through another struct — because it would have infinite
+    /// size. The layout calculator and the struct emitter walk these graphs recursively, so a cycle
+    /// that got past here would recurse until the stack overflowed. Checked once at module creation,
+    /// with the declaration's line, so nothing downstream ever sees one. The depth limit does the same
+    /// for long acyclic chains (`S1 { a: S0 }`, `S2 { a: S1 }`, …) an untrusted bundle can declare.
+    private static func validateTypeDeclarations(_ module: WGSLModule, lines: [String: Int]) throws {
+        var depths: [String: Int] = [:]
+        // Declarations currently being walked — meeting one again is a cycle.
+        var path: [String] = []
+
+        func failure(_ name: String, _ message: String) -> WGPUError {
+            let line = lines[name] ?? 0
+            return WGPUError(kind: .validation, message: "WGSL validation failed (line \(line)): \(message)", line: line)
+        }
+
+        func nesting(ofDeclaration name: String) throws -> Int {
+            if let known = depths[name] { return known }
+            if let start = path.firstIndex(of: name) {
+                let cycle = (path[start...] + [name]).joined(separator: " → ")
+                throw failure(name, "recursive type '\(name)' (\(cycle)) — WGSL types cannot contain themselves")
+            }
+            guard path.count < maximumCompositeNesting else {
+                throw failure(name, "type declarations nest more than \(maximumCompositeNesting) levels deep")
+            }
+            path.append(name)
+            defer { path.removeLast() }
+
+            let depth: Int
+            if let structure = module.structNamed(name) {
+                depth = 1 + (try structure.members.map { try nesting(of: $0.type) }.max() ?? 0)
+            } else if let alias = module.aliases.first(where: { $0.name == name }) {
+                depth = try nesting(of: alias.type)
+            } else {
+                depth = 0   // not a declared type — undefined names are left to later stages
+            }
+            guard depth <= maximumCompositeNesting else {
+                throw failure(name, "'\(name)' nests composite types \(depth) levels deep (limit \(maximumCompositeNesting))")
+            }
+            depths[name] = depth
+            return depth
+        }
+
+        func nesting(of type: WGSLType) throws -> Int {
+            switch type {
+            case .vector: return 1
+            case .matrix: return 2
+            case .array(let element, _): return 1 + (try nesting(of: element))
+            case .named(let name): return try nesting(ofDeclaration: name)
+            // Scalars, atomics and handle/pointer types do not embed another type's storage.
+            default: return 0
+            }
+        }
+
+        for structure in module.structs { _ = try nesting(ofDeclaration: structure.name) }
+        for alias in module.aliases { _ = try nesting(ofDeclaration: alias.name) }
     }
 
     private mutating func parseAttributes() throws -> [WGSLAttribute] {

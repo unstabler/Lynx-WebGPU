@@ -197,6 +197,126 @@ final class WGSLTranspilerTests: XCTestCase {
         XCTAssertTrue(msl.contains("WaveSample{}"), "zero-value construction stays a plain empty init:\n\(msl)")
     }
 
+    // MARK: - Recursive types
+
+    /// WGSL forbids a type that contains itself — it would have infinite size. The layout calculator
+    /// walks struct members recursively, so before this check `struct S { a: array<S, 2> }` recursed
+    /// until the stack overflowed (signal 11) instead of failing shader module creation.
+    func test_recursiveStructsAreRejectedAtModuleCreationWithTheirLine() throws {
+        let cases: [(source: String, line: Int, cycle: String)] = [
+            ("""
+            struct S { a: array<S, 2> }
+            """, 1, "S → S"),
+            ("""
+            struct S { a: S }
+            """, 1, "S → S"),
+            ("""
+            const n = 1;
+            struct S { a: array<A, 2> }
+            alias A = S;
+            """, 2, "S → A → S"),
+            ("""
+            struct A { b: B }
+
+            struct B {
+                x: f32,
+                a: array<A, 4>,
+            }
+            """, 1, "A → B → A"),
+            ("""
+            alias X = Y;
+            alias Y = X;
+            """, 1, "X → Y → X"),
+        ]
+        for (source, line, cycle) in cases {
+            XCTAssertThrowsError(try WGSLShaderModule(source: source + """
+
+            @group(0) @binding(0) var<storage, read> data: array<f32>;
+            @compute @workgroup_size(1) fn cs() { _ = data[0]; }
+            """), source) { error in
+                let wgpuError = error as? WGPUError
+                XCTAssertEqual(wgpuError?.kind, .validation, source)
+                XCTAssertEqual(wgpuError?.line, line, source)
+                let message = wgpuError?.message ?? ""
+                XCTAssertTrue(message.contains("recursive type") && message.contains(cycle), "\(source)\n→ \(message)")
+            }
+        }
+    }
+
+    /// The layout calculator is bounded even when handed a recursive AST directly (the parser check
+    /// keeps one from ever reaching it — this guards the walk itself).
+    func test_theLayoutWalkStopsOnARecursiveStructInsteadOfRecursingForever() {
+        var module = WGSLModule()
+        module.structs = [WGSLStruct(name: "S", members: [
+            WGSLStructMember(attributes: [], name: "x", type: .scalar("f32")),
+            WGSLStructMember(attributes: [], name: "a", type: .array(element: .named("S"), count: .intLiteral("2"))),
+        ])]
+        let placement = WGSLLayout.layout(of: module.structs[0], module: module, uniform: false)
+        XCTAssertEqual(placement.members.map(\.offset), [0, 4])
+        XCTAssertEqual(WGSLLayout.size(of: .named("S"), module: module, uniform: true), 16)
+    }
+
+    /// A cyclic constant used as an array length gives up with an error instead of recursing.
+    func test_aCyclicArrayLengthConstantIsAnErrorNotARecursion() throws {
+        let module = try WGSLShaderModule(source: """
+        const A = B;
+        const B = A;
+        @fragment fn fs() -> @location(0) vec4f {
+            var v: array<f32, A>;
+            return vec4f(v[0]);
+        }
+        """)
+        XCTAssertThrowsError(try module.translateToMSL(entryPoints: ["fs"], bindings: WGSLBindingAssignment()))
+    }
+
+    /// Lengths and `@size` values that overflow `Int` are clamped rather than trapping.
+    func test_hugeArrayLengthsAndSizeAttributesDoNotOverflowTheLayout() throws {
+        let module = try WGSLParser.parse("""
+        struct S {
+            a: array<array<f32, 4000000000>, 4000000000>,
+            @size(9223372036854775807) b: f32,
+            @align(9223372036854775807) c: f32,
+        }
+        """)
+        let structure = try XCTUnwrap(module.structNamed("S"))
+        let placement = WGSLLayout.layout(of: structure, module: module, uniform: false)
+        XCTAssertEqual(placement.members.count, 3)
+        XCTAssertNil(WGSLLayout.constantValue(
+            .binary(op: "*", .intLiteral("9223372036854775807"), .intLiteral("2")), module: module
+        ))
+    }
+
+    /// Long acyclic chains are fine up to the composite nesting limit and rejected past it — the
+    /// limit is what bounds every later recursive walk over these types.
+    func test_deepStructChainsCompileUpToTheNestingLimitAndAreRejectedPastIt() throws {
+        func chain(_ count: Int) -> String {
+            var source = "struct S0 { v: f32 }\n"
+            for index in 1..<count {
+                source += "struct S\(index) { inner: S\(index - 1), pad: f32 }\n"
+            }
+            return source + """
+            @group(0) @binding(0) var<storage, read_write> data: S\(count - 1);
+            @compute @workgroup_size(1) fn cs() { data.pad = 1.0; }
+            """
+        }
+        let msl = try translate(chain(40), entryPoints: ["cs"])
+        XCTAssertTrue(msl.contains("struct alignas(4) S39 {"), msl)
+
+        XCTAssertThrowsError(try WGSLShaderModule(source: chain(WGSLParser.maximumCompositeNesting + 2))) { error in
+            let message = (error as? WGPUError)?.message ?? ""
+            XCTAssertTrue(message.contains("levels deep"), message)
+        }
+
+        // An alias chain adds no nesting but is walked the same way, so its length is bounded too.
+        var aliases = ""
+        for index in 0..<300 { aliases += "alias X\(index) = X\(index + 1);\n" }
+        aliases += "alias X300 = f32;\n"
+        XCTAssertThrowsError(try WGSLShaderModule(source: aliases)) { error in
+            let message = (error as? WGPUError)?.message ?? ""
+            XCTAssertTrue(message.contains("levels deep"), message)
+        }
+    }
+
     // MARK: - Compute / storage buffers
 
     func test_computeShadersAndStorageBuffersTranslate() throws {
