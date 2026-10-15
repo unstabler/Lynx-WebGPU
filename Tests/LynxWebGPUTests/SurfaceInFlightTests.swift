@@ -240,17 +240,32 @@ final class SurfaceInFlightTests: XCTestCase {
             "usage": TestUsage.renderAttachment | TestUsage.textureCopySrc,
         ]
 
+        // Each frame waits for the previous ones to retire — a drained drawable pool would fail the
+        // acquisition and read as a wrong result rather than an environment limit.
+        func settle() {
+            XCTAssertTrue(waitUntil { context.frameCoordinator.framesInFlight(canvas: "race") == 0 })
+        }
+        func skipIfNoDrawable(_ result: [String: Any]) throws {
+            let lost = messages(result).contains { $0.contains("could not obtain a drawable") }
+            try XCTSkipIf(lost, "could not obtain a drawable headless: \(result)")
+        }
+        settle()
+
         // Render-only use in that batch still works — a framebuffer-only drawable is a valid attachment.
         let renderOnly = raced([configure] + frame(10))
+        try skipIfNoDrawable(renderOnly)
         XCTAssertTrue(surface.layer.framebufferOnly, "the layer update is still queued on main")
         XCTAssertEqual(renderOnly["ok"] as? Bool, true, "\(renderOnly)")
+        settle()
 
         // A copy out of the canvas in such a batch fails alone, as validation.
         let withCopy = raced([configure] + frame(20, copyInto: 100))
+        try skipIfNoDrawable(withCopy)
         XCTAssertTrue(surface.layer.framebufferOnly, "the layer update is still queued on main")
         XCTAssertEqual(withCopy["ok"] as? Bool, false, "\(withCopy)")
         XCTAssertEqual(messages(withCopy).count, 1, "only the copy fails: \(withCopy)")
         XCTAssertTrue(messages(withCopy).first?.contains("framebuffer-only") == true, "\(withCopy)")
+        settle()
 
         // Once main has run, a later frame's drawable takes the same copy.
         RunLoop.main.run(until: Date().addingTimeInterval(0.05))
@@ -258,7 +273,9 @@ final class SurfaceInFlightTests: XCTestCase {
         var recovered = false
         for attempt in 0..<4 where !recovered {
             let result = context.execute(commands: frame(30 + attempt * 2, copyInto: 100))
+            try skipIfNoDrawable(result)
             recovered = (result["ok"] as? Bool) == true
+            settle()
         }
         XCTAssertTrue(recovered, "the copy must succeed once the configuration has landed")
     }
