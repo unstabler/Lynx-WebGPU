@@ -269,9 +269,10 @@ struct MSLEmitter {
                 return .vector(size: size, element: element)
             }
             if callee == "array" {
-                let element = typeArguments.first ?? arguments.first.flatMap(inferredType(of:))
-                guard let element else { return nil }
-                return .array(element: element, count: .intLiteral(String(arguments.count)))
+                return arrayConstructorType(typeArguments: typeArguments, argumentCount: arguments.count)
+                    ?? arguments.first.flatMap(inferredType(of:)).map {
+                        WGSLType.array(element: $0, count: .intLiteral(String(arguments.count)))
+                    }
             }
             return nil
         default:
@@ -1236,13 +1237,17 @@ struct MSLEmitter {
         }
         if callee == "array" {
             // With the element type omitted, guess it from the first argument's constructor name (`array(vec2f(…), …)`).
-            let element = typeArguments.first ?? arguments.first.flatMap(inferredType(of:))
-            guard let element, let elementType = try? MSLTypeMapping.type(element, module: module) else {
+            let arrayType = arrayConstructorType(typeArguments: typeArguments, argumentCount: emitted.count)
+                ?? arguments.first.flatMap(inferredType(of:)).map {
+                    WGSLType.array(element: $0, count: .intLiteral(String(emitted.count)))
+                }
+            guard let arrayType else {
                 throw WGPUError.unsupported(
                     "WGSL: cannot determine the element type of an array(…) constructor — spell it out as `array<T, N>(…)`"
                 )
             }
-            return "array<\(elementType), \(emitted.count)>{\(emitted.joined(separator: ", "))}"
+            // An empty brace list is value-initialization — the zero value `array<T, N>()` asks for.
+            return "\(try MSLTypeMapping.type(arrayType, module: module)){\(emitted.joined(separator: ", "))}"
         }
         // WGSL defines f32 → i32/u32 conversion as **saturating** (a C++ cast is UB out of range).
         // Only a single argument is a conversion; a constructor listing components already passed each argument through its own.
@@ -1265,6 +1270,17 @@ struct MSLEmitter {
 
         let name = MSLTypeMapping.renamedBuiltins[callee] ?? callee
         return "\(name)(\(emitted.joined(separator: ", ")))"
+    }
+
+    /// The type an `array<T, N>(…)` / `array<T>(…)` constructor builds — the parser keeps the written
+    /// array type as the sole type argument. Its length is the declared one (the zero-argument form
+    /// has nothing else to go by); when there is none, or it cannot be computed here, the argument count.
+    private func arrayConstructorType(typeArguments: [WGSLType], argumentCount: Int) -> WGSLType? {
+        guard case .array(let element, let count)? = typeArguments.first else { return nil }
+        if let count, argumentCount == 0 || WGSLLayout.constantValue(count, module: module) != nil {
+            return .array(element: element, count: count)
+        }
+        return .array(element: element, count: .intLiteral(String(argumentCount)))
     }
 
     /// The saturating conversion helper name, when this is an integer-producing constructor (`i32`, `u32`, `vec3i`, `vec2<u32>`, …).

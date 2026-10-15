@@ -752,10 +752,10 @@ struct WGSLParser {
             if name == "array" {
                 // The second argument of `array<f32, 3>(…)` is a length expression, not a type.
                 // The type parser already knows that shape, so we rewind to the name token and reuse it.
+                // The **whole array type** is kept: the zero-value form `array<u32, 4>()` has no
+                // arguments to count, so the length lives only here.
                 index -= 1
-                if case .array(let element, _) = try parseType() {
-                    typeArguments = [element]
-                }
+                typeArguments = [try parseType()]
             } else {
                 advance()
                 repeat {

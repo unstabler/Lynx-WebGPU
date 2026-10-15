@@ -1025,6 +1025,44 @@ final class WGSLTranspilerTests: XCTestCase {
 
     // MARK: - Compile-time constants
 
+    /// The zero-value constructor `array<T, N>()` has no arguments to count, so its length can only
+    /// come from the written type. It used to come out as `array<uint, 0>{}` — a zero-length array
+    /// whose every index clamps to nothing.
+    func test_aZeroArgumentArrayConstructorKeepsItsDeclaredLength() throws {
+        let msl = try translate("""
+        struct Item { a: vec3f, b: f32 }
+        const N = 8u;
+        const zeros = array<f32, 4>();
+
+        @fragment
+        fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+            var data = array<u32, 4>();
+            data[1] = 3u;
+            var grid = array<array<f32, 2>, 3>();
+            grid[2][1] = 1.0;
+            var items = array<Item, 2>();
+            items[1].b = 2.0;
+            var colors = array<vec3f, 5>();
+            var counts = array<i32, N>();
+            counts[7] = 1;
+            let lut = array<f32, 3>(1.0, 2.0, 3.0);
+            let inferred = array(vec2f(1.0), vec2f(2.0));
+            return vec4f(f32(data[1]) + grid[2][1] + items[1].b + zeros[3] + lut[2] + inferred[1].x,
+                         colors[4].x, f32(counts[7]), 1.0);
+        }
+        """, entryPoints: ["fs"])
+
+        XCTAssertTrue(msl.contains("auto data = array<uint, 4>{};"), msl)
+        XCTAssertTrue(msl.contains("auto grid = array<array<float, 2>, 3>{};"), msl)
+        XCTAssertTrue(msl.contains("auto items = array<Item, 2>{};"), msl)
+        XCTAssertTrue(msl.contains("auto colors = array<float3, 5>{};"), msl)
+        XCTAssertTrue(msl.contains("auto counts = array<int, 8>{};"), msl)
+        XCTAssertTrue(msl.contains("constant array<float, 4> zeros = array<float, 4>{};"), msl)
+        XCTAssertTrue(msl.contains("array<float, 3>{1.0, 2.0, 3.0}"), msl)
+        XCTAssertTrue(msl.contains("array<float2, 2>{float2(1.0), float2(2.0)}"), msl)
+        XCTAssertFalse(msl.contains(", 0>{}"), "a zero-length array leaked through:\n\(msl)")
+    }
+
     func test_aConstDeclaredInsideAFunctionCanBeAnArraySize() throws {
         let source = """
         @fragment
