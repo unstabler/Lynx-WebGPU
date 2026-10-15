@@ -131,7 +131,10 @@ protocol DawnCanvas: AnyObject {
     var format: LynxWebGPUCore.WGPUTextureFormat { get }
     /// Whether it is a surface with a drawable pool that **can fall behind** — subject to in-flight accounting (`WGPUFrameCoordinator`).
     var pacesFrames: Bool { get }
-    func configure(device: WGPUDevice, format: LynxWebGPUCore.WGPUTextureFormat) throws
+    /// `usage` is the canvas configuration's — the same bundle asks the same of Metal and Dawn.
+    func configure(
+        device: WGPUDevice, format: LynxWebGPUCore.WGPUTextureFormat, usage: LynxWebGPUCore.WGPUTextureUsage
+    ) throws
     func updateSize(_ size: CGSize, device: WGPUDevice)
     /// This frame's texture. When `owned`, the caller owns a +1 reference (the surface path — a new one each frame);
     /// otherwise it is a borrow of the canvas-owned reference (offscreen — the wrapper must retain).
@@ -148,6 +151,7 @@ final class DawnOffscreenCanvas: DawnCanvas {
     let identifier: String
     private(set) var size: CGSize
     private(set) var format: LynxWebGPUCore.WGPUTextureFormat = .rgba8unorm
+    private var usage: LynxWebGPUCore.WGPUTextureUsage = .renderAttachment
     private(set) var texture: WGPUTexture?
     var pacesFrames: Bool { false }
 
@@ -158,8 +162,11 @@ final class DawnOffscreenCanvas: DawnCanvas {
 
     deinit { releaseTexture() }
 
-    func configure(device: WGPUDevice, format: LynxWebGPUCore.WGPUTextureFormat) throws {
+    func configure(
+        device: WGPUDevice, format: LynxWebGPUCore.WGPUTextureFormat, usage: LynxWebGPUCore.WGPUTextureUsage
+    ) throws {
         self.format = format
+        self.usage = usage
         try remakeTexture(device: device)
     }
 
@@ -185,8 +192,11 @@ final class DawnOffscreenCanvas: DawnCanvas {
         let dimensions = try dawnTextureDimensions(size, "offscreen canvas '\(identifier)'")
         releaseTexture()
         var descriptor = WGPUTextureDescriptor()
+        // The canvas usage (`STORAGE_BINDING`, `COPY_DST`, …) on top of what the harness always needs —
+        // drawing into it and reading it back.
         descriptor.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc
             | WGPUTextureUsage_TextureBinding
+            | WGPUTextureUsage(UInt64(truncatingIfNeeded: usage.rawValue))
         descriptor.dimension = WGPUTextureDimension_2D
         descriptor.size = WebGPU.WGPUExtent3D(
             width: dimensions.width, height: dimensions.height, depthOrArrayLayers: 1
@@ -220,6 +230,7 @@ final class DawnLayerCanvas: DawnCanvas {
     private let lock = NSLock()
     private var desiredSize: CGSize
     private var desiredFormat: LynxWebGPUCore.WGPUTextureFormat = .bgra8unorm
+    private var desiredUsage: LynxWebGPUCore.WGPUTextureUsage = .renderAttachment
     private var configuredSize: CGSize = .zero
     private var needsConfigure = true
     var pacesFrames: Bool { true }
@@ -258,9 +269,12 @@ final class DawnLayerCanvas: DawnCanvas {
         return desiredFormat
     }
 
-    func configure(device: WGPUDevice, format: LynxWebGPUCore.WGPUTextureFormat) throws {
+    func configure(
+        device: WGPUDevice, format: LynxWebGPUCore.WGPUTextureFormat, usage: LynxWebGPUCore.WGPUTextureUsage
+    ) throws {
         lock.lock()
         desiredFormat = format
+        desiredUsage = usage
         needsConfigure = true
         lock.unlock()
     }
@@ -300,6 +314,7 @@ final class DawnLayerCanvas: DawnCanvas {
         lock.lock()
         let size = desiredSize
         let format = desiredFormat
+        let usage = desiredUsage
         let needed = needsConfigure
         lock.unlock()
         guard needed else { return }
@@ -308,7 +323,7 @@ final class DawnLayerCanvas: DawnCanvas {
         var configuration = WGPUSurfaceConfiguration()
         configuration.device = device
         configuration.format = try DawnEnum.textureFormat(format)
-        configuration.usage = WGPUTextureUsage_RenderAttachment
+        configuration.usage = WGPUTextureUsage(UInt64(truncatingIfNeeded: usage.rawValue))
         configuration.width = dimensions.width
         configuration.height = dimensions.height
         configuration.alphaMode = WGPUCompositeAlphaMode_Auto

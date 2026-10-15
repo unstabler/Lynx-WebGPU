@@ -487,6 +487,17 @@ public final class WGPUMetalBackend: WGPUBackend {
 
     public func acquireFrameTexture(_ surface: WGPUSurface) throws -> WGPUAcquiredSurfaceTexture<WGPUMetalBackend>? {
         guard let drawable = surface.nextDrawable() else { return nil }
+        // A drawable still carrying the previous `framebufferOnly` (configure lands on main
+        // asynchronously) would make Metal assert on the first copy or shader access — refuse the frame
+        // instead. The drawable is dropped unpresented and goes back to the pool.
+        if let layerSurface = surface as? WGPUMetalLayerSurface,
+           !layerSurface.canServeConfiguredUsage(drawable.texture) {
+            throw WGPUError.validation(
+                "canvas '\(surface.identifier)' was configured with a usage beyond RENDER_ATTACHMENT, but "
+                    + "the drawable is still framebuffer-only (configure applies on the main thread "
+                    + "asynchronously) — this frame is skipped; a later one will have it"
+            )
+        }
         // Use the actual drawable texture's format — canvas configuration can land a frame late.
         let format = WGPUMetalMapping.textureFormat(from: drawable.texture.pixelFormat)
             ?? surface.configuredFormat

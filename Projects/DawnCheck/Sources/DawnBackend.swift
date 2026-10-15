@@ -960,7 +960,7 @@ final class DawnBackend: WGPUBackend {
     func configureSurface(
         _ surface: DawnCanvas, configuration: LynxWebGPUCore.WGPUCanvasConfiguration
     ) throws {
-        try surface.configure(device: device, format: configuration.format)
+        try surface.configure(device: device, format: configuration.format, usage: configuration.usage)
     }
 
     func resizeSurface(_ surface: DawnCanvas, size: CGSize) {
