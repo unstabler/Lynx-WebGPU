@@ -130,6 +130,31 @@ final class ConformanceTests: XCTestCase {
         stuck.forcedReadiness = false
         let readyOutcomes = WebGPUConformance.run(on: stuck, only: ["frame-readiness"])
         XCTAssertEqual(readyOutcomes.first?.status, .failed, "the readiness signal was false and it still passed")
+
+        // (8) a runtime filing its errors only at batch end — after the in-batch pop already resolved,
+        // so the scope comes back clean and the error lands in `errors` (what Dawn did before
+        // per-command draining).
+        let late = MisbehavingRuntime(runtime, corrupt: Self.attributeAtBatchEnd)
+        let attributionOutcomes = WebGPUConformance.run(on: late, only: ["error-scope-attribution"])
+        XCTAssertEqual(attributionOutcomes.first?.status, .failed, "scope errors leaked out and it still passed")
+    }
+
+    /// Rewrites a batch result as if every error had been collected after the batch's last pop:
+    /// each popped scope resolves clean and what it caught moves to `errors`.
+    static func attributeAtBatchEnd(_ result: [String: Any]) -> [String: Any] {
+        guard let scopes = result["errorScopes"] as? [Any] else { return result }
+        var broken = result
+        var errors = result["errors"] as? [[String: Any]] ?? []
+        broken["errorScopes"] = scopes.map { scope -> Any in
+            guard let captured = scope as? [String: Any], captured["rejected"] == nil else { return scope }
+            errors.append(captured)
+            return NSNull()
+        }
+        if !errors.isEmpty {
+            broken["errors"] = errors
+            broken["ok"] = false
+        }
+        return broken
     }
 }
 

@@ -14,10 +14,11 @@ import LynxWebGPUCore
 /// ## How Dawn errors are moved onto the wire model
 ///
 /// - Handle, state and range errors are turned into path-tagged validation by **the engine** (the same wording as Metal).
-/// - Dawn's own validation errors are wrapped in a device error scope (validation/out-of-memory) around the
-///   whole batch and reclaimed in `collectBatchDiagnostics()` — the engine puts them on the same batch result.
-/// - Errors outside a scope (uncaptured) are collected through the same channel and handed over at the next
-///   reclamation — the engine's deferred error queue ships them with the next batch (`docs/COMMAND-STREAM.md` §2).
+/// - Dawn's own validation errors all arrive through the device's **uncaptured callback** (no device scope is
+///   pushed). Dawn calls it synchronously inside the offending API call, so the engine drains the sink
+///   **after every command** (`drainImmediateDiagnostics()`) and files each error with the error scopes open
+///   when that command ran. What surfaces only at Finish/submit or on a pump is reclaimed in
+///   `collectBatchDiagnostics()`; anything later still rides the next batch (`docs/COMMAND-STREAM.md` §2).
 ///
 /// ## Simulator note
 ///
@@ -45,7 +46,8 @@ final class DawnBackend: WGPUBackend {
     /// The spec spellings of the advertisable features — the compression support query and adapterInfo use the same list.
     private let featureLabels: Set<String>
 
-    /// Device errors outside a scope (uncaptured) — `collectBatchDiagnostics` drains them.
+    /// Device errors outside a scope (uncaptured) — `drainImmediateDiagnostics` (per command) and
+    /// `collectBatchDiagnostics` (batch end) drain them.
     private let uncaptured = WGPUDeferredErrorQueue()
 
     // Batch lifetime state (beginBatch ~ submit)
@@ -148,16 +150,25 @@ final class DawnBackend: WGPUBackend {
     }
 
     func collectBatchDiagnostics() -> [WGPUError] {
-        // Validation errors come out as callbacks from wgpuInstanceProcessEvents after encoder Finish and submit.
-        // Pump a few times to reclaim this batch's share — whatever still arrives late rides on the next batch
-        // as the deferred error contract says (`WGPUDeferredErrorQueue`).
+        // Encoder errors are raised at Finish (in submit), and some callbacks only come out of
+        // wgpuInstanceProcessEvents. Pump a few times to reclaim this batch's share — whatever still arrives
+        // late rides on the next batch as the deferred error contract says (`WGPUDeferredErrorQueue`).
         for _ in 0..<3 { wgpuInstanceProcessEvents(instance) }
-        let drained = uncaptured.drain()
-        // The cascading echo of an invalid object ("[Invalid X] is invalid due to a previous error") is a
-        // downstream repeat of the root error. When the root is in the same reclamation, the echoes are filtered
-        // out — a scene overlay only shows the last error, so unfiltered the echo always hides the root (it really did in the stencil scene).
-        let roots = drained.filter { !$0.message.contains("is invalid due to a previous error") }
-        return roots.isEmpty ? drained : roots
+        return uncaptured.drain()
+    }
+
+    func drainImmediateDiagnostics() -> [WGPUError] {
+        // No pump — the uncaptured callback fires synchronously inside the failing wgpu* call, so this
+        // command's errors are already in the sink. Draining here is what lets a `push → create → pop` in
+        // one batch catch the creation error in its scope.
+        uncaptured.drain()
+    }
+
+    func isCascadingEcho(_ diagnostic: WGPUError) -> Bool {
+        // The cascading echo of an invalid object is a downstream repeat of the root error. The engine
+        // drops it from the batch result when the root is there too — a scene overlay only shows the
+        // last error, so unfiltered the echo always hides the root (it really did in the stencil scene).
+        diagnostic.message.contains("is invalid due to a previous error")
     }
 
     var hasPendingWork: Bool { commandEncoder != nil }
@@ -494,7 +505,7 @@ final class DawnBackend: WGPUBackend {
         guard let module else {
             throw WGPUError.backend("failed to create the GPUShaderModule")
         }
-        // Compilation diagnostics come out through the device scope (collectBatchDiagnostics) and getCompilationInfo.
+        // Compilation diagnostics come out through the uncaptured sink (drainImmediateDiagnostics) and getCompilationInfo.
         return WGPUShaderModuleCreation(module: DawnShaderModuleObject(module: module), failure: nil)
     }
 

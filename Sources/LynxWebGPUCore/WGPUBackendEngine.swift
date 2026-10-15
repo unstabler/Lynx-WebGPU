@@ -126,6 +126,9 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         // Flush the previous batch's GPU execution failures first — an open error scope catches them.
         for failure in gpuFailures.drain() { record(failure) }
         backend.beginBatch()
+        // What the backend's validator raised between batches (a resize, a readback, …) — filed with
+        // the scopes open now, before this batch's first push/pop can move them.
+        recordImmediateDiagnostics()
 
         for (index, command) in commands.enumerated() {
             do {
@@ -142,14 +145,28 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             } catch {
                 record(.backend(error.localizedDescription, path: "commands[\(index)]"))
             }
+            // Per command, not per batch: a native validator's error must meet the scopes **as they
+            // were when this command ran**. Collected only at batch end, a `push → create → pop` in
+            // one batch (the shim's `createRenderPipelineAsync`) resolves its scope clean while the
+            // error leaks to the batch result (`WGPUBackend.drainImmediateDiagnostics`).
+            recordImmediateDiagnostics()
         }
 
         // No commands but present means **the tick's closing batch** (the end of a frame-loop callback).
         finish(WGPUFrameBoundary(requestedPresent: present, commandCount: commands.count))
 
-        // Per-batch backend diagnostics (Dawn's device scope, …) — collected after submit so this
-        // batch's GPU validation errors are included too.
+        // Diagnostics that only surface late (Dawn: encoder errors raised at Finish, pumped callbacks)
+        // — collected after submit so this batch's GPU validation errors are included too. They meet
+        // the scopes open at the end of the batch: no command-level moment is left to attribute them to.
         for diagnostic in backend.collectBatchDiagnostics() { record(diagnostic) }
+
+        // A cascading echo ("[Invalid X] is invalid due to a previous error") repeats a root error
+        // downstream. When a root error is in this result too, the echoes are dropped from it — an
+        // overlay showing the last error would otherwise always show the echo and hide the cause.
+        // Scopes are not filtered: using an invalid object is a real validation error in the spec.
+        if errors.contains(where: { !backend.isCascadingEcho($0) }) {
+            errors.removeAll(where: backend.isCascadingEcho)
+        }
 
         return WGPUBatchResult(
             commandCount: commands.count,
@@ -167,6 +184,12 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     private func record(_ error: WGPUError) {
         if errorScopes.capture(error) { return }
         errors.append(error)
+    }
+
+    /// Files what the backend's own validator has already raised (`drainImmediateDiagnostics`) with
+    /// the scopes open **now**.
+    private func recordImmediateDiagnostics() {
+        for diagnostic in backend.drainImmediateDiagnostics() { record(diagnostic) }
     }
 
     private func resetBatchState() {
