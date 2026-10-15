@@ -391,38 +391,62 @@ final class WGSLTranspilerTests: XCTestCase {
         }
     }
 
-    /// Just under the limit still parses on the same small stack, and nested expressions and types
-    /// also **translate** there — the limit is what bounds the emitter's recursion over them too.
-    func test_nestingJustUnderTheLimitStillWorksOnASmallStack() throws {
-        let depth = WGSLParser.maximumNestingDepth - 8
-        let source = """
+    /// **Whatever the parser accepts also translates**, on a 512 KB caller stack. The parser's limit
+    /// alone was not enough: the emitter's frames are much larger than the parser's, so 50 nested
+    /// calls or 120 nested blocks parsed and then overflowed `translateToMSL` (signal 11). Parsing and
+    /// emission now run on `WGSLDeepStack`. Each shape is checked at the deepest accepted nesting and
+    /// one past it (a function body's statement and its expression take two levels).
+    func test_everythingTheParserAcceptsTranslatesOnASmallStack() {
+        let deepest = WGSLParser.maximumNestingDepth - 2
+        func calls(_ n: Int) -> String {
+            "let x = " + String(repeating: "abs(", count: n) + "1.0" + String(repeating: ")", count: n) + ";"
+        }
+        func parens(_ n: Int) -> String {
+            "let x = " + String(repeating: "(", count: n) + "1.0" + String(repeating: ")", count: n) + ";"
+        }
+        func blocks(_ n: Int) -> String {
+            "var x = 0.0; " + String(repeating: "{ ", count: n) + "x = 1.0;" + String(repeating: " }", count: n)
+        }
+        func types(_ n: Int) -> String {
+            // The innermost length expression is the last level.
+            "var a: " + String(repeating: "array<", count: n) + "f32" + String(repeating: ", 1>", count: n)
+                + "; let x = 1.0;"
+        }
+        for (name, shape) in [("calls", calls), ("parens", parens), ("blocks", blocks), ("types", types)] {
+            for depth in [deepest, deepest + 1] {
+                let source = """
+                @fragment fn fs() -> @location(0) vec4f {
+                    \(shape(depth))
+                    return vec4f(x);
+                }
+                """
+                var msl: String?
+                var failure: WGPUError?
+                onSmallStack {
+                    do {
+                        let module = try WGSLShaderModule(source: source)
+                        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["fs"]))
+                        msl = try module.translateToMSL(entryPoints: ["fs"], bindings: bindings)
+                    } catch {
+                        failure = error as? WGPUError
+                    }
+                }
+                if depth == deepest {
+                    XCTAssertNil(failure, "\(name) at \(depth): \(String(describing: failure))")
+                    XCTAssertNotNil(msl, "\(name) at \(depth)")
+                } else {
+                    XCTAssertTrue(failure?.message.contains("nesting is deeper than") ?? false,
+                                  "\(name) at \(depth): \(String(describing: failure))")
+                }
+            }
+        }
+        // The deepest accepted shader also passes the Metal compiler.
+        _ = try? translate("""
         @fragment fn fs() -> @location(0) vec4f {
-            let x = \(String(repeating: "(", count: depth))1.0\(String(repeating: ")", count: depth));
-            var a: \(String(repeating: "array<", count: depth / 2))f32\(String(repeating: ", 1>", count: depth / 2));
+            \(calls(deepest))
             return vec4f(x);
         }
-        """
-        var msl: String?
-        var failure: Error?
-        onSmallStack {
-            do { msl = try self.translate(source, entryPoints: ["fs"]) } catch { failure = error }
-        }
-        XCTAssertNil(failure)
-        XCTAssertTrue(msl?.contains("1.0" + String(repeating: ")", count: depth)) ?? false)
-
-        let statements = """
-        fn f(a: i32) -> i32 {
-            var y = 0;
-            \(String(repeating: "{ ", count: depth))y = 1;\(String(repeating: " }", count: depth))
-            if a == 0 { y = 2; }\(String(repeating: " else if a == 1 { y = 3; }", count: depth))
-            return y;
-        }
-        """
-        failure = nil
-        onSmallStack {
-            do { _ = try WGSLShaderModule(source: statements) } catch { failure = error }
-        }
-        XCTAssertNil(failure)
+        """, entryPoints: ["fs"])
     }
 
     /// A cyclic constant used as an array length gives up with an error instead of recursing.

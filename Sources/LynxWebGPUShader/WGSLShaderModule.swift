@@ -13,11 +13,24 @@ public final class WGSLShaderModule {
     public let reflection: WGSLShaderReflection
 
     private let ast: WGSLModule
+    /// Functions needing the buffer size table — computed with the AST walks at creation, so no
+    /// later query walks the tree on the caller's stack.
+    private let bufferSizeUsers: Set<String>
 
+    /// Parsing and reflection run on `WGSLDeepStack` — the source is untrusted and both recurse
+    /// over its nesting.
     public init(source: String) throws {
         self.source = source
-        self.ast = try WGSLParser.parse(source)
-        self.reflection = WGSLReflectionBuilder.build(ast)
+        let (ast, reflection, bufferSizeUsers) = try WGSLDeepStack.run {
+            let ast = try WGSLParser.parse(source)
+            return (
+                ast, WGSLReflectionBuilder.build(ast),
+                WGSLReflectionBuilder.functionsNeedingBufferSizes(in: ast)
+            )
+        }
+        self.ast = ast
+        self.reflection = reflection
+        self.bufferSizeUsers = bufferSizeUsers
     }
 
     /// Builds MSL source containing the requested entry points.
@@ -31,10 +44,14 @@ public final class WGSLShaderModule {
         bindings: WGSLBindingAssignment,
         constants: [String: Double] = [:]
     ) throws -> String {
-        var emitter = MSLEmitter(
-            module: Self.applying(constants, to: ast), reflection: reflection, bindings: bindings
-        )
-        return try emitter.emit(entryPoints: entryPoints)
+        // Emission recurses over the shader's nesting — on `WGSLDeepStack`, like parsing.
+        let ast = self.ast, reflection = self.reflection
+        return try WGSLDeepStack.run {
+            var emitter = MSLEmitter(
+                module: Self.applying(constants, to: ast), reflection: reflection, bindings: bindings
+            )
+            return try emitter.emit(entryPoints: entryPoints)
+        }
     }
 
     /// Folds pipeline constants into the AST up front.
@@ -98,8 +115,7 @@ public final class WGSLShaderModule {
     ///
     /// **This must compute the same thing as the emitter** — a mismatch makes the shader read an unbound buffer.
     public func usesArrayLength(entryPoints: [String]) -> Bool {
-        let users = WGSLReflectionBuilder.functionsNeedingBufferSizes(in: ast)
-        return entryPoints.contains(where: users.contains)
+        entryPoints.contains(where: bufferSizeUsers.contains)
     }
 
     /// The entry point's `@workgroup_size` — used as threadsPerThreadgroup in a compute dispatch.
