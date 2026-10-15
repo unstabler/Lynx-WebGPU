@@ -166,6 +166,8 @@ struct alignas(16) Light {
 - 멤버 오프셋은 WGSL 명세(`AlignOf`/`SizeOf`/`RoundUp`)대로 계산한다. `@align(n)`/`@size(n)`을 존중한다.
 - uniform 주소 공간에서 쓰이는 구조체는 정렬/배열 스트라이드가 16으로 올라간다.
 - vec3 멤버 뒤 12~15바이트 구간을 다른 멤버가 쓰면 `packed_floatN`, 아니면 `floatN` + `char` 패딩.
+- 별칭(`alias M = mat4x4f;`, `alias I2 = I1; alias I1 = Inner;`)은 가리키는 타입 그대로 배치한다 —
+  몇 단을 거치든 끝까지 따라간다.
 
 **따라서 JS는 WGSL 규칙대로 버퍼를 채우면 된다.** 브라우저에서 쓰던 유니폼 패킹 코드가 그대로 동작한다.
 

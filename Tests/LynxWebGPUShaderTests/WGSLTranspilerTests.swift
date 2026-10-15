@@ -197,6 +197,74 @@ final class WGSLTranspilerTests: XCTestCase {
         XCTAssertTrue(msl.contains("WaveSample{}"), "zero-value construction stays a plain empty init:\n\(msl)")
     }
 
+    /// An alias measures as the type it names — through any number of alias hops. The calculator used
+    /// to read an alias of a non-struct type (and a two-hop chain) as 4 bytes, so every member after
+    /// it sat at the wrong offset and the MSL struct disagreed with the bytes JS wrote.
+    func test_aliasesAreLaidOutAsTheTypeTheyName() throws {
+        func placement(_ source: String, uniform: Bool = false) throws -> WGSLLayout.StructPlacement {
+            let module = try WGSLParser.parse(source)
+            return WGSLLayout.layout(of: try XCTUnwrap(module.structNamed("S")), module: module, uniform: uniform)
+        }
+
+        let matrix = try placement("alias M = mat4x4f; struct S { m: M, t: f32 }", uniform: true)
+        XCTAssertEqual(matrix.members.map(\.offset), [0, 64])
+        XCTAssertEqual(matrix.size, 80)
+
+        let chain = try placement("""
+        struct Inner { v: vec4f }
+        alias I1 = Inner;
+        alias I2 = I1;
+        struct S { x: f32, i: I2 }
+        """)
+        XCTAssertEqual(chain.members.map(\.offset), [0, 16])
+        XCTAssertEqual(chain.size, 32)
+
+        let array = try placement("alias A4 = array<f32, 4>; struct S { a: A4, b: vec4f }")
+        XCTAssertEqual(array.members.map(\.offset), [0, 16])
+        XCTAssertEqual(array.size, 32)
+
+        // An aliased vec3 is still a vec3 — packed when the next member starts at byte 12.
+        let vector = try placement("alias V = vec3f; struct S { p: V, w: f32 }")
+        XCTAssertEqual(vector.members.map(\.offset), [0, 12])
+        XCTAssertEqual(vector.size, 16)
+        XCTAssertEqual(vector.members.first?.needsPackedVector, true)
+    }
+
+    /// The same shaders end to end: the emitted structs match the WGSL offsets (no stray padding),
+    /// the buffers' minimum binding sizes count the aliased types, and the MSL compiles.
+    func test_aliasedMembersEmitAtTheirWGSLOffsets() throws {
+        let source = """
+        struct Inner { v: vec4f }
+        alias I1 = Inner;
+        alias I2 = I1;
+        alias M = mat4x4f;
+        alias A4 = array<f32, 4>;
+        alias V = vec3f;
+        struct Params { m: M, t: f32 }
+        struct Nested { x: f32, i: I2 }
+        struct Packed { a: A4, b: vec4f, p: V, w: f32 }
+        @group(0) @binding(0) var<uniform> params: Params;
+        @group(0) @binding(1) var<storage, read> nested: Nested;
+        @group(0) @binding(2) var<storage, read_write> packed: Packed;
+        @group(0) @binding(3) var<uniform> matrix: M;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            packed.b = params.m[0] * params.t + nested.i.v + matrix[1] + vec4f(nested.x);
+            packed.a[3] = packed.p.x + packed.w;
+        }
+        """
+        let module = try WGSLShaderModule(source: source)
+        XCTAssertEqual(module.reflection.minimumBindingSizes(usedBy: ["main"]), [0: [0: 80, 1: 32, 2: 48, 3: 64]])
+
+        let msl = try translate(source, entryPoints: ["main"])
+        XCTAssertTrue(msl.contains("struct alignas(16) Params {\n    float4x4 m;\n    float t;\n    char wgpu_pad0[12];\n};"), msl)
+        XCTAssertTrue(msl.contains("struct alignas(16) Nested {\n    float x;\n    char wgpu_pad0[12];\n    Inner i;\n};"), msl)
+        XCTAssertTrue(msl.contains(
+            "struct alignas(16) Packed {\n    array<float, 4> a;\n    float4 b;\n    packed_float3 p;\n    float w;\n};"
+        ), msl)
+    }
+
     /// An alias may name a struct, but aliases are emitted before the struct definitions (a member may
     /// be spelled with one) — without a forward declaration Metal says "unknown type name 'S'".
     func test_anAliasOfAStructCompilesThroughAForwardDeclaration() throws {

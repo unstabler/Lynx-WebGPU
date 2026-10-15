@@ -99,9 +99,19 @@ enum WGSLLayout {
             case .atomic:
                 return (4, 4)
             case .named(let name):
-                guard let structure = resolveStruct(name, module: module) else { return (4, 4) }
-                let placement = layout(of: structure)
-                return (placement.align, placement.size)
+                if let structure = resolveStruct(name, module: module) {
+                    let placement = layout(of: structure)
+                    return (placement.align, placement.size)
+                }
+                // An alias of a non-struct type (`alias M = mat4x4f;`) measures as that type — reading it
+                // as 4 bytes put every member after it at the wrong offset.
+                guard let target = resolveAlias(name, module: module),
+                      !enclosing.contains(name), enclosing.count < WGSLParser.maximumCompositeNesting else {
+                    return (4, 4)
+                }
+                enclosing.append(name)
+                defer { enclosing.removeLast() }
+                return measure(target)
             case .pointer, .texture, .sampler, .void:
                 return (4, 4)
             }
@@ -126,7 +136,10 @@ enum WGSLLayout {
             var maximumAlign = 1
 
             for member in structure.members {
-                var (memberAlign, memberSize) = measure(member.type)
+                // A member spelled with an alias is placed (and emitted) as the aliased type, so the
+                // vec3 packing below sees `alias V = vec3f;` as the vec3 it is.
+                let memberType = resolvingAlias(member.type, module: module)
+                var (memberAlign, memberSize) = measure(memberType)
                 if let explicit = member.attributes.first(named: "align")?.firstInt { memberAlign = explicit }
                 if let explicit = member.attributes.first(named: "size")?.firstInt { memberSize = max(memberSize, explicit) }
                 // Attribute values come straight from the source — keep the running offset from overflowing.
@@ -135,7 +148,7 @@ enum WGSLLayout {
 
                 offset = roundUp(memberAlign, offset)
                 members.append(MemberPlacement(
-                    name: member.name, type: member.type,
+                    name: member.name, type: memberType,
                     offset: offset, size: memberSize, align: memberAlign,
                     needsPackedVector: false
                 ))
@@ -162,13 +175,31 @@ enum WGSLLayout {
 
     // MARK: - Helpers
 
+    /// The struct a name denotes — directly or through any chain of aliases (`alias I2 = I1; alias I1 = S;`).
     static func resolveStruct(_ name: String, module: WGSLModule) -> WGSLStruct? {
         if let structure = module.structNamed(name) { return structure }
-        // Follow an alias one step.
-        if let alias = module.aliases.first(where: { $0.name == name }), case .named(let target) = alias.type {
-            return module.structNamed(target)
+        guard case .named(let target)? = resolveAlias(name, module: module) else { return nil }
+        return module.structNamed(target)
+    }
+
+    /// The type an alias finally names, following alias-to-alias hops: a struct comes back as
+    /// `.named(structName)`, anything else as the type itself. Nil when `name` is not an alias.
+    /// The hops are bounded — the parser rejects alias cycles and chains past the nesting limit,
+    /// and this gives up rather than loop if handed one anyway.
+    static func resolveAlias(_ name: String, module: WGSLModule) -> WGSLType? {
+        guard var type = module.aliases.first(where: { $0.name == name })?.type else { return nil }
+        for _ in 0..<WGSLParser.maximumCompositeNesting {
+            guard case .named(let next) = type, module.structNamed(next) == nil,
+                  let target = module.aliases.first(where: { $0.name == next })?.type else { return type }
+            type = target
         }
         return nil
+    }
+
+    /// `type` with a top-level alias replaced by what it names (other types unchanged).
+    static func resolvingAlias(_ type: WGSLType, module: WGSLModule) -> WGSLType {
+        guard case .named(let name) = type, module.structNamed(name) == nil else { return type }
+        return resolveAlias(name, module: module) ?? type
     }
 
     /// Computes a value that must be known at compile time, such as an array length. Only integer literals and module constants are supported.
@@ -274,8 +305,15 @@ enum WGSLLayout {
     private static func markStructs(in type: WGSLType, module: WGSLModule, into names: inout Set<String>) {
         switch type {
         case .named(let name):
-            guard !names.contains(name), let structure = resolveStruct(name, module: module) else { return }
-            names.insert(name)
+            guard let structure = resolveStruct(name, module: module) else {
+                // An alias of a non-struct type (`alias Lights = array<Light, 4>;`) — mark what it holds.
+                if let target = resolveAlias(name, module: module), target != type {
+                    markStructs(in: target, module: module, into: &names)
+                }
+                return
+            }
+            // The struct's own name (not an alias of it) is what emission looks up.
+            guard names.insert(structure.name).inserted else { return }
             for member in structure.members {
                 markStructs(in: member.type, module: module, into: &names)
             }
