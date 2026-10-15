@@ -159,10 +159,28 @@ enum MSLTypeMapping {
         return identifier(name)
     }
 
+    /// The namespace of names the emitter generates itself (prelude helpers, `wgpu_in`/`wgpu_out`,
+    /// padding members, loop guards, …). A user identifier spelled with this prefix is moved out of it
+    /// by `identifier(_:)` — otherwise a shader could redeclare (or call into) an internal name.
+    static let internalPrefix = "wgpu_"
+
+    /// Sigil marking a name the **emitter itself** puts into the syntax tree (the `discard` flag
+    /// global). The WGSL lexer never produces `$` in an identifier, so such a name cannot meet a user
+    /// declaration in any name-keyed table; `identifier(_:)` maps it into the internal namespace.
+    static let syntheticNameSigil: Character = "$"
+
     /// Renames a variable, parameter, struct or member to a name that is safe in MSL.
     /// **The declaration and every use must go through the same function** or the names diverge.
+    ///
+    /// The mapping is injective and keeps user names out of the internal namespace:
+    /// - MSL reserved words and user names starting with `wgpu_` → `wgpu_id_<name>`
+    ///   (no generated name starts with `wgpu_id_`);
+    /// - synthetic names (`$x`) → `wgpu_x`;
+    /// - everything else is unchanged (and therefore never starts with `wgpu_`).
     static func identifier(_ name: String) -> String {
-        reservedIdentifiers.contains(name) ? "wgpu_id_\(name)" : name
+        if name.first == syntheticNameSigil { return internalPrefix + name.dropFirst() }
+        if reservedIdentifiers.contains(name) || name.hasPrefix(internalPrefix) { return "wgpu_id_\(name)" }
+        return name
     }
 
     // MARK: - Builtin functions

@@ -54,7 +54,13 @@ struct MSLEmitter {
     /// Active shadowing renames (original name → emitted name). Saved and restored at block boundaries.
     private var localRenames: [String: String] = [:]
     /// Name of the synthetic global masking writes after `discard`. Not created when the module has no `discard`.
-    private static let discardFlagName = "wgpu_discarded"
+    ///
+    /// It lives in the syntax tree next to the user's globals, so it carries the synthetic sigil — no
+    /// WGSL identifier can spell it, so a user global of the same MSL name cannot replace it in
+    /// `globalsByName` or the usage sets (`MSLTypeMapping.syntheticNameSigil`).
+    private static let discardFlagName = "\(MSLTypeMapping.syntheticNameSigil)discarded"
+    /// The flag's MSL name — the same mapping its declaration and threaded arguments go through.
+    private static let discardFlagMSLName = MSLTypeMapping.identifier(discardFlagName)
     /// Functions that must take that flag as an argument (empty turns the transformation off entirely).
     private let discardFlagUsers: Set<String>
     /// Names of storage address space globals — used to pick what to mask after `discard`.
@@ -90,7 +96,9 @@ struct MSLEmitter {
         self.bindings = bindings
         self.uniformStructs = WGSLLayout.uniformStructNames(module)
         self.usage = usage
-        self.globalsByName = Dictionary(uniqueKeysWithValues: module.globals.map { ($0.name, $0) })
+        // The parser rejects duplicate module-scope names, but this table must never be what traps on
+        // one — shader source comes from the bundle (JS), so a trap here would take the host down.
+        self.globalsByName = Dictionary(module.globals.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
         self.structNames = Set(module.structs.map(\.name))
         self.needsBufferSizes = WGSLReflectionBuilder.functionsNeedingBufferSizes(in: module)
         self.storageGlobalNames = Set(module.globals.filter { $0.addressSpace == "storage" }.map(\.name))
@@ -477,7 +485,9 @@ struct MSLEmitter {
         defer { textureScope = previousScope }
         registerTextures(of: function)
 
-        let innerName = "wgpu_\(function.name)_inner"
+        // Names derived from the entry point carry their own `wgpu_ep_` tag: a bare `wgpu_<entry>_…`
+        // could spell a renamed user identifier (`wgpu_id_…`) for an entry point named `id_…`.
+        let innerName = "wgpu_ep_\(function.name)_inner"
         let resources = threadedGlobals(for: function.name)
 
         // 1) The inner function keeping the original signature.
@@ -519,7 +529,7 @@ struct MSLEmitter {
             }
         }
 
-        let inputStructName = "wgpu_\(function.name)_in"
+        let inputStructName = "wgpu_ep_\(function.name)_in"
         if !interface.stageInFields.isEmpty {
             line("struct \(inputStructName) {")
             indented { emitter in
@@ -529,7 +539,7 @@ struct MSLEmitter {
             line("")
         }
 
-        let outputStructName = "wgpu_\(function.name)_out"
+        let outputStructName = "wgpu_ep_\(function.name)_out"
         if !interface.outFields.isEmpty {
             line("struct \(outputStructName) {")
             indented { emitter in
@@ -588,10 +598,10 @@ struct MSLEmitter {
             }
             if interface.outFields.isEmpty {
                 emitter.line("\(call);")
-                if discardTail { emitter.line("if (\(Self.discardFlagName)) { discard_fragment(); }") }
+                if discardTail { emitter.line("if (\(Self.discardFlagMSLName)) { discard_fragment(); }") }
             } else {
                 emitter.line("\(returnType) wgpu_result = \(call);")
-                if discardTail { emitter.line("if (\(Self.discardFlagName)) { discard_fragment(); }") }
+                if discardTail { emitter.line("if (\(Self.discardFlagMSLName)) { discard_fragment(); }") }
                 emitter.line("\(outputStructName) wgpu_out{};")
                 for statement in interface.packStatements { emitter.line(statement) }
                 emitter.line("return wgpu_out;")
@@ -779,7 +789,7 @@ struct MSLEmitter {
         case .letDeclaration, .constDeclaration, .varDeclaration, .assignment, .increment, .decrement:
             let text = try simpleStatement(statement)
             if masksAfterDiscard(statement) {
-                line("if (!\(Self.discardFlagName)) { \(text); }")
+                line("if (!\(Self.discardFlagMSLName)) { \(text); }")
             } else {
                 line("\(text);")
             }
@@ -787,7 +797,7 @@ struct MSLEmitter {
         case .expressionStatement(let expression):
             let text = try self.expression(expression)
             if masksAfterDiscard(statement) {
-                line("if (!\(Self.discardFlagName)) { \(text); }")
+                line("if (!\(Self.discardFlagMSLName)) { \(text); }")
             } else {
                 line("\(text);")
             }
@@ -893,7 +903,7 @@ struct MSLEmitter {
             if discardFlagUsers.isEmpty {
                 line("discard_fragment();")
             } else {
-                line("\(Self.discardFlagName) = true;")
+                line("\(Self.discardFlagMSLName) = true;")
             }
         }
     }
@@ -1263,7 +1273,9 @@ struct MSLEmitter {
             return "\(MSLTypeMapping.functionName(callee))(\((emitted + extra).joined(separator: ", ")))"
         }
 
-        let name = MSLTypeMapping.renamedBuiltins[callee] ?? callee
+        // Anything else passes through by name (builtins, alias constructors) — through `identifier(_:)`
+        // so it matches the declaration it refers to and cannot reach an internal `wgpu_` helper.
+        let name = MSLTypeMapping.renamedBuiltins[callee] ?? MSLTypeMapping.identifier(callee)
         return "\(name)(\(emitted.joined(separator: ", ")))"
     }
 

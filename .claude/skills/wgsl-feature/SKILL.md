@@ -61,8 +61,13 @@ AST를 늘렸으면 **`WGSLReflectionBuilder.collect`의 식별자 수집에도 
 구조적 변환 두 가지를 건드릴 일이 생기면 `docs/ARCHITECTURE.md` §4를 먼저 읽을 것:
 - **리소스 스레딩** — MSL에 가변 전역이 없어 전역을 함수 인자로 내려보낸다.
   `threadedGlobals(for:)`의 **정렬 순서가 선언과 호출에서 같아야** 한다.
-- **진입점 래핑** — 스테이지 I/O 속성은 `wgpu_<entry>_in/out` 전용 구조체에만 붙인다.
+- **진입점 래핑** — 스테이지 I/O 속성은 `wgpu_ep_<entry>_in/out` 전용 구조체에만 붙인다.
   일반 구조체에 `[[attribute]]`를 붙이면 유니폼 버퍼 레이아웃이 깨진다.
+
+방출기가 새 내부 이름을 만들 때는 **`wgpu_` 아래 고정 태그**로 짓고 `wgpu_id_`로 시작하게 하지 말 것 —
+`wgpu_`로 시작하는 사용자 식별자는 `MSLTypeMapping.identifier(_:)`가 `wgpu_id_`로 옮기므로
+그 자리만 사용자 몫이다. AST에 합성 선언을 넣어야 하면 이름에 `$` 시길을 붙인다
+(`MSLTypeMapping.syntheticNameSigil` — WGSL 식별자로는 쓸 수 없어 사용자 선언과 겹치지 않는다).
 
 ## 4. 구조체 배치 (`WGSLLayout.swift`)
 
