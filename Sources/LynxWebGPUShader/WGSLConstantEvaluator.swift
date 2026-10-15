@@ -331,8 +331,11 @@ extension WGSLModule {
         for function in functions {
             guard let attribute = function.attributes.first(named: "workgroup_size") else {
                 if function.stage == .compute, let compute = function.attributes.first(named: "compute") {
-                    throw Self.attributeError(
-                        compute, "compute entry point '\(function.name)' has no @workgroup_size"
+                    throw WGPUError(
+                        kind: .validation,
+                        message: "WGSL attribute error (line \(compute.line)): @compute — "
+                            + "compute entry point '\(function.name)' has no @workgroup_size",
+                        line: compute.line
                     )
                 }
                 continue

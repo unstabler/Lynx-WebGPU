@@ -1195,7 +1195,7 @@ final class WGSLTranspilerTests: XCTestCase {
         // A compute entry point must declare one — dispatching 1 thread silently is what this replaces.
         XCTAssertThrowsError(try WGSLShaderModule(source: "@compute fn main() {}")) { error in
             let message = (error as? WGPUError)?.message ?? ""
-            XCTAssertTrue(message.contains("has no @workgroup_size"), message)
+            XCTAssertTrue(message.contains("@compute — compute entry point 'main' has no @workgroup_size"), message)
         }
 
         // An override argument is left to pipeline creation, even when its default is 0.
@@ -1244,6 +1244,27 @@ final class WGSLTranspilerTests: XCTestCase {
         assertRejected("large", "1024 exceeds maxComputeWorkgroupSizeX (256)")
         let fits = try XCTUnwrap(module.workgroupSize(of: "byOverride", constants: ["wx": 16, "wy": 16]))
         XCTAssertEqual([fits.x, fits.y, fits.z], [16, 16, 1])
+    }
+
+    func test_anOverflowingWorkgroupSizeIsAnErrorInTranslationToo() throws {
+        // `translateToMSL` applies no device limits — the zero-init stride must not trap on overflow.
+        let module = try WGSLShaderModule(source: """
+        var<workgroup> tile: array<u32, 4>;
+        @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+        @compute @workgroup_size(4294967295, 4294967295, 4294967295)
+        fn huge(@builtin(local_invocation_index) index: u32) { out[index] = tile[index % 4u]; }
+        @compute @workgroup_size(65536, 65536)
+        fn wide(@builtin(local_invocation_index) index: u32) { out[index] = tile[index % 4u]; }
+        """)
+        for entry in ["huge", "wide"] {
+            let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: [entry]))
+            XCTAssertThrowsError(try module.translateToMSL(entryPoints: [entry], bindings: bindings), entry) { error in
+                let error = error as? WGPUError
+                XCTAssertEqual(error?.kind, .validation, entry)
+                XCTAssertTrue(error?.message.contains("does not fit in u32") == true, error?.message ?? "")
+            }
+            XCTAssertThrowsError(try module.workgroupSize(of: entry), entry)
+        }
     }
 
     // MARK: - External textures
