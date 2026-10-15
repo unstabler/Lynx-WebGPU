@@ -64,7 +64,7 @@ struct WGSLIntegerLiteral: Equatable {
 /// Evaluates an integer const-expression (or override-expression) at compile time.
 ///
 /// Covers integer literals, names of `const`s (and, where allowed, `override`s), parentheses,
-/// unary `-` and `+ - * / %`. Anything else **throws with a reason** rather than guessing — a
+/// unary `-`, `+ - * / %` and the conversions `i32(e)` / `u32(e)`. Anything else **throws with a reason** rather than guessing — a
 /// wrong number here becomes a wrong binding slot or a wrong struct layout, both silent.
 struct WGSLConstantEvaluator {
     /// Why a value could not be computed. Callers wrap it into a `WGPUError` with their own context.
@@ -82,6 +82,11 @@ struct WGSLConstantEvaluator {
 
     /// Names currently being resolved — `const A = B; const B = A;` must stop, not recurse forever.
     private var resolving: Set<String> = []
+    /// Current recursion depth — operator nesting and const-name chains both count. Shader text is
+    /// untrusted and the JS thread's stack is small, so `1+1+…` with thousands of terms must fail
+    /// cleanly instead of overflowing the stack.
+    private var depth = 0
+    static let maximumDepth = 256
 
     init(module: WGSLModule, allowsOverrides: Bool, allowsFunctionConstants: Bool) {
         self.module = module
@@ -90,6 +95,10 @@ struct WGSLConstantEvaluator {
     }
 
     mutating func evaluate(_ expression: WGSLExpression) throws -> Int {
+        depth += 1
+        defer { depth -= 1 }
+        guard depth <= Self.maximumDepth else { throw Failure(reason: "the expression is nested too deeply") }
+
         switch expression {
         case .intLiteral(let text):
             guard let literal = WGSLIntegerLiteral(text) else {
@@ -120,10 +129,17 @@ struct WGSLConstantEvaluator {
             return result.partialValue
         case .identifier(let name):
             return try resolve(name)
+        case .call(let callee, let typeArguments, let arguments)
+            where (callee == "i32" || callee == "u32") && typeArguments.isEmpty && arguments.count == 1:
+            // A value conversion of an integer is the identity — as long as the value fits the target.
+            let value = try evaluate(arguments[0])
+            let range = callee == "u32" ? 0...Int(UInt32.max) : Int(Int32.min)...Int(Int32.max)
+            guard range.contains(value) else { throw Failure(reason: "\(value) does not fit in \(callee)") }
+            return value
         case .floatLiteral(let text):
             throw Failure(reason: "'\(text)' is not an integer")
         default:
-            throw Failure(reason: "only integer literals, const names and + - * / % are supported here")
+            throw Failure(reason: "only integer literals, const names, + - * / % and i32()/u32() are supported here")
         }
     }
 

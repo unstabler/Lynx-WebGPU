@@ -971,18 +971,103 @@ final class WGSLTranspilerTests: XCTestCase {
         }
     }
 
-    func test_aNegativePipelineConstantIsPlantedAsANegation() throws {
+    func test_aDeeplyNestedConstantExpressionIsAnErrorNotAStackOverflow() throws {
+        // The JS thread's stack is small — evaluation depth is bounded instead of trusting the shader.
+        let terms = Array(repeating: "1", count: 1000).joined(separator: "+")
+        let chain = (1..<1000).map { "const C\($0) = C\($0 - 1);" }.joined(separator: "\n")
+        for source in [
+            "@group(0) @binding(\(terms)) var<uniform> u: vec4f;",
+            "const C0 = 0;\n\(chain)\n@group(0) @binding(C999) var<uniform> u: vec4f;",
+        ] {
+            XCTAssertThrowsError(try WGSLShaderModule(source: source)) { error in
+                let message = (error as? WGPUError)?.message ?? ""
+                XCTAssertTrue(message.contains("nested too deeply"), String(message.suffix(200)))
+            }
+        }
+
+        // The same, as an array length (an override-expression).
+        let module = try WGSLShaderModule(source: """
+        var<private> xs: array<f32, \(terms)>;
+        @fragment fn fs() -> @location(0) vec4f { return vec4f(xs[0]); }
+        """)
+        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["fs"]))
+        XCTAssertThrowsError(try module.translateToMSL(entryPoints: ["fs"], bindings: bindings)) { error in
+            let message = (error as? WGPUError)?.message ?? ""
+            XCTAssertTrue(message.contains("nested too deeply"), String(message.suffix(200)))
+        }
+
+        // A realistic depth still resolves.
+        let shallow = Array(repeating: "1", count: 100).joined(separator: "+")
+        let shallowModule = try WGSLShaderModule(source: """
+        @group(0) @binding(\(shallow)) var<uniform> u: vec4f;
+        @fragment fn fs() -> @location(0) vec4f { return u; }
+        """)
+        XCTAssertEqual(shallowModule.reflection.resource(named: "u")?.binding, 100)
+    }
+
+    func test_integerConversionsAreConstExpressions() throws {
         let source = """
-        override bias: i32 = 0;
-        @group(0) @binding(0) var<storage, read_write> out: array<i32>;
+        const SLOT = u32(3);
+        @group(0) @binding(SLOT) var<uniform> tint: vec4f;
+        @group(i32(0)) @binding(i32(SLOT) + 1) var<storage, read_write> out: array<f32>;
+        var<private> weights: array<f32, u32(4)>;
+
         @compute @workgroup_size(1)
         fn main() {
-            out[0] = 10 - bias;
+            weights[0] = tint.x;
+            out[0] = weights[0];
+        }
+        """
+        let module = try WGSLShaderModule(source: source)
+        XCTAssertEqual(module.reflection.resource(named: "tint")?.binding, 3)
+        XCTAssertEqual(module.reflection.resource(named: "out")?.binding, 4)
+
+        let msl = try translate(source, entryPoints: ["main"])
+        XCTAssertTrue(msl.contains("array<float, 4>"), msl)
+
+        // The conversion keeps its range check.
+        for (attribute, reason) in [("@binding(u32(-1))", "does not fit in u32"),
+                                    ("@binding(i32(0x80000000))", "does not fit in i32"),
+                                    ("@binding(u32(1, 2))", "only integer literals")] {
+            let broken = "@group(0) \(attribute) var<uniform> u: vec4f;"
+            XCTAssertThrowsError(try WGSLShaderModule(source: broken), attribute) { error in
+                let message = (error as? WGPUError)?.message ?? ""
+                XCTAssertTrue(message.contains(reason), "says why (\(reason)): \(message)")
+            }
+        }
+    }
+
+    func test_aNonPositiveOverrideArrayLengthIsRejected() throws {
+        // A negative pipeline constant used to be read digit by digit — -3 became `array<float, 3>`.
+        let source = """
+        override N: u32 = 64;
+        override bias: i32 = 0;
+        @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+        var<workgroup> buf: array<f32, N>;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            buf[0] = f32(10 - bias);
+            out[0] = buf[0];
         }
         """
         let module = try WGSLShaderModule(source: source)
         let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["main"]))
-        let msl = try module.translateToMSL(entryPoints: ["main"], bindings: bindings, constants: ["bias": -3])
+        for value in [-3.0, 0.0] {
+            XCTAssertThrowsError(
+                try module.translateToMSL(entryPoints: ["main"], bindings: bindings, constants: ["N": value]),
+                "N = \(value)"
+            ) { error in
+                let message = (error as? WGPUError)?.message ?? ""
+                XCTAssertTrue(message.contains("an array length must be positive"), message)
+            }
+        }
+
+        // A negative constant elsewhere is planted as a negation (WGSL has no negative literals).
+        let msl = try module.translateToMSL(
+            entryPoints: ["main"], bindings: bindings, constants: ["N": 8, "bias": -3]
+        )
+        XCTAssertTrue(msl.contains("array<float, 8>"), msl)
         XCTAssertTrue(msl.contains("-3"), msl)
         MetalCompilerHarness.assertCompiles(msl)
     }
