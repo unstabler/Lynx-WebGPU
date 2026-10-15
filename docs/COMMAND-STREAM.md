@@ -230,8 +230,8 @@ Metal은 둘 다 느슨해서, 안 막으면 브라우저·Dawn에서만 거부�
 | `setScissorRect` | `x`(0) · `y`(0) · `width` · `height` |
 | `setBlendConstant` | `color` |
 | `setStencilReference` | `reference`(0) — **WebIDL의 `u32` 변환(modulo)을 적용한다** |
-| `draw` | `vertexCount` · `instanceCount`(1) · `firstVertex`(0) · `firstInstance`(0) |
-| `drawIndexed` | `indexCount` · `instanceCount`(1) · `firstIndex`(0) · `baseVertex`(0) · `firstInstance`(0) |
+| `draw` | `vertexCount` · `instanceCount`(1) · `firstVertex`(0) · `firstInstance`(0) — 개수가 0이면 상태만 검증하고 백엔드 드로우는 건너뛴다 |
+| `drawIndexed` | `indexCount` · `instanceCount`(1) · `firstIndex`(0) · `baseVertex`(0) · `firstInstance`(0) — 위와 같다 |
 | `drawIndirect` | `indirectBuffer` · `indirectOffset`(0) — 인자 16B |
 | `drawIndexedIndirect` | `indirectBuffer` · `indirectOffset`(0) — 인자 20B |
 | `executeBundles` | `bundles[]` |
@@ -252,7 +252,7 @@ Metal은 둘 다 느슨해서, 안 막으면 브라우저·Dawn에서만 거부�
 | op | 필드 |
 |---|---|
 | `beginComputePass` | `timestampWrites` · `label` |
-| `dispatchWorkgroups` | `x`(1) · `y`(1) · `z`(1) — 각각 **최소 1로 올린다** |
+| `dispatchWorkgroups` | `x`(1) · `y`(1) · `z`(1) — **0은 그대로 둔다**(명세상 유효한 no-op — 상태 검증만 하고 백엔드 디스패치는 건너뛴다). 음수와 `maxComputeWorkgroupsPerDimension` 초과는 검증 오류 |
 | `dispatchWorkgroupsIndirect` | `indirectBuffer` · `indirectOffset`(0) — 인자 12B |
 
 ### 4-8. 쿼리

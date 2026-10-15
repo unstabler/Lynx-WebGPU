@@ -704,6 +704,11 @@ declare class GPURenderBundleEncoder extends GPURenderCommandsBase {
 }
 declare class GPUComputePassEncoder extends GPUPassEncoderBase {
     /**
+     * Dispatches an `x × y × z` grid of workgroups.
+     *
+     * A count of `0` is valid and dispatches nothing (`Math.ceil(n / 64)` with `n = 0`) — the pass state
+     * is still validated. Only an omitted `y`/`z` defaults to `1`.
+     *
      * @param {number} x
      * @param {number} [y]
      * @param {number} [z]

@@ -88,6 +88,23 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     /// (`WGPUBackendCapabilities.validatesNatively`).
     private let specValidation: Bool
 
+    /// Whether a draw/dispatch that does no work (a 0 vertex/index/instance/workgroup count) stops at
+    /// the engine once its state is validated. The spec makes such a call valid and a no-op, but Metal
+    /// asserts on an empty grid (`dispatchThreadgroups`) — Dawn's own Metal backend drops zero-count
+    /// draws and dispatches before the encoder for the same reason — so the backend never sees one.
+    /// A backend that validates natively (Dawn) is a complete WebGPU implementation:
+    /// it receives the call so **its** state validation still runs, and skips the work itself.
+    private var skipsEmptyWork: Bool { specValidation }
+
+    /// `GPUSupportedLimits.maxComputeWorkgroupsPerDimension` as the backend advertises it (the device
+    /// is created with the adapter's limits). Read once — `adapterInfo()` builds a whole dictionary.
+    /// Falls back to the spec's default limit when the backend reports none.
+    private lazy var maxComputeWorkgroupsPerDimension: Int = {
+        let limits = backend.adapterInfo()["limits"] as? [String: Any]
+        let value = limits?["maxComputeWorkgroupsPerDimension"]
+        return (value as? Int) ?? (value as? NSNumber)?.intValue ?? 65535
+    }()
+
     public init(backend: B, frameCoordinator: WGPUFrameCoordinator = WGPUFrameCoordinator()) {
         self.backend = backend
         self.frameCoordinator = frameCoordinator
@@ -1417,6 +1434,8 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             throw WGPUError.validation("setPipeline is required before draw")
         }
         try applyDrawState()
+        // Validated like any draw, but nothing to rasterize — see `skipsEmptyWork`.
+        if skipsEmptyWork, command.vertexCount == 0 || command.instanceCount == 0 { return }
         try backend.draw(command)
     }
 
@@ -1429,6 +1448,7 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             throw WGPUError.validation("setIndexBuffer is required before drawIndexed")
         }
         try applyDrawState()
+        if skipsEmptyWork, command.indexCount == 0 || command.instanceCount == 0 { return }
         try backend.drawIndexed(command, index: resolvedIndexBinding(indexBinding))
     }
 
@@ -1502,10 +1522,25 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
 
     private func dispatchWorkgroups(_ command: WGPUDispatchWorkgroupsCommand) throws {
         try requireComputePass()
+        // The per-dimension cap is checked **before** `applyDrawState()`, like the indirect arguments —
+        // a rejected command must not have changed encoder state.
+        if specValidation {
+            let limit = maxComputeWorkgroupsPerDimension
+            for (key, count) in [("x", command.x), ("y", command.y), ("z", command.z)] where count > limit {
+                throw WGPUError.validation(
+                    "a workgroup count must not exceed maxComputeWorkgroupsPerDimension "
+                        + "(\(limit)) — got \(count)",
+                    path: command.fieldPath(key)
+                )
+            }
+        }
         guard currentComputePipeline != nil else {
             throw WGPUError.validation("setPipeline is required before dispatchWorkgroups")
         }
+        // A zero-sized grid is valid and dispatches nothing, but **the state is still validated** —
+        // a missing bind group is an error whether or not any workgroup runs.
         try applyDrawState()
+        if skipsEmptyWork, command.isEmpty { return }
         try backend.dispatchWorkgroups(command)
     }
 

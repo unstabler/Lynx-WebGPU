@@ -408,6 +408,56 @@ final class RenderPipelineTests: XCTestCase {
         XCTAssertEqual(output, [2, 4, 6, 8, 10, 12, 14, 16])
     }
 
+    func test_aZeroWorkgroupDispatchRunsNothing() throws {
+        // `dispatchWorkgroups(Math.ceil(n / 64))` with n = 0 is valid and a no-op by the spec. It used to
+        // be raised to 1 (running the shader once); handed to Metal as is, the empty grid asserts.
+        let shader = """
+        @group(0) @binding(0) var<storage, read_write> values: array<f32>;
+
+        @compute @workgroup_size(4)
+        fn mark(@builtin(global_invocation_id) id: vec3u) {
+            values[id.x] = 7.0;
+        }
+        """
+        let initial: [Float] = [1, 2, 3, 4, 5, 6, 7, 8]
+        func dispatch(_ x: Int, _ y: Int = 1, _ z: Int = 1) -> [[String: Any]] {
+            [
+                ["op": "beginComputePass"],
+                ["op": "setPipeline", "pipeline": 3],
+                ["op": "setBindGroup", "index": 0, "bindGroup": 5],
+                ["op": "dispatchWorkgroups", "x": x, "y": y, "z": z],
+                ["op": "endPass"],
+            ]
+        }
+
+        harness.executeExpectingSuccess([
+            ["op": "createShaderModule", "id": 1, "code": shader],
+            ["op": "createBuffer", "id": 2, "usage": TestUsage.storage | TestUsage.copySrc,
+             "data": initial.base64],
+            ["op": "createComputePipeline", "id": 3, "layout": "auto",
+             "compute": ["module": 1, "entryPoint": "mark"]],
+            ["op": "getBindGroupLayout", "id": 4, "pipeline": 3, "index": 0],
+            ["op": "createBindGroup", "id": 5, "layout": 4,
+             "entries": [["binding": 0, "resource": ["buffer": 2]]]],
+        ] + dispatch(0) + dispatch(2, 0) + dispatch(2, 1, 0))
+        XCTAssertEqual(try harness.readBufferSync(handle: 2, as: Float.self, size: 32), initial)
+
+        // Past the advertised `maxComputeWorkgroupsPerDimension` is a validation error, not a launch.
+        let tooLarge = harness.execute(dispatch(65536))
+        XCTAssertEqual(tooLarge["ok"] as? Bool, false)
+        XCTAssertTrue(
+            harness.describeErrors(tooLarge).contains("maxComputeWorkgroupsPerDimension"),
+            harness.describeErrors(tooLarge)
+        )
+        XCTAssertEqual(try harness.readBufferSync(handle: 2, as: Float.self, size: 32), initial)
+
+        // The control: one workgroup marks exactly its four invocations.
+        harness.executeExpectingSuccess(dispatch(1))
+        XCTAssertEqual(
+            try harness.readBufferSync(handle: 2, as: Float.self, size: 32), [7, 7, 7, 7, 5, 6, 7, 8]
+        )
+    }
+
     func test_arrayLengthReturnsTheBoundSize() throws {
         // A shader cannot know a buffer's size, so the runtime plugs a size table into the reserved index.
         // What is checked here: (1) a whole binding, (2) a partial binding, (3) an array at the end of a struct.

@@ -1298,13 +1298,22 @@ class GPURenderBundleEncoder extends GPURenderCommandsBase {
 
 class GPUComputePassEncoder extends GPUPassEncoderBase {
   /**
+   * Dispatches an `x × y × z` grid of workgroups.
+   *
+   * A count of `0` is valid and dispatches nothing (`Math.ceil(n / 64)` with `n = 0`) — the pass state
+   * is still validated. Only an omitted `y`/`z` defaults to `1`.
+   *
    * @param {number} x
    * @param {number} [y]
    * @param {number} [z]
    * @returns {void}
    */
   dispatchWorkgroups(x, y, z) {
-    this._commands.push({ op: 'dispatchWorkgroups', x: x || 1, y: y || 1, z: z || 1 });
+    this._commands.push({
+      op: 'dispatchWorkgroups', x,
+      y: y === undefined ? 1 : y,
+      z: z === undefined ? 1 : z,
+    });
   }
 
   /**
