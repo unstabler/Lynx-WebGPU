@@ -287,7 +287,9 @@ enum WGPUPipelineLayoutResolver {
             for (groupIndex, entries) in wgsl.autoBindGroupLayouts(entryPoints: stage.entryPoints).enumerated() {
                 for entry in entries {
                     if let existing = merged[groupIndex]?[entry.binding] {
-                        guard existing.layout == entry.layout else {
+                        // Two modules may size the same buffer differently — the spec keeps the larger
+                        // `minBindingSize`, so only the rest of the entry has to match.
+                        guard let layout = Self.mergedLayout(existing.layout, entry.layout) else {
                             throw WGPUError.validation(
                                 "the resource kind of @group(\(groupIndex)) @binding(\(entry.binding)) differs between stages"
                             )
@@ -295,7 +297,7 @@ enum WGPUPipelineLayoutResolver {
                         merged[groupIndex, default: [:]][entry.binding] = WGPUBindGroupLayoutEntry(
                             binding: entry.binding,
                             visibility: existing.visibility.union(entry.visibility),
-                            layout: entry.layout
+                            layout: layout
                         )
                     } else {
                         merged[groupIndex, default: [:]][entry.binding] = entry
@@ -308,5 +310,14 @@ enum WGPUPipelineLayoutResolver {
         return (0...maximumGroup).map { index in
             WGPUBindGroupLayoutObject(entries: Array(merged[index]?.values ?? [:].values))
         }
+    }
+
+    /// The entry two stages' declarations of one binding merge into, or nil when they disagree.
+    private static func mergedLayout(_ a: WGPUBindingLayout, _ b: WGPUBindingLayout) -> WGPUBindingLayout? {
+        guard case .buffer(var first) = a, case .buffer(var second) = b else { return a == b ? a : nil }
+        let minimum = max(first.minBindingSize, second.minBindingSize)
+        first.minBindingSize = minimum
+        second.minBindingSize = minimum
+        return first == second ? .buffer(first) : nil
     }
 }

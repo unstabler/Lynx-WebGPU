@@ -843,7 +843,7 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             )
         }
         let raw = try backend.makePipelineLayout(groups.map(\.raw))
-        registry.insert(WGPUEnginePipelineLayout<B>(raw: raw), at: command.id)
+        registry.insert(WGPUEnginePipelineLayout<B>(raw: raw, groupEntries: groups.map(\.entries)), at: command.id)
     }
 
     private func createBindGroup(_ command: WGPUCreateCommand<WGPUBindGroupDescriptor>) throws {
@@ -852,7 +852,8 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             path: command.fieldPath("layout")
         )
         var buffers: [WGPUEngineBuffer<B>] = []
-        let entries: [WGPUResolvedBindGroupEntry<B>] = try command.descriptor.entries.map { entry in
+        var bufferBindings: [WGPUEngineBufferBinding] = []
+        let entries: [WGPUResolvedBindGroupEntry<B>] = try command.descriptor.entries.enumerated().map { index, entry in
             // Check matching when the layout's entries are known. A natively-validating backend and a
             // derived layout (entries unknown) are left to backend validation — it knows visibility itself.
             let layoutEntry: WGPUBindGroupLayoutEntry?
@@ -869,9 +870,25 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             case .buffer(let handle, let offset, let size):
                 let object = try registry.lookup(handle, as: WGPUEngineBuffer<B>.self, kind: "GPUBuffer")
                 buffers.append(object)
-                resource = .buffer(
-                    object.raw, offset: offset, boundSize: size ?? max(object.size - offset, 0)
-                )
+                let boundSize = size ?? max(object.size - offset, 0)
+                if case .buffer(let bufferLayout)? = layoutEntry?.layout {
+                    // The spec checks every buffer binding against its layout's `minBindingSize` here.
+                    // (`layout: "auto"` layouts carry the shader's minimum, so they are caught here too.)
+                    guard boundSize >= bufferLayout.minBindingSize else {
+                        throw WGPUError.validation(
+                            "binding \(entry.binding): the bound range is \(boundSize) bytes, smaller than "
+                                + "the layout's minBindingSize \(bufferLayout.minBindingSize)",
+                            path: command.fieldPath("entries[\(index)]")
+                        )
+                    }
+                    // Remembered for the draw-time check of `minBindingSize: 0` entries.
+                    bufferBindings.append(WGPUEngineBufferBinding(
+                        binding: entry.binding, bufferSize: object.size, offset: offset, size: size,
+                        hasDynamicOffset: bufferLayout.hasDynamicOffset,
+                        prevalidatedSize: bufferLayout.minBindingSize != 0
+                    ))
+                }
+                resource = .buffer(object.raw, offset: offset, boundSize: boundSize)
             case .sampler(let handle):
                 let object = try registry.lookup(handle, as: WGPUEngineSampler<B>.self, kind: "GPUSampler")
                 resource = .sampler(object.raw)
@@ -886,7 +903,9 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             )
         }
         let raw = try backend.makeBindGroup(layout: layout.raw, entries: entries)
-        registry.insert(WGPUEngineBindGroup<B>(raw: raw, buffers: buffers), at: command.id)
+        registry.insert(
+            WGPUEngineBindGroup<B>(raw: raw, buffers: buffers, bufferBindings: bufferBindings), at: command.id
+        )
     }
 
     private func createQuerySet(_ command: WGPUCreateCommand<WGPUQuerySetDescriptor>) throws {
@@ -974,6 +993,9 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             layout: layout,
             fieldPath: { command.fieldPath($0) }
         )
+        try validateMinimumBindingSizes(
+            creation.info.minimumBindingSizes, layout: descriptor.layout, path: command.fieldPath("layout")
+        )
         registry.insert(
             WGPUEngineRenderPipeline<B>(raw: creation.pipeline, info: creation.info), at: command.id
         )
@@ -989,9 +1011,39 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         let creation = try backend.makeComputePipeline(
             descriptor, module: module.raw, layout: layout, fieldPath: { command.fieldPath($0) }
         )
+        try validateMinimumBindingSizes(
+            creation.info.minimumBindingSizes, layout: descriptor.layout, path: command.fieldPath("layout")
+        )
         registry.insert(
             WGPUEngineComputePipeline<B>(raw: creation.pipeline, info: creation.info), at: command.id
         )
+    }
+
+    /// The spec's "validating shader binding": an explicit layout's buffer entry with a non-zero
+    /// `minBindingSize` must be at least the shader variable's minimum binding size — otherwise
+    /// every bind group made for that layout passes its own check yet is too small for this shader.
+    /// (A zero entry is checked at each draw/dispatch instead, and `"auto"` derives the value from
+    /// the shader itself.) Nil sizes mean the backend validates natively.
+    private func validateMinimumBindingSizes(
+        _ sizes: [Int: [Int: Int]]?, layout reference: WGPUPipelineLayoutRef, path: String?
+    ) throws {
+        guard specValidation, let sizes, case .explicit(let handle) = reference else { return }
+        let layout = try registry.lookup(handle, as: WGPUEnginePipelineLayout<B>.self, kind: "GPUPipelineLayout")
+        for (groupIndex, bindings) in sizes.sorted(by: { $0.key < $1.key }) {
+            guard groupIndex >= 0, groupIndex < layout.groupEntries.count,
+                  let entries = layout.groupEntries[groupIndex] else { continue }
+            for (binding, required) in bindings.sorted(by: { $0.key < $1.key }) {
+                guard let entry = entries.first(where: { $0.binding == binding }),
+                      case .buffer(let buffer) = entry.layout,
+                      buffer.minBindingSize != 0, buffer.minBindingSize < required else { continue }
+                throw WGPUError.validation(
+                    "@group(\(groupIndex)) @binding(\(binding)): the layout's minBindingSize "
+                        + "\(buffer.minBindingSize) is smaller than the shader variable's minimum binding "
+                        + "size \(required)",
+                    path: path
+                )
+            }
+        }
     }
 
     private func resolvePipelineLayout(_ reference: WGPUPipelineLayoutRef) throws -> WGPUResolvedPipelineLayout<B> {
@@ -1304,16 +1356,19 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     /// why its message is generic.
     private func applyDrawState() throws {
         let requiredGroups: Set<Int>?
+        let minimumBindingSizes: [Int: [Int: Int]]?
         if passState == .render {
             guard let pipeline = currentRenderPipeline else {
                 throw WGPUError.validation("setPipeline is required before draw")
             }
             requiredGroups = pipeline.info.requiredGroups
+            minimumBindingSizes = pipeline.info.minimumBindingSizes
         } else {
             guard let pipeline = currentComputePipeline else {
                 throw WGPUError.validation("setPipeline is required before dispatch")
             }
             requiredGroups = pipeline.info.requiredGroups
+            minimumBindingSizes = pipeline.info.minimumBindingSizes
         }
 
         // Every group the layout requires must be bound. Without this check a draw silently uses
@@ -1327,6 +1382,10 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
                         + "(bindings are invalidated around bundle execution — call setBindGroup again)"
                 )
             }
+        }
+
+        if specValidation, let minimumBindingSizes {
+            try validateBoundSizes(against: minimumBindingSizes)
         }
 
         // If a buffer held by a bind group is mapped, this draw is queue work too, so it is rejected.
@@ -1346,6 +1405,33 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         dirtyGroups.removeAll()
 
         try applyVertexBuffers()
+    }
+
+    /// The spec's draw/dispatch-time half of `minBindingSize`: a buffer entry whose layout said `0`
+    /// was not size-checked at creation, so its effective size (after the dynamic offset, when the
+    /// entry has no explicit `size`) must cover the pipeline's shader variable now. Without it a
+    /// 4-byte binding feeds a shader that reads a 64-byte struct, and Metal reads past the range.
+    private func validateBoundSizes(against minimumSizes: [Int: [Int: Int]]) throws {
+        for (groupIndex, required) in minimumSizes.sorted(by: { $0.key < $1.key }) {
+            guard let bound = boundGroups[groupIndex] else { continue }
+            var dynamicIndex = 0
+            for binding in bound.group.bufferBindings {
+                var dynamicOffset = 0
+                if binding.hasDynamicOffset {
+                    if dynamicIndex < bound.offsets.count { dynamicOffset = bound.offsets[dynamicIndex] }
+                    dynamicIndex += 1
+                }
+                guard !binding.prevalidatedSize, let minimum = required[binding.binding] else { continue }
+                let size = binding.effectiveSize(dynamicOffset: dynamicOffset)
+                guard size >= minimum else {
+                    throw WGPUError.validation(
+                        "@group(\(groupIndex)) @binding(\(binding.binding)): the bound buffer range is \(size) "
+                            + "bytes, but the shader variable needs at least \(minimum) (its minimum binding "
+                            + "size — give the layout entry a minBindingSize, or bind a larger range)"
+                    )
+                }
+            }
+        }
     }
 
     /// Right before a draw, checks the vertex buffers the pipeline requires are present and sends them down.

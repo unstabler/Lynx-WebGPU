@@ -317,6 +317,47 @@ final class WGSLTranspilerTests: XCTestCase {
         }
     }
 
+    // MARK: - Minimum buffer binding size
+
+    /// The spec's "minimum buffer binding size": `SizeOf` of the store type, a runtime-sized array
+    /// counting as one element. The engine checks bound ranges against it, and `layout: "auto"`
+    /// puts it in each buffer entry's `minBindingSize`.
+    func test_reflectionReportsEachBuffersMinimumBindingSize() throws {
+        let source = """
+        struct Params { t: f32 }
+        struct Light { dir: vec3f, color: vec3f }
+        struct Particles { count: u32, items: array<vec4f> }
+        @group(0) @binding(0) var<uniform> params: Params;
+        @group(0) @binding(1) var<uniform> light: Light;
+        @group(0) @binding(2) var<storage, read_write> particles: Particles;
+        @group(1) @binding(0) var<storage, read> values: array<f32>;
+        @group(1) @binding(1) var<uniform> m: mat3x3f;
+        @group(1) @binding(2) var tex: texture_2d<f32>;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            let size = textureDimensions(tex);
+            particles.items[0] = vec4f(light.dir * params.t + light.color + m[0],
+                                       values[0] + f32(size.x) + f32(particles.count));
+        }
+        """
+        let module = try WGSLShaderModule(source: source)
+        XCTAssertEqual(module.reflection.minimumBindingSizes(usedBy: ["main"]), [
+            // `struct { t: f32 }` is 4 bytes even in the uniform address space — WGSL's SizeOf does not
+            // depend on it (the uniform rules only constrain offsets), and the spec/Dawn accept 4.
+            0: [0: 4, 1: 32, 2: 32],
+            // One f32 element; a mat3x3f is three 16-byte columns.
+            1: [0: 4, 1: 48],
+        ])
+        XCTAssertNil(module.reflection.resource(named: "tex")?.minimumBindingSize)
+
+        let auto = module.autoBindGroupLayouts(entryPoints: ["main"])
+        XCTAssertEqual(auto[0].first?.layout, .buffer(WGPUBufferBindingLayout(type: .uniform, minBindingSize: 4)))
+        XCTAssertEqual(auto[0].last?.layout, .buffer(WGPUBufferBindingLayout(type: .storage, minBindingSize: 32)))
+
+        _ = try translate(source, entryPoints: ["main"])
+    }
+
     // MARK: - Compute / storage buffers
 
     func test_computeShadersAndStorageBuffersTranslate() throws {

@@ -89,8 +89,45 @@ public final class WGPUEngineBindGroupLayout<B: WGPUBackend> {
 
 public final class WGPUEnginePipelineLayout<B: WGPUBackend> {
     public let raw: B.PipelineLayout
+    /// Each group's layout entries (nil where they are unknown) — pipeline creation checks the
+    /// layout's `minBindingSize`s against the shader here.
+    public let groupEntries: [[WGPUBindGroupLayoutEntry]?]
 
-    public init(raw: B.PipelineLayout) { self.raw = raw }
+    public init(raw: B.PipelineLayout, groupEntries: [[WGPUBindGroupLayoutEntry]?] = []) {
+        self.raw = raw
+        self.groupEntries = groupEntries
+    }
+}
+
+/// One buffer entry of a bind group, as the draw-time binding size check needs it.
+public struct WGPUEngineBufferBinding {
+    public let binding: Int
+    public let bufferSize: Int
+    public let offset: Int
+    /// The entry's explicit `size` — nil means "to the end of the buffer", which a dynamic offset
+    /// then shortens (the spec's effective binding size is taken after adding it).
+    public let size: Int?
+    public let hasDynamicOffset: Bool
+    /// The layout entry's `minBindingSize` was non-zero, so `createBindGroup` already checked the
+    /// size and pipeline creation checked the shader against it — the spec's `[[prevalidatedSize]]`.
+    public let prevalidatedSize: Bool
+
+    public init(binding: Int, bufferSize: Int, offset: Int, size: Int?,
+                hasDynamicOffset: Bool, prevalidatedSize: Bool) {
+        self.binding = binding
+        self.bufferSize = bufferSize
+        self.offset = offset
+        self.size = size
+        self.hasDynamicOffset = hasDynamicOffset
+        self.prevalidatedSize = prevalidatedSize
+    }
+
+    /// The spec's "effective buffer binding size" once `dynamicOffset` is applied.
+    public func effectiveSize(dynamicOffset: Int) -> Int {
+        if let size { return size }
+        let (end, overflow) = offset.addingReportingOverflow(dynamicOffset)
+        return overflow ? 0 : max(bufferSize - end, 0)
+    }
 }
 
 public final class WGPUEngineBindGroup<B: WGPUBackend> {
@@ -98,10 +135,14 @@ public final class WGPUEngineBindGroup<B: WGPUBackend> {
     /// Buffers this group holds — needed to check "is it mapped?" right before a draw (the group
     /// pins its buffers at creation, so a buffer mapped afterwards is caught there).
     public let buffers: [WGPUEngineBuffer<B>]
+    /// Its buffer entries, sorted by binding — empty when the layout's entries were unknown.
+    public let bufferBindings: [WGPUEngineBufferBinding]
 
-    public init(raw: B.BindGroup, buffers: [WGPUEngineBuffer<B>]) {
+    public init(raw: B.BindGroup, buffers: [WGPUEngineBuffer<B>],
+                bufferBindings: [WGPUEngineBufferBinding] = []) {
         self.raw = raw
         self.buffers = buffers
+        self.bufferBindings = bufferBindings.sorted { $0.binding < $1.binding }
     }
 }
 

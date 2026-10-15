@@ -399,7 +399,8 @@ public final class WGPUMetalBackend: WGPUBackend {
                 requiredGroups: resolved.requiredGroups,
                 requiredVertexSlots: pipeline.requiredVertexSlots,
                 writesDepth: pipeline.writesDepth,
-                writesStencil: pipeline.writesStencil
+                writesStencil: pipeline.writesStencil,
+                minimumBindingSizes: Self.minimumBindingSizes(stages: stages)
             )
         )
     }
@@ -420,8 +421,29 @@ public final class WGPUMetalBackend: WGPUBackend {
         )
         return WGPUComputePipelineCreation(
             pipeline: pipeline,
-            info: WGPUComputePipelineInfo(requiredGroups: resolved.requiredGroups)
+            info: WGPUComputePipelineInfo(
+                requiredGroups: resolved.requiredGroups,
+                minimumBindingSizes: Self.minimumBindingSizes(stages: [(module, [descriptor.entryPoint!])])
+            )
         )
+    }
+
+    /// The spec's minimum buffer binding size of every buffer the stages use, from WGSL reflection
+    /// (the larger one when two modules declare the same binding). An MSL module contributes nothing —
+    /// its bindings go unchecked.
+    private static func minimumBindingSizes(
+        stages: [(module: WGPUShaderModuleObject, entryPoints: [String])]
+    ) -> [Int: [Int: Int]] {
+        var sizes: [Int: [Int: Int]] = [:]
+        for stage in stages {
+            guard let wgsl = stage.module.wgsl else { continue }
+            for (group, bindings) in wgsl.reflection.minimumBindingSizes(usedBy: stage.entryPoints) {
+                for (binding, size) in bindings {
+                    sizes[group, default: [:]][binding] = max(sizes[group]?[binding] ?? 0, size)
+                }
+            }
+        }
+        return sizes
     }
 
     /// An explicit layout passes through; `"auto"` is derived from the shader declarations.
