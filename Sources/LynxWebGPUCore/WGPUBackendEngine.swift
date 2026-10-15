@@ -502,6 +502,7 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         defer {
             object.isMapped = false
             object.writeMappedRange = nil
+            object.mapGeneration += 1   // a still-pending mapping's completion is stale from here on
             backend.unmapBuffer(object.raw)
         }
         guard let data = command.data else { return }
@@ -2030,6 +2031,8 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             target.writeMappedRange = offset..<(offset + length)
         }
         target.isMapped = true
+        target.mapGeneration += 1
+        let generation = target.mapGeneration
 
         // Waiting on previously submitted GPU work is the backend's job. Completion arrives on an
         // arbitrary thread, so the wrapper retakes the lock — safe even when it arrives synchronously
@@ -2042,8 +2045,12 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             self.noteReadbackFinished()
             switch result {
             case .failure(let error):
-                target.isMapped = false
-                target.writeMappedRange = nil
+                // Only this mapping's failure releases it — the failure of one unmapped while pending
+                // (Dawn aborts it) may arrive after a newer mapping began, and must leave that one alone.
+                if target.mapGeneration == generation {
+                    target.isMapped = false
+                    target.writeMappedRange = nil
+                }
                 completion(["ok": false, "errors": [error.payload]])
             case .success(let data):
                 // Carry `Data` straight through — Lynx turns `NSData` into a JS `ArrayBuffer`.

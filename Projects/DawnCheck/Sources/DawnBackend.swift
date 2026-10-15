@@ -275,6 +275,7 @@ final class DawnBackend: WGPUBackend {
     }
 
     func unmapBuffer(_ buffer: DawnBufferObject) {
+        buffer.mapGeneration += 1   // a write mapping still pending is aborted — its callback is stale
         if buffer.dawnMapped {
             wgpuBufferUnmap(buffer.buffer)
             buffer.dawnMapped = false
@@ -392,28 +393,41 @@ final class DawnBackend: WGPUBackend {
             let object: DawnBufferObject
             let offset: Int
             let length: Int
+            let generation: Int
             let deliver: (Result<Data, WGPUError>) -> Void
-            init(object: DawnBufferObject, offset: Int, length: Int,
+            init(object: DawnBufferObject, offset: Int, length: Int, generation: Int,
                  deliver: @escaping (Result<Data, WGPUError>) -> Void) {
                 self.object = object
                 self.offset = offset
                 self.length = length
+                self.generation = generation
                 self.deliver = deliver
             }
         }
         // Marked up front so an unmap while still pending also releases it (Dawn aborts the map).
         buffer.dawnMapped = true
-        let context = WriteMapContext(object: buffer, offset: offset, length: length, deliver: deliver)
+        buffer.mapGeneration += 1
+        let context = WriteMapContext(
+            object: buffer, offset: offset, length: length,
+            generation: buffer.mapGeneration, deliver: deliver
+        )
         var callbackInfo = WGPUBufferMapCallbackInfo()
         callbackInfo.mode = WGPUCallbackMode_AllowProcessEvents
         callbackInfo.callback = { status, message, userdata1, _ in
             guard let userdata1 else { return }
             let context = Unmanaged<WriteMapContext>.fromOpaque(userdata1).takeRetainedValue()
+            // A mapping `unmapBuffer` aborted may report after a newer one began — it must not touch
+            // the newer mapping's state (clearing `dawnMapped` would make its unmap skip the Dawn unmap).
+            let isCurrent = context.object.mapGeneration == context.generation
             guard status == WGPUMapAsyncStatus_Success else {
-                context.object.dawnMapped = false
+                if isCurrent { context.object.dawnMapped = false }
                 context.deliver(.failure(WGPUError.backend(
                     "mapAsync(WRITE) failed — \(String(wgpu: message))"
                 )))
+                return
+            }
+            guard isCurrent else {
+                context.deliver(.failure(WGPUError.backend("mapAsync(WRITE) was superseded by unmap()")))
                 return
             }
             guard context.length > 0 else {

@@ -21,6 +21,10 @@ public final class WGPUEngineBuffer<B: WGPUBackend> {
     /// `mappedAtCreation`) — the only range `unmapBuffer`'s `data` may be written back into.
     /// Nil while unmapped or mapped for reading.
     public var writeMappedRange: Range<Int>?
+    /// Bumped at every mapping request and every unmap — a `readBuffer` completion carrying an older
+    /// value belongs to a mapping that was already released (unmap while pending, then mapped again),
+    /// so it must not touch the current mapping's state.
+    public var mapGeneration = 0
 
     public init(raw: B.Buffer, size: Int, usage: WGPUBufferUsage) {
         self.raw = raw
