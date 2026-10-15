@@ -72,6 +72,9 @@ struct MSLEmitter {
         case value
         /// A `let` pointer known to point at this place.
         case pointer(StoragePlace)
+        /// A pointer **parameter** (or a `let` copied from one) — it points at whatever the caller chose,
+        /// so no bound can be found for it. Carries the pointee type to recognise a runtime-sized array behind it.
+        case parameterPointer(WGSLType)
     }
     /// Name of the synthetic global masking writes after `discard`. Not created when the module has no `discard`.
     private static let discardFlagName = "wgpu_discarded"
@@ -308,7 +311,44 @@ struct MSLEmitter {
     /// Function parameters are locals — a parameter shadowing a global is not that global. A pointer
     /// parameter points at the caller's choice of place, so it is never resolved to one.
     private static func parameterBindings(of function: WGSLFunction) -> [String: LocalBinding] {
-        Dictionary(function.parameters.map { ($0.name, LocalBinding.value) }, uniquingKeysWith: { first, _ in first })
+        Dictionary(function.parameters.map { parameter in
+            if case .pointer(_, let pointee, _) = parameter.type {
+                return (parameter.name, LocalBinding.parameterPointer(pointee))
+            }
+            return (parameter.name, LocalBinding.value)
+        }, uniquingKeysWith: { first, _ in first })
+    }
+
+    /// The pointee type of a pointer that leads back to a pointer **parameter** (`q`, `&(*q)`,
+    /// `&(*q).member`, or a `let` holding one of those). nil for anything else.
+    private func parameterPointee(of expression: WGSLExpression) -> WGSLType? {
+        switch expression {
+        case .paren(let inner):
+            return parameterPointee(of: inner)
+        case .identifier(let name):
+            guard case .parameterPointer(let pointee)? = localBindings[name] else { return nil }
+            return pointee
+        case .addressOf(let place):
+            return parameterPlaceType(of: place)
+        default:
+            return nil
+        }
+    }
+
+    /// The type of a place reached through a pointer parameter (`*q`, `(*q).member`). nil for anything else.
+    private func parameterPlaceType(of expression: WGSLExpression) -> WGSLType? {
+        switch expression {
+        case .paren(let inner):
+            return parameterPlaceType(of: inner)
+        case .dereference(let pointer):
+            return parameterPointee(of: pointer)
+        case .member(let base, let field):
+            guard case .named(let typeName)? = parameterPlaceType(of: base),
+                  let structure = WGSLLayout.resolveStruct(typeName, module: module) else { return nil }
+            return structure.members.first(where: { $0.name == field })?.type
+        default:
+            return nil
+        }
     }
 
     /// Guesses the type from the initializer's **syntax** alone (reading constructor names, not inferring types).
@@ -1036,8 +1076,9 @@ struct MSLEmitter {
             let valueText = try expression(value)
             // Resolved before the name is declared — the initializer sees the outer meaning of every name.
             let target = pointerTarget(of: value)
+            let parameterTarget = target == nil ? parameterPointee(of: value) : nil
             let declared = declaredName(name)
-            localBindings[name] = target.map(LocalBinding.pointer) ?? .value
+            localBindings[name] = target.map(LocalBinding.pointer) ?? parameterTarget.map(LocalBinding.parameterPointer) ?? .value
             return "const \(typeText) \(declared) = \(valueText)"
 
         case .varDeclaration(let name, let type, let value):
@@ -1210,10 +1251,20 @@ struct MSLEmitter {
     /// So the list of functions using the table (`needsBufferSizes`) counts this use as well. A pointer
     /// can only be formed from a global named in the same function, so that list already covers `(*p)[i]`.
     ///
+    /// A runtime-sized array behind a **pointer parameter** has no findable bound (the caller picks the
+    /// buffer), so it is refused here with a WGSL-level message.
+    ///
     /// nil sends the index down the plain `wgpu_at` path — where a runtime-sized array **does not compile**
-    /// (the prelude deletes the unbounded pointer overloads), so a shape missed here fails loudly.
+    /// (the prelude deletes the unbounded pointer overloads), so a shape missed here still fails loudly.
     private func runtimeArrayCount(of expression: WGSLExpression) throws -> String? {
-        guard let place = storagePlace(of: expression) else { return nil }
+        guard let place = storagePlace(of: expression) else {
+            if case .array(_, nil)? = parameterPlaceType(of: expression) {
+                throw WGPUError.unsupported(
+                    "WGSL: indexing a runtime-sized array through a pointer parameter is not supported"
+                )
+            }
+            return nil
+        }
         return try runtimeArrayElementCount(at: place)
     }
 

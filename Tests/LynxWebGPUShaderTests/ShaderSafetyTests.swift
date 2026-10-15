@@ -127,28 +127,58 @@ final class ShaderSafetyTests: XCTestCase {
         let count = "((wgpu_buffer_sizes[0] > 4u ? wgpu_buffer_sizes[0] - 4u : 0u) / uint(sizeof(uint)))"
         XCTAssertTrue(msl.contains("wgpu_store_n((*q).items, idx, \(count),"), "a write through a struct pointer is unclamped\n\(msl)")
         XCTAssertTrue(msl.contains("buf.head = \(count)"), "arrayLength() through a pointer\n\(msl)")
-    }
 
-    /// A pointer the emitter **cannot** bound — a `ptr<storage>` parameter points wherever the caller
-    /// chose — must not fall back to an unchecked access: the prelude deletes the bare pointer
-    /// overloads, so the shader fails to compile instead.
-    func test_aRuntimeArrayIndexWithoutABoundDoesNotCompile() throws {
-        let module = try WGSLShaderModule(source: """
+        // A pointer **straight to the runtime member** carries the member's offset as well.
+        let direct = try translate("""
         struct Buf { head: u32, items: array<u32> }
         @group(0) @binding(0) var<storage, read_write> buf: Buf;
         @group(0) @binding(1) var<uniform> idx: u32;
-        fn poke(q: ptr<storage, Buf, read_write>, i: u32) { (*q).items[i] = (*q).items[0]; }
-        @compute @workgroup_size(1) fn cs() { poke(&buf, idx); }
-        """)
-        let groups = module.autoBindGroupLayouts(entryPoints: ["cs"])
-        let msl = try module.translateToMSL(
-            entryPoints: ["cs"], bindings: try WGSLBindingAssigner.assign(groups: groups)
-        )
-        XCTAssertTrue(msl.contains("wgpu_store((*q).items, i,"), msl)
-        XCTAssertFalse(MSLPrelude.source.contains("p[uint(i)]"), "an unbounded pointer overload is back in the prelude")
-        if let result = MetalCompilerHarness.compile(msl) {
-            XCTAssertFalse(result.succeeded, "an unbounded runtime array index compiled\n\(msl)")
+        @compute @workgroup_size(1) fn cs() {
+            let p = &buf.items;
+            (*p)[idx] = 7u;
         }
+        """, entryPoints: ["cs"])
+        XCTAssertTrue(direct.contains("wgpu_store_n((*p), idx, \(count), 7u)"), "a write through a member pointer is unclamped\n\(direct)")
+    }
+
+    /// A pointer the emitter **cannot** bound — a `ptr<storage>` parameter points wherever the caller
+    /// chose — must not fall back to an unchecked access. The emitter refuses it at translate time with
+    /// a WGSL-level message; behind that, the prelude deletes the bare pointer overloads, so a shape
+    /// that slipped past the emitter would still fail to compile rather than index unchecked.
+    func test_aRuntimeArrayIndexThroughAPointerParameterIsRefused() throws {
+        let shapes = [
+            "(*q).items[i] = 1u;",
+            "let r = q; (*r).items[i] = 1u;",
+            "let r = &(*q).items; let v = (*r)[i];",
+        ]
+        for body in shapes {
+            let module = try WGSLShaderModule(source: """
+            struct Buf { head: u32, items: array<u32> }
+            alias B = Buf;
+            @group(0) @binding(0) var<storage, read_write> buf: Buf;
+            @group(0) @binding(1) var<uniform> idx: u32;
+            fn poke(q: ptr<storage, B, read_write>, i: u32) { \(body) }
+            @compute @workgroup_size(1) fn cs() { poke(&buf, idx); }
+            """)
+            let groups = module.autoBindGroupLayouts(entryPoints: ["cs"])
+            XCTAssertThrowsError(
+                try module.translateToMSL(entryPoints: ["cs"], bindings: try WGSLBindingAssigner.assign(groups: groups)),
+                body
+            ) { error in
+                XCTAssertEqual((error as? WGPUError)?.kind, .unsupported, body)
+                XCTAssertTrue(
+                    ((error as? WGPUError)?.message ?? "").contains("through a pointer parameter"), "\(body): \(error)"
+                )
+            }
+        }
+        // The fixed part behind the same parameter is not a runtime-sized array and stays allowed.
+        _ = try translate("""
+        struct Buf { head: u32, items: array<u32> }
+        @group(0) @binding(0) var<storage, read_write> buf: Buf;
+        fn bump(q: ptr<storage, Buf, read_write>) { (*q).head += 1u; }
+        @compute @workgroup_size(1) fn cs() { bump(&buf); }
+        """, entryPoints: ["cs"])
+        XCTAssertFalse(MSLPrelude.source.contains("p[uint(i)]"), "an unbounded pointer overload is back in the prelude")
     }
 
     /// A binding too small to hold one element gives a count of 0 — the store helper must then
@@ -167,7 +197,7 @@ final class ShaderSafetyTests: XCTestCase {
         @group(0) @binding(1) var<uniform> idx: u32;
         @compute @workgroup_size(1) fn cs() {
             data[0] = 1u;
-            var data = array<u32, 4>();
+            var data = array<u32, 4>(0u, 0u, 0u, 0u);
             data[idx] = 2u;
         }
         """, entryPoints: ["cs"])

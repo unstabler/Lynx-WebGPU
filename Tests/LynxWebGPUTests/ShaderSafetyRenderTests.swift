@@ -165,6 +165,10 @@ final class ShaderSafetyRenderTests: XCTestCase {
     /// A binding **smaller than the array's start offset** holds no element. `items` starts at byte 16
     /// but only 4 bytes are bound: in uint32, `4 - 16` wraps to ~4e9 and would let `items[2]` land on
     /// byte 24 — outside the binding. The count must saturate at 0 and the write must be dropped.
+    ///
+    /// A conformant implementation **rejects this bind group** — the binding is below the minimum binding
+    /// size (the fixed part plus one element), which Core does not enforce yet. Once it does, this test
+    /// must flip to expecting that validation error; until then it pins the shader-side defence.
     func test_aBindingSmallerThanTheArrayOffsetDropsTheWrite() throws {
         harness.executeExpectingSuccess([
             ["op": "createShaderModule", "id": 1, "code": """

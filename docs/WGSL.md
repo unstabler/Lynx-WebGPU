@@ -230,9 +230,11 @@ WGSL에는 값이 정해져 있는데 MSL(C++)에서는 **정의되지 않은 �
   방출기가 포인터를 **전역 자리까지 되짚어** 같은 크기 표로 자른다 (`wgpu_at_n` · `wgpu_store_n`).
   `alias B = Buf;`처럼 별칭으로 쓴 저장 타입도 별칭을 풀어 같은 멤버를 찾는다.
 - **상한을 뽑을 수 없는 모양** — `ptr<storage, Buf>` 매개변수처럼 호출자가 무엇을 가리킬지 정하는
-  경우 — 은 **컴파일이 실패한다.** 프렐류드가 크기 없는 포인터용 `wgpu_at` · `wgpu_store` 오버로드를
-  `= delete`로 막아 두었기 때문이다 (구조체 말미 `T items[1]`도 포인터로 붕괴해 같은 곳에 걸린다).
-  조용히 범위 밖을 건드리는 대신 파이프라인 생성이 실패한다. `ptr<storage, array<f32>>` 매개변수는
+  경우 — 은 방출기가 **번역 시점에 거부한다** ("WGSL: indexing a runtime-sized array through a pointer
+  parameter is not supported"). 매개변수의 고정 크기 부분(`(*q).head`)은 그대로 쓸 수 있다.
+  그 밖에 방출기가 놓친 모양도 **컴파일이 실패한다** — 프렐류드가 크기 없는 포인터용 `wgpu_at` ·
+  `wgpu_store` 오버로드를 `= delete`로 막아 두었기 때문이다 (구조체 말미 `T items[1]`도 포인터로
+  붕괴해 같은 곳에 걸린다). 조용히 범위 밖을 건드리는 대신 파이프라인 생성이 실패한다. `ptr<storage, array<f32>>` 매개변수는
   그 전에 방출기가 "WGSL: a runtime-sized array (array<T>) can only be used in a storage buffer binding"으로 거부한다.
 
 즉 런타임 크기 배열의 상한은 **방출기가 크기 표 자리를 찾은 경우에만** 붙고, 못 찾은 경우는
