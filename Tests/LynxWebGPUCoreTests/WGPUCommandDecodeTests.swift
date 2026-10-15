@@ -143,4 +143,40 @@ final class WGPUCommandDecodeTests: XCTestCase {
         XCTAssertEqual(command.commands.count, 1)
         XCTAssertEqual(try WGPUCommand(from: command.commands[0]).opName, "draw")
     }
+
+    /// `pass.setBindGroup(0, bg, [Infinity])` used to reach `Int(Double.infinity)` — a runtime trap
+    /// that `try?` cannot catch, so one bad JS number killed the host process.
+    func test_setBindGroupWithAnUnusableDynamicOffsetIsAValidationError() throws {
+        for bad in [Double.infinity, -.infinity, .nan, 1e20, -1e20] {
+            let commands = try WGPUValueReader(["commands": [[
+                "op": "setBindGroup", "index": 0, "bindGroup": 1, "dynamicOffsets": [0, bad],
+            ]]]).requiredObjects("commands")
+            XCTAssertThrowsError(try WGPUCommand(from: commands[0]), "\(bad)") { error in
+                guard let error = error as? WGPUError else { return XCTFail("not a WGPUError") }
+                XCTAssertEqual(error.kind, .validation)
+                XCTAssertEqual(error.path, "commands[0].dynamicOffsets[1]")
+            }
+        }
+
+        // Absent still means "no dynamic offsets" — the shim omits the field when there are none.
+        let plain = try WGPUCommand(from: WGPUValueReader(["op": "setBindGroup", "index": 0, "bindGroup": 1]))
+        guard case .setBindGroup(let command) = plain else { return XCTFail("not the setBindGroup case") }
+        XCTAssertEqual(command.dynamicOffsets, [])
+    }
+
+    func test_unusableIntegersInOtherOpsAreValidationErrors() {
+        let cases: [(payload: [String: Any], path: String)] = [
+            (["op": "executeBundles", "bundles": [Double.infinity]], "bundles[0]"),
+            (["op": "createPipelineLayout", "id": 1, "bindGroupLayouts": [Double.nan]], "bindGroupLayouts[0]"),
+            (["op": "draw", "vertexCount": 3, "instanceCount": 1e20], "instanceCount"),
+            (["op": "dispatchWorkgroups", "x": Double.nan], "x"),
+            (["op": "setVertexBuffer", "slot": 0, "buffer": 1, "offset": -Double.infinity], "offset"),
+        ]
+        for (payload, path) in cases {
+            XCTAssertThrowsError(try WGPUCommand(from: WGPUValueReader(payload)), "\(payload)") { error in
+                XCTAssertEqual((error as? WGPUError)?.kind, .validation)
+                XCTAssertEqual((error as? WGPUError)?.path, path)
+            }
+        }
+    }
 }

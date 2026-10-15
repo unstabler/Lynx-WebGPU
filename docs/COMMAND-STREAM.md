@@ -107,6 +107,7 @@ shim의 `snapshotValue`가 기록 시점에 깊은 복사를 한다. 브라우�
 | 열거형 | **명세 철자 문자열 그대로** (`"rgba8unorm"`, `"triangle-list"`) |
 | 바이너리 (`data`) | `ArrayBuffer` / base64 문자열 / 바이트 배열 |
 | 핸들 | 정수. `null`/누락은 "없음" |
+| 정수 필드 전반 (오프셋·크기·개수·핸들·플래그·배열 원소) | WebIDL `[EnforceRange]`처럼 읽는다 — NaN·±Infinity는 거부, 소수는 0 쪽으로 버림, ±(2^53 − 1)(`Number.MAX_SAFE_INTEGER`) 밖은 거부. 거부는 필드 경로가 붙은 `validation` 오류다 (`WGPUValueReader.enforceRange` 한 곳) |
 
 `null`은 **누락과 같게** 다룬다 (`WGPUValueReader`가 `NSNull`을 없는 값으로 본다). 단
 `colorFormats` 배열 안의 `null`은 "이 슬롯에는 어태치먼트가 없다"는 뜻으로 보존된다.
@@ -364,7 +365,6 @@ occlusion 쿼리는 중첩할 수 없고, 한 패스에서 같은 인덱스를 �
 | `GPURenderPassColorAttachment.depthSlice` | 읽지 않는다 — 항상 0번 슬라이스에 그린다 |
 | `GPURenderPassDescriptor.maxDrawCount` | 무시한다 (드라이버 힌트) |
 | `setBindGroup`의 `Uint32Array` 오버로드 | 없다 — 배열 형태와 결과가 같고 브리지를 건널 때 어차피 배열로 펴진다 |
-| `setBindGroup`의 `dynamicOffsets` 파싱 실패 | **빈 배열로 본다.** 실제로 필요했다면 바인드 그룹 적용에서 "개수가 부족하다"로 잡힌다 |
 
 미지원 API 전체 목록은 `docs/WEBGPU-API.md` §8에 있다.
 
