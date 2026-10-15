@@ -43,8 +43,14 @@ enum MSLTypeMapping {
                     "WGSL: a runtime-sized array (array<T>) can only be used in a storage buffer binding"
                 )
             }
-            guard let length = WGSLLayout.constantValue(count, module: module) else {
-                throw WGPUError.unsupported("WGSL: the array length cannot be computed at compile time")
+            let length: Int
+            do {
+                length = try WGSLLayout.arrayLength(count, module: module)
+            } catch let failure as WGSLConstantEvaluator.Failure {
+                throw WGPUError.unsupported("WGSL: the array length cannot be computed at compile time — \(failure.reason)")
+            }
+            guard length > 0 else {
+                throw WGPUError.validation("WGSL: an array length must be positive — got \(length)")
             }
             return "array<\(try self.type(element, module: module)), \(length)>"
         case .atomic(let element):

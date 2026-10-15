@@ -52,6 +52,21 @@
 `@location(n)`은 정점 입력에서 `[[attribute(n)]]`, 정점→프래그먼트 보간에서 `[[user(locnN)]]`,
 프래그먼트 출력에서 `[[color(n)]]`이 된다. `@interpolate(flat)` → `[[flat]]`.
 
+### 컴파일 시점 정수 (속성 인자 · 배열 길이)
+
+`@group` `@binding` `@location` `@align` `@size`의 인자와 `array<T, N>`의 길이는 **상수식으로 계산**한다
+(`WGSLConstantEvaluator`). 지원 범위:
+
+- 정수 리터럴 — 명세 문법 그대로: 10진(`0`, 선행 0 없음) · 16진(`0x10` `0X1F`) · 접미사 `i`(i32) `u`(u32).
+  접미사 없는 값은 AbstractInt(i64 범위). 형식이 틀리거나 타입 범위를 넘으면 거부한다
+- 모듈 스코프 `const` 이름 (선언이 사용보다 뒤에 와도 된다) · 괄호 · 단항 `-` · `+ - * / %`
+- 배열 길이에서만: `override` 이름(§2-2)과 함수 지역 `const` (모듈 전체에서 값이 하나로 정해질 때)
+
+속성은 const-expression 자리라 `override`를 받지 않는다. 계산할 수 없거나 범위를 벗어난 값
+(`@binding(-1)`, `@align(3)`, 순환하는 `const`, 지원하지 않는 연산자·함수 호출)은 **셰이더 모듈 생성
+오류**다 — 줄 번호와 이유가 함께 나온다. 예전에는 숫자 아닌 글자를 지워 읽어서 `@binding(0x10)`이
+10, `array<u32, 0x100>`이 길이 100이 되는 식으로 **조용히 틀렸다**.
+
 ### 내장 함수
 
 이름이 같은 것은 그대로 통과한다 (`min` `max` `clamp` `mix` `dot` `cross` `normalize` `length`

@@ -7,18 +7,24 @@ import Foundation
 /// An attribute such as `@vertex`, `@group(0)` or `@location(2)`.
 struct WGSLAttribute: Equatable {
     var name: String
+    /// Each argument's source text (tokens joined) — what name-like arguments (`@builtin(position)`) are read from.
     var arguments: [String]
-
-    var firstInt: Int? { arguments.first.flatMap { Int($0.filter(\.isNumber)) } }
+    /// Each argument parsed as an expression — nil where it does not parse as one.
+    /// Integer arguments are evaluated from these (`WGSLConstantEvaluator`), never from the text.
+    var expressions: [WGSLExpression?] = []
+    var line: Int = 0
+    /// The value of an integer const-expression attribute (`@group` `@binding` `@location` `@align`
+    /// `@size`), settled by `WGSLModule.resolveIntegerAttributes()` once the module is parsed.
+    var integerValue: Int?
 }
 
 extension Array where Element == WGSLAttribute {
     func first(named name: String) -> WGSLAttribute? { first { $0.name == name } }
     func has(_ name: String) -> Bool { contains { $0.name == name } }
-    var location: Int? { first(named: "location")?.firstInt }
+    var location: Int? { first(named: "location")?.integerValue }
     var builtin: String? { first(named: "builtin")?.arguments.first }
-    var group: Int? { first(named: "group")?.firstInt }
-    var binding: Int? { first(named: "binding")?.firstInt }
+    var group: Int? { first(named: "group")?.integerValue }
+    var binding: Int? { first(named: "binding")?.integerValue }
 }
 
 indirect enum WGSLType: Equatable {

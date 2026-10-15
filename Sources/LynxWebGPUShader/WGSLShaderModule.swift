@@ -58,7 +58,9 @@ public final class WGSLShaderModule {
         let isFloatType: Bool
         if case .scalar(let name)? = type { isFloatType = name == "f32" || name == "f16" } else { isFloatType = false }
         if !isFloatType, value == value.rounded() {
-            return .intLiteral(String(Int(value)))
+            // WGSL has no negative literals — a negative value is negation applied to one.
+            let literal = WGSLExpression.intLiteral(String(Int(value).magnitude))
+            return value < 0 ? .unary(op: "-", literal) : literal
         }
         return .floatLiteral(String(value))
     }

@@ -38,7 +38,9 @@ struct WGSLParser {
 
     static func parse(_ source: String) throws -> WGSLModule {
         var parser = WGSLParser(tokens: try WGSLLexer.tokenize(source))
-        return try parser.parseModule()
+        var module = try parser.parseModule()
+        try module.resolveIntegerAttributes()
+        return module
     }
 
     private init(tokens: [WGSLToken]) {
@@ -155,26 +157,48 @@ struct WGSLParser {
         var attributes: [WGSLAttribute] = []
         while check("@") {
             advance()
+            let line = current.line
             let name = try expectIdentifier("attribute name")
             var arguments: [String] = []
+            var expressions: [WGSLExpression?] = []
             if match("(") {
                 repeat {
                     if check(")") { break }
-                    var text = ""
-                    var depth = 0
-                    while !isAtEnd {
-                        if depth == 0, check(",") || check(")") { break }
-                        if check("(") { depth += 1 }
-                        if check(")") { depth -= 1 }
-                        text += advance().text
-                    }
-                    arguments.append(text)
+                    let argument = parseAttributeArgument()
+                    arguments.append(argument.text)
+                    expressions.append(argument.expression)
                 } while match(",")
                 try expect(")", "attribute arguments")
             }
-            attributes.append(WGSLAttribute(name: name, arguments: arguments))
+            attributes.append(WGSLAttribute(name: name, arguments: arguments, expressions: expressions, line: line))
         }
         return attributes
+    }
+
+    /// One attribute argument — as an expression when it parses as one (`0x10`, `BASE + 1`), and as
+    /// source text always. An argument that is not an expression is kept as text only, so an attribute
+    /// this parser has no grammar for still passes as it did.
+    private mutating func parseAttributeArgument() -> (text: String, expression: WGSLExpression?) {
+        let start = index
+        // `expectGenericClose` rewrites tokens in place, so the text and a rollback read the originals.
+        let original = tokens
+        let originalTemplateDepth = templateDepth
+        if let expression = try? parseExpression(), check(",") || check(")") {
+            return (original[start..<index].map(\.text).joined(), expression)
+        }
+        index = start
+        tokens = original
+        templateDepth = originalTemplateDepth
+
+        var text = ""
+        var depth = 0
+        while !isAtEnd {
+            if depth == 0, check(",") || check(")") { break }
+            if check("(") { depth += 1 }
+            if check(")") { depth -= 1 }
+            text += advance().text
+        }
+        return (text, nil)
     }
 
     private mutating func parseStruct() throws -> WGSLStruct {
