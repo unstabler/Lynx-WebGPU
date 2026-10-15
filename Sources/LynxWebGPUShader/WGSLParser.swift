@@ -12,6 +12,10 @@ struct WGSLParser {
     /// Depth of expression parsing inside a generic argument (the length expression of `array<f32, 64>`).
     /// Above zero, `>` is read as **closing a template** rather than as a comparison.
     private var templateDepth = 0
+    /// How deeply types, expressions and statements are nested at the current token. Every one of
+    /// those is parsed recursively, so untrusted source (`((((…))))` or `array<array<…>>` a few
+    /// hundred thousand deep) would otherwise overflow the stack — `enterNesting()` caps it.
+    private var nestingDepth = 0
 
     /// Names whose `<` must be read as opening a generic.
     private static let templateNames: Set<String> = [
@@ -95,6 +99,18 @@ struct WGSLParser {
             tokens[index] = .punctuation("=", line: current.line)
         } else {
             throw error("expected '>' (\(context)) — got: '\(current.text)'")
+        }
+    }
+
+    /// The deepest nesting of types, expressions and statements a module may use — Tint's parser
+    /// limit. Real shaders stay far below it; past it parsing fails instead of exhausting the stack.
+    static let maximumNestingDepth = 128
+
+    /// Called on entry to every recursive production; pair it with `defer { nestingDepth -= 1 }`.
+    private mutating func enterNesting() throws {
+        nestingDepth += 1
+        guard nestingDepth <= Self.maximumNestingDepth else {
+            throw error("nesting is deeper than \(Self.maximumNestingDepth) levels")
         }
     }
 
@@ -337,6 +353,8 @@ struct WGSLParser {
     // MARK: - Types
 
     private mutating func parseType() throws -> WGSLType {
+        try enterNesting()
+        defer { nestingDepth -= 1 }
         let name = try expectIdentifier("type name")
 
         switch name {
@@ -472,6 +490,8 @@ struct WGSLParser {
     }
 
     private mutating func parseStatement() throws -> WGSLStatement {
+        try enterNesting()
+        defer { nestingDepth -= 1 }
         // Attributes on a statement (@diagnostic and the like) do not affect translation.
         _ = try parseAttributes()
 
@@ -567,6 +587,9 @@ struct WGSLParser {
     }
 
     private mutating func parseIfStatement() throws -> WGSLStatement {
+        // An `else if` chain recurses here directly (and so does everything walking the result).
+        try enterNesting()
+        defer { nestingDepth -= 1 }
         let condition = try parseExpression()
         let thenBranch = try parseBlock()
         var elseBranch: WGSLElseBranch?
@@ -685,32 +708,49 @@ struct WGSLParser {
     ]
 
     mutating func parseExpression() throws -> WGSLExpression {
-        try parseBinary(level: 0)
+        try enterNesting()
+        defer { nestingDepth -= 1 }
+        return try parseBinary(minimumLevel: 0)
     }
 
-    private mutating func parseBinary(level: Int) throws -> WGSLExpression {
-        guard level < Self.precedence.count else { return try parseUnary() }
-        var left = try parseBinary(level: level + 1)
-        while Self.precedence[level].contains(current.text), current.kind == .punctuation,
-              !(templateDepth > 0 && Self.templateClosers.contains(current.text)) {
+    /// Precedence climbing — one call per operand instead of one per precedence level, so a nested
+    /// parenthesis costs a handful of stack frames rather than a dozen (the depth limit has to fit a
+    /// 512 KB thread stack). Operators of one level associate left.
+    private mutating func parseBinary(minimumLevel: Int) throws -> WGSLExpression {
+        var left = try parseUnary()
+        while let level = binaryOperatorLevel(), level >= minimumLevel {
             let op = advance().text
-            let right = try parseBinary(level: level + 1)
+            let right = try parseBinary(minimumLevel: level + 1)
             left = .binary(op: op, left, right)
         }
         return left
     }
 
+    /// The precedence level of the binary operator at the current token, if it is one here.
+    private func binaryOperatorLevel() -> Int? {
+        guard current.kind == .punctuation,
+              !(templateDepth > 0 && Self.templateClosers.contains(current.text)) else { return nil }
+        return Self.precedence.firstIndex { $0.contains(current.text) }
+    }
+
     private mutating func parseUnary() throws -> WGSLExpression {
+        // A prefix operator recurses without passing through parseExpression (`- - - … x`), so it counts too.
         if check("-") || check("!") || check("~") {
             let op = advance().text
+            try enterNesting()
+            defer { nestingDepth -= 1 }
             return .unary(op: op, try parseUnary())
         }
         if check("&") {
             advance()
+            try enterNesting()
+            defer { nestingDepth -= 1 }
             return .addressOf(try parseUnary())
         }
         if check("*") {
             advance()
+            try enterNesting()
+            defer { nestingDepth -= 1 }
             return .dereference(try parseUnary())
         }
         return try parsePostfix()

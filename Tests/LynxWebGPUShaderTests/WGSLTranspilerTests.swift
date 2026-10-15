@@ -256,6 +256,83 @@ final class WGSLTranspilerTests: XCTestCase {
         XCTAssertEqual(WGSLLayout.size(of: .named("S"), module: module, uniform: true), 16)
     }
 
+    // MARK: - Parser nesting depth
+
+    /// Runs `body` on a thread with a 512 KB stack — the default for a secondary thread on Apple
+    /// platforms, which is where commands run (the JS thread). Overflowing it kills the test process.
+    private func onSmallStack(
+        file: StaticString = #filePath, line: UInt = #line, _ body: @escaping () -> Void
+    ) {
+        let finished = DispatchSemaphore(value: 0)
+        let thread = Thread {
+            body()
+            finished.signal()
+        }
+        thread.stackSize = 512 * 1024
+        thread.start()
+        XCTAssertEqual(finished.wait(timeout: .now() + 60), .success, "did not finish in time", file: file, line: line)
+    }
+
+    /// The parser is recursive descent, so nesting in untrusted source used to recurse once per level
+    /// until the stack ran out (signal 11) — 200,000 parentheses or a 200,000-deep `array<array<…>>`
+    /// on the main thread, a few dozen levels on a 512 KB stack. Past Tint's depth limit it is now a
+    /// validation error with the line. (10,000 levels here: far past any stack, and the debug-build
+    /// lexer takes seconds per 100 KB.)
+    func test_absurdlyDeepNestingIsAParseErrorNotAStackOverflow() {
+        let depth = 10_000
+        let sources = [
+            "const x = " + String(repeating: "(", count: depth) + "1" + String(repeating: ")", count: depth) + ";",
+            "var<private> v: " + String(repeating: "array<", count: depth) + "f32"
+                + String(repeating: ", 1>", count: depth) + ";",
+            "const y = " + String(repeating: "- ", count: depth) + "1;",
+            "fn f() " + String(repeating: "{", count: depth) + String(repeating: "}", count: depth),
+            "fn g(a: i32) {\n if a == 0 {}" + String(repeating: " else if a == 1 {}", count: depth) + "\n}",
+        ]
+        for source in sources {
+            var failure: WGPUError?
+            onSmallStack {
+                do { _ = try WGSLShaderModule(source: source) } catch { failure = error as? WGPUError }
+            }
+            XCTAssertEqual(failure?.kind, .validation, String(source.prefix(40)))
+            XCTAssertNotNil(failure?.line, String(source.prefix(40)))
+            XCTAssertTrue(failure?.message.contains("nesting is deeper than") ?? false, "\(String(describing: failure))")
+        }
+    }
+
+    /// Just under the limit still parses on the same small stack, and nested expressions and types
+    /// also **translate** there — the limit is what bounds the emitter's recursion over them too.
+    func test_nestingJustUnderTheLimitStillWorksOnASmallStack() throws {
+        let depth = WGSLParser.maximumNestingDepth - 8
+        let source = """
+        @fragment fn fs() -> @location(0) vec4f {
+            let x = \(String(repeating: "(", count: depth))1.0\(String(repeating: ")", count: depth));
+            var a: \(String(repeating: "array<", count: depth / 2))f32\(String(repeating: ", 1>", count: depth / 2));
+            return vec4f(x);
+        }
+        """
+        var msl: String?
+        var failure: Error?
+        onSmallStack {
+            do { msl = try self.translate(source, entryPoints: ["fs"]) } catch { failure = error }
+        }
+        XCTAssertNil(failure)
+        XCTAssertTrue(msl?.contains("1.0" + String(repeating: ")", count: depth)) ?? false)
+
+        let statements = """
+        fn f(a: i32) -> i32 {
+            var y = 0;
+            \(String(repeating: "{ ", count: depth))y = 1;\(String(repeating: " }", count: depth))
+            if a == 0 { y = 2; }\(String(repeating: " else if a == 1 { y = 3; }", count: depth))
+            return y;
+        }
+        """
+        failure = nil
+        onSmallStack {
+            do { _ = try WGSLShaderModule(source: statements) } catch { failure = error }
+        }
+        XCTAssertNil(failure)
+    }
+
     /// A cyclic constant used as an array length gives up with an error instead of recursing.
     func test_aCyclicArrayLengthConstantIsAnErrorNotARecursion() throws {
         let module = try WGSLShaderModule(source: """
