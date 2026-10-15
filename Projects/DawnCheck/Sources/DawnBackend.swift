@@ -427,6 +427,8 @@ final class DawnBackend: WGPUBackend {
                 return
             }
             guard isCurrent else {
+                // Defensive: Dawn reports an unmapped pending map as Aborted, so this is not expected —
+                // but a stale success must not read the newer mapping's range either way.
                 context.deliver(.failure(WGPUError.backend("mapAsync(WRITE) was superseded by unmap()")))
                 return
             }

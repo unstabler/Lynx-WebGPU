@@ -2043,14 +2043,21 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             self.executionLock.lock()
             defer { self.executionLock.unlock() }
             self.noteReadbackFinished()
+            // A mapping unmapped while pending is over: its completion may arrive after a newer mapping
+            // began, so it must leave that one's state alone, and it reports failure whatever the backend
+            // returned (the spec rejects it with an AbortError) — on every backend alike.
+            guard target.mapGeneration == generation else {
+                let error: WGPUError
+                if case .failure(let failure) = result { error = failure } else {
+                    error = .backend("mapAsync was aborted by unmap() before it completed")
+                }
+                completion(["ok": false, "errors": [error.payload]])
+                return
+            }
             switch result {
             case .failure(let error):
-                // Only this mapping's failure releases it — the failure of one unmapped while pending
-                // (Dawn aborts it) may arrive after a newer mapping began, and must leave that one alone.
-                if target.mapGeneration == generation {
-                    target.isMapped = false
-                    target.writeMappedRange = nil
-                }
+                target.isMapped = false
+                target.writeMappedRange = nil
                 completion(["ok": false, "errors": [error.payload]])
             case .success(let data):
                 // Carry `Data` straight through — Lynx turns `NSData` into a JS `ArrayBuffer`.
