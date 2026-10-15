@@ -34,7 +34,7 @@ enum WGSLDeepStack {
         return try result.get()
     }
 
-    private final class ResultBox<T> {
+    private final class ResultBox<T>: @unchecked Sendable {
         var result: Result<T, Error>?
     }
 
