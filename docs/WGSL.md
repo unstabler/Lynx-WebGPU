@@ -77,8 +77,10 @@
 | `textureSample(t, s, uv)` | `t.sample(s, uv)` |
 | `textureSampleLevel(t, s, uv, lod)` | `t.sample(s, uv, level(lod))` |
 | `textureSampleBias(t, s, uv, b)` | `t.sample(s, uv, bias(b))` |
-| `textureSampleGrad(t, s, uv, dx, dy)` | `t.sample(s, uv, gradient2d(dx, dy))` |
+| `textureSampleGrad(t, s, uv, dx, dy)` | `t.sample(s, uv, gradient2d(dx, dy))` (3d는 `gradient3d`, 큐브는 `gradientcube`) |
 | `textureSampleCompare(t, s, uv, ref)` | `t.sample_compare(s, uv, ref)` |
+| `textureSampleCompareLevel(t, s, uv, ref)` | `t.sample_compare(s, uv, ref, level(0))` — 정점·컴퓨트 셰이더에서도 된다 |
+| 위 샘플 함수의 끝 인자 `offset` | 맨 뒤(LOD 옵션 다음)에 `int2(offset)` / 3d는 `int3(offset)`. 큐브에 주면 오류 |
 | `textureLoad(t, coord, level)` | `t.read(uint2(coord), level)` |
 | `textureStore(t, coord, v)` | `t.write(v, uint2(coord))` |
 | `textureDimensions(t)` | `uint2(t.get_width(), t.get_height())` |

@@ -1335,6 +1335,17 @@ struct MSLEmitter {
             }
         }
 
+        /// The optional trailing `offset` (a const-expression `vec2<i32>` / `vec3<i32>`). Metal takes it
+        /// as the **last** argument, after any LOD option — dropping it silently samples the wrong texel.
+        /// WGSL allows it only on 2d, 2d_array and 3d textures (depth ones included), never on cubes.
+        func appendOffset(to parameters: inout [String]) throws {
+            guard !rest.isEmpty else { return }
+            guard rest.count == 1, ["2d", "2d_array", "3d"].contains(dimension) else {
+                throw WGPUError.validation("WGSL: too many arguments to \(callee)() for a \(dimension) texture")
+            }
+            parameters.append("\(dimension == "3d" ? "int3" : "int2")(\(rest.removeFirst()))")
+        }
+
         switch callee {
         case "textureSample", "textureSampleBias", "textureSampleLevel", "textureSampleGrad":
             guard rest.count >= 2 else {
@@ -1355,10 +1366,17 @@ struct MSLEmitter {
                 guard rest.count >= 2 else { throw WGPUError.validation("WGSL: textureSampleGrad has no derivatives") }
                 let dx = rest.removeFirst()
                 let dy = rest.removeFirst()
-                parameters.append("gradient2d(\(dx), \(dy))")
+                let gradient: String
+                switch dimension {
+                case "3d": gradient = "gradient3d"
+                case "cube", "cube_array": gradient = "gradientcube"
+                default: gradient = "gradient2d"
+                }
+                parameters.append("\(gradient)(\(dx), \(dy))")
             default:
                 break
             }
+            try appendOffset(to: &parameters)
             return "\(receiver).sample(\(parameters.joined(separator: ", ")))"
 
         case "textureSampleCompare", "textureSampleCompareLevel":
@@ -1370,6 +1388,10 @@ struct MSLEmitter {
             var parameters = [sampler, coordinates]
             if isArrayed, rest.count >= 2 { parameters.append(rest.removeFirst()) }
             parameters.append(rest.removeFirst())
+            // `…CompareLevel` samples mip level 0 — spelled out, because Metal's option-less overload
+            // takes an implicit LOD (fragment-only) and the offset must follow the LOD option.
+            if callee == "textureSampleCompareLevel" { parameters.append("level(0)") }
+            try appendOffset(to: &parameters)
             return "\(receiver).sample_compare(\(parameters.joined(separator: ", ")))"
 
         case "textureLoad":

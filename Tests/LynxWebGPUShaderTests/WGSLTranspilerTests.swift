@@ -374,6 +374,148 @@ final class WGSLTranspilerTests: XCTestCase {
         XCTAssertTrue(msl.contains("sampler samp [[sampler(0)]]"))
     }
 
+    /// The trailing `offset` argument of the sampling builtins must reach Metal, where it is the last
+    /// argument after any LOD option. It used to be dropped silently — the shader compiled and
+    /// sampled the texel next to the one asked for.
+    func test_sampleOffsetsReachMetalOn2DTextures() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var t: texture_2d<f32>;
+        @group(0) @binding(1) var s: sampler;
+        const shift = vec2i(-2, 3);
+
+        @fragment
+        fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+            let a = textureSample(t, s, uv, vec2i(1, -1));
+            let b = textureSampleLevel(t, s, uv, 2.0, vec2<i32>(0, 1));
+            let c = textureSampleBias(t, s, uv, 0.5, shift);
+            let d = textureSampleGrad(t, s, uv, vec2f(0.01), vec2f(0.02), vec2(1, 1));
+            let e = textureSample(t, s, uv);
+            return a + b + c + d + e;
+        }
+        """, entryPoints: ["fs"])
+
+        XCTAssertTrue(msl.contains("t.sample(s, uv, int2(int2(1, -1)))"), msl)
+        XCTAssertTrue(msl.contains("t.sample(s, uv, level(2.0), int2(int2(0, 1)))"), msl)
+        XCTAssertTrue(msl.contains("t.sample(s, uv, bias(0.5), int2(shift))"), msl)
+        XCTAssertTrue(msl.contains("t.sample(s, uv, gradient2d(float2(0.01), float2(0.02)), int2(wgpu_aint2(1, 1)))"), msl)
+        XCTAssertTrue(msl.contains("t.sample(s, uv);"), "no offset, no extra argument:\n\(msl)")
+    }
+
+    func test_sampleOffsetsFollowTheArrayIndexOnArrayTextures() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var t: texture_2d_array<f32>;
+        @group(0) @binding(1) var s: sampler;
+
+        @fragment
+        fn fs(@location(0) uv: vec2f, @location(1) @interpolate(flat) layer: i32) -> @location(0) vec4f {
+            let a = textureSample(t, s, uv, layer, vec2i(1, 0));
+            let b = textureSampleLevel(t, s, uv, layer, 1.0, vec2i(0, 1));
+            let c = textureSampleBias(t, s, uv, 2u, -1.0, vec2i(-1, 0));
+            let d = textureSampleGrad(t, s, uv, layer, vec2f(0.0), vec2f(0.0), vec2i(0, -1));
+            return a + b + c + d;
+        }
+        """, entryPoints: ["fs"])
+
+        XCTAssertTrue(msl.contains("t.sample(s, uv, layer, int2(int2(1, 0)))"), msl)
+        XCTAssertTrue(msl.contains("t.sample(s, uv, layer, level(1.0), int2(int2(0, 1)))"), msl)
+        XCTAssertTrue(msl.contains("t.sample(s, uv, 2u, bias(-1.0), int2(int2(-1, 0)))"), msl)
+        XCTAssertTrue(msl.contains("t.sample(s, uv, layer, gradient2d(float2(0.0), float2(0.0)), int2(int2(0, -1)))"), msl)
+    }
+
+    /// A 3D texture takes a 3-component offset — and its gradients are `gradient3d`, not `gradient2d`.
+    func test_sampleOffsetsOn3DTexturesAreThreeComponents() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var t: texture_3d<f32>;
+        @group(0) @binding(1) var s: sampler;
+
+        @fragment
+        fn fs(@location(0) uvw: vec3f) -> @location(0) vec4f {
+            let a = textureSample(t, s, uvw, vec3i(1, 0, -1));
+            let b = textureSampleLevel(t, s, uvw, 0.0, vec3i(0, 0, 1));
+            let c = textureSampleGrad(t, s, uvw, vec3f(0.1), vec3f(0.1), vec3i(1, 1, 1));
+            return a + b + c;
+        }
+        """, entryPoints: ["fs"])
+
+        XCTAssertTrue(msl.contains("t.sample(s, uvw, int3(int3(1, 0, -1)))"), msl)
+        XCTAssertTrue(msl.contains("t.sample(s, uvw, level(0.0), int3(int3(0, 0, 1)))"), msl)
+        XCTAssertTrue(msl.contains("t.sample(s, uvw, gradient3d(float3(0.1), float3(0.1)), int3(int3(1, 1, 1)))"), msl)
+    }
+
+    /// Depth textures: plain and level sampling, and both comparison forms — `…CompareLevel` is
+    /// mip level 0, spelled out so the offset can follow it (and so it works outside fragment shaders).
+    func test_depthSamplingAndComparisonKeepTheirOffsets() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var shadow: texture_depth_2d;
+        @group(0) @binding(1) var shadows: texture_depth_2d_array;
+        @group(0) @binding(2) var cmp: sampler_comparison;
+        @group(0) @binding(3) var s: sampler;
+
+        @fragment
+        fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+            let a = textureSample(shadow, s, uv, vec2i(1, 1));
+            let b = textureSampleLevel(shadow, s, uv, 0, vec2i(-1, 0));
+            let c = textureSampleCompare(shadow, cmp, uv, 0.5, vec2i(0, 1));
+            let d = textureSampleCompareLevel(shadow, cmp, uv, 0.5, vec2i(1, 0));
+            let e = textureSampleCompare(shadows, cmp, uv, 3, 0.5, vec2i(-1, -1));
+            let f = textureSampleCompareLevel(shadows, cmp, uv, 3, 0.5, vec2i(1, -1));
+            let g = textureSampleCompareLevel(shadow, cmp, uv, 0.25);
+            return vec4f(a + b + c + d, e + f, g, 1.0);
+        }
+        """, entryPoints: ["fs"])
+
+        XCTAssertTrue(msl.contains("shadow.sample(s, uv, int2(int2(1, 1)))"), msl)
+        XCTAssertTrue(msl.contains("shadow.sample(s, uv, level(0), int2(int2(-1, 0)))"), msl)
+        XCTAssertTrue(msl.contains("shadow.sample_compare(cmp, uv, 0.5, int2(int2(0, 1)))"), msl)
+        XCTAssertTrue(msl.contains("shadow.sample_compare(cmp, uv, 0.5, level(0), int2(int2(1, 0)))"), msl)
+        XCTAssertTrue(msl.contains("shadows.sample_compare(cmp, uv, 3, 0.5, int2(int2(-1, -1)))"), msl)
+        XCTAssertTrue(msl.contains("shadows.sample_compare(cmp, uv, 3, 0.5, level(0), int2(int2(1, -1)))"), msl)
+        XCTAssertTrue(msl.contains("shadow.sample_compare(cmp, uv, 0.25, level(0))"), msl)
+    }
+
+    /// `textureSampleCompareLevel` has no implicit derivatives, so it is legal in a vertex shader —
+    /// Metal's option-less `sample_compare` is not, hence the explicit `level(0)`.
+    func test_compareLevelSamplingWorksOutsideFragmentShaders() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var shadow: texture_depth_2d;
+        @group(0) @binding(1) var cmp: sampler_comparison;
+
+        @vertex
+        fn vs() -> @builtin(position) vec4f {
+            let lit = textureSampleCompareLevel(shadow, cmp, vec2f(0.5), 0.5);
+            return vec4f(lit, 0.0, 0.0, 1.0);
+        }
+        """, entryPoints: ["vs"])
+        XCTAssertTrue(msl.contains("shadow.sample_compare(cmp, float2(0.5), 0.5, level(0))"), msl)
+    }
+
+    /// Cubes take no offset in WGSL; their gradients are `gradientcube`.
+    func test_cubeSamplingRejectsAnOffsetAndUsesCubeGradients() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var sky: texture_cube<f32>;
+        @group(0) @binding(1) var s: sampler;
+
+        @fragment
+        fn fs(@location(0) dir: vec3f) -> @location(0) vec4f {
+            return textureSampleGrad(sky, s, dir, vec3f(0.1), vec3f(0.1));
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("sky.sample(s, dir, gradientcube(float3(0.1), float3(0.1)))"), msl)
+
+        let module = try WGSLShaderModule(source: """
+        @group(0) @binding(0) var sky: texture_cube<f32>;
+        @group(0) @binding(1) var s: sampler;
+        @fragment
+        fn fs(@location(0) dir: vec3f) -> @location(0) vec4f {
+            return textureSample(sky, s, dir, vec3i(1, 0, 0));
+        }
+        """)
+        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["fs"]))
+        XCTAssertThrowsError(try module.translateToMSL(entryPoints: ["fs"], bindings: bindings)) { error in
+            XCTAssertTrue((error as? WGPUError)?.message.contains("too many arguments") ?? false, "\(error)")
+        }
+    }
+
     func test_aStorageTextureWriteBecomesAWriteCall() throws {
         let source = """
         @group(0) @binding(0) var target: texture_storage_2d<rgba8unorm, write>;
