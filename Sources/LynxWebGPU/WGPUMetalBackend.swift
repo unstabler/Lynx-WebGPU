@@ -256,6 +256,7 @@ public final class WGPUMetalBackend: WGPUBackend {
         _ texture: WGPUTextureObject, data: Data, origin: WGPUOrigin3D, size: WGPUExtent3D,
         mipLevel: Int, bytesPerRow: Int, rowsPerImage: Int
     ) throws {
+        try Self.ensureNotFramebufferOnly(texture.texture, "writeTexture")
         let blockRows = texture.format.blockRows(height: size.height)
         let bytesPerImage = bytesPerRow * max(rowsPerImage, blockRows)
         let layers = max(size.depthOrArrayLayers, 1)
@@ -339,6 +340,7 @@ public final class WGPUMetalBackend: WGPUBackend {
             case .sampler(let sampler):
                 resource = .sampler(sampler.sampler)
             case .textureView(let view):
+                try Self.ensureNotFramebufferOnly(view.texture, "binding \(entry.binding)")
                 resource = .texture(view.texture)
             }
             return WGPUMetalBindGroup.Binding(
@@ -487,17 +489,6 @@ public final class WGPUMetalBackend: WGPUBackend {
 
     public func acquireFrameTexture(_ surface: WGPUSurface) throws -> WGPUAcquiredSurfaceTexture<WGPUMetalBackend>? {
         guard let drawable = surface.nextDrawable() else { return nil }
-        // A drawable still carrying the previous `framebufferOnly` (configure lands on main
-        // asynchronously) would make Metal assert on the first copy or shader access — refuse the frame
-        // instead. The drawable is dropped unpresented and goes back to the pool.
-        if let layerSurface = surface as? WGPUMetalLayerSurface,
-           !layerSurface.canServeConfiguredUsage(drawable.texture) {
-            throw WGPUError.validation(
-                "canvas '\(surface.identifier)' was configured with a usage beyond RENDER_ATTACHMENT, but "
-                    + "the drawable is still framebuffer-only (configure applies on the main thread "
-                    + "asynchronously) — this frame is skipped; a later one will have it"
-            )
-        }
         // Use the actual drawable texture's format — canvas configuration can land a frame late.
         let format = WGPUMetalMapping.textureFormat(from: drawable.texture.pixelFormat)
             ?? surface.configuredFormat
@@ -903,6 +894,7 @@ public final class WGPUMetalBackend: WGPUBackend {
         size: WGPUExtent3D, buffer: WGPUBufferObject, offset: Int,
         bytesPerRow: Int, bytesPerImage: Int
     ) throws {
+        try Self.ensureNotFramebufferOnly(texture.texture, "copyTextureToBuffer")
         let encoder = try activeBlitEncoder()
         encoder.copy(
             from: texture.texture,
@@ -922,6 +914,7 @@ public final class WGPUMetalBackend: WGPUBackend {
         texture: WGPUTextureObject, slice: Int, mipLevel: Int, origin: WGPUOrigin3D,
         size: WGPUExtent3D
     ) throws {
+        try Self.ensureNotFramebufferOnly(texture.texture, "copyBufferToTexture")
         let encoder = try activeBlitEncoder()
         encoder.copy(
             from: buffer.buffer,
@@ -942,6 +935,8 @@ public final class WGPUMetalBackend: WGPUBackend {
         destination: WGPUTextureObject, destinationSlice: Int, destinationMipLevel: Int,
         destinationOrigin: WGPUOrigin3D, size: WGPUExtent3D
     ) throws {
+        try Self.ensureNotFramebufferOnly(source.texture, "copyTextureToTexture source")
+        try Self.ensureNotFramebufferOnly(destination.texture, "copyTextureToTexture destination")
         let encoder = try activeBlitEncoder()
         encoder.copy(
             from: source.texture,
@@ -953,6 +948,20 @@ public final class WGPUMetalBackend: WGPUBackend {
             destinationSlice: destinationSlice,
             destinationLevel: destinationMipLevel,
             destinationOrigin: MTLOrigin(x: destinationOrigin.x, y: destinationOrigin.y, z: 0)
+        )
+    }
+
+    /// Metal rejects every use of a framebuffer-only texture other than as a render pass attachment
+    /// (a validation assertion that kills a debug process) — only canvas drawables can be one. The canvas
+    /// usage may lack the use, or the configure requesting it has not landed yet: a JS-thread configure
+    /// applies `framebufferOnly` on main asynchronously (`WGPUMetalLayerSurface`). Only the offending op
+    /// fails; the frame still renders and presents.
+    private static func ensureNotFramebufferOnly(_ texture: MTLTexture, _ use: String) throws {
+        guard texture.isFramebufferOnly else { return }
+        throw WGPUError.validation(
+            "\(use): the canvas texture is framebuffer-only — the canvas usage does not include this use, "
+                + "or the configure requesting it has not taken effect yet (it applies on the main thread "
+                + "asynchronously; a later frame will have it)"
         )
     }
 

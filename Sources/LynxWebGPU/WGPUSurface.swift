@@ -71,7 +71,6 @@ public final class WGPUMetalLayerSurface: WGPUSurface {
 
     private var cachedSize: CGSize = .zero
     private var format: WGPUTextureFormat = .bgra8unorm
-    private var usage: WGPUTextureUsage = .renderAttachment
     private let lock = NSLock()
 
     public init(identifier: String, layer: CAMetalLayer) {
@@ -110,7 +109,6 @@ public final class WGPUMetalLayerSurface: WGPUSurface {
         let pixelFormat = try WGPUMetalMapping.pixelFormat(configuration.format)
         lock.lock()
         format = configuration.format
-        usage = configuration.usage
         let size = layer.drawableSize
         cachedSize = size
         lock.unlock()
@@ -154,22 +152,11 @@ public final class WGPUMetalLayerSurface: WGPUSurface {
     /// Only a canvas that is **nothing but a render attachment** qualifies. Any other usage reaches the
     /// drawable texture outside a render pass — a blit for `COPY_SRC`/`COPY_DST`, a shader read for
     /// `TEXTURE_BINDING`, a shader write for `STORAGE_BINDING` — and Metal rejects all of those on a
-    /// framebuffer-only texture (a validation assertion that kills a debug process).
+    /// framebuffer-only texture (a validation assertion that kills a debug process). The first drawables
+    /// after a JS-thread configure can still be framebuffer-only — `WGPUMetalBackend` refuses those uses
+    /// per op (`ensureNotFramebufferOnly`).
     static func isFramebufferOnly(_ usage: WGPUTextureUsage) -> Bool {
         usage.isSubset(of: .renderAttachment)
-    }
-
-    /// Whether a drawable texture from this layer can serve the **requested** canvas usage.
-    ///
-    /// `configure` from the JS thread lands `framebufferOnly` on main later, so the first drawables after
-    /// it can still be framebuffer-only. Handing one out to a batch that copies into it or binds it would
-    /// hit the same Metal assertion — the acquisition path refuses it instead (`WGPUMetalBackend`).
-    /// Reading the texture's property is safe off main; the requested usage comes from the lock.
-    func canServeConfiguredUsage(_ texture: MTLTexture) -> Bool {
-        lock.lock()
-        let usage = self.usage
-        lock.unlock()
-        return Self.isFramebufferOnly(usage) || !texture.isFramebufferOnly
     }
 
     public func nextDrawable() -> WGPUDrawable? {

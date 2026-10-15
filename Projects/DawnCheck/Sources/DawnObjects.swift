@@ -279,6 +279,16 @@ final class DawnLayerCanvas: DawnCanvas {
         lock.unlock()
     }
 
+    /// The usages this surface can be configured with (`wgpuSurfaceGetCapabilities`), nil if the query
+    /// fails. The JS thread calls it — the same thread that configures the surface.
+    func supportedUsage(adapter: WGPUAdapter) -> LynxWebGPUCore.WGPUTextureUsage? {
+        guard let surface else { return nil }
+        var capabilities = WGPUSurfaceCapabilities()
+        guard wgpuSurfaceGetCapabilities(surface, adapter, &capabilities) == WGPUStatus_Success else { return nil }
+        defer { wgpuSurfaceCapabilitiesFreeMembers(capabilities) }
+        return LynxWebGPUCore.WGPUTextureUsage(rawValue: Int(truncatingIfNeeded: capabilities.usages))
+    }
+
     func updateSize(_ newSize: CGSize, device: WGPUDevice) {
         lock.lock()
         if newSize != desiredSize {

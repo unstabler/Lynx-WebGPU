@@ -960,7 +960,23 @@ final class DawnBackend: WGPUBackend {
     func configureSurface(
         _ surface: DawnCanvas, configuration: LynxWebGPUCore.WGPUCanvasConfiguration
     ) throws {
-        try surface.configure(device: device, format: configuration.format, usage: configuration.usage)
+        // A usage the surface does not support (e.g. STORAGE_BINDING on the Metal-layer surface) would
+        // fail the native configure and with it every later acquire — it is dropped so the canvas keeps
+        // rendering, and reported as validation.
+        var usage = configuration.usage
+        var unsupported: LynxWebGPUCore.WGPUTextureUsage = []
+        if let layerCanvas = surface as? DawnLayerCanvas,
+           let supported = layerCanvas.supportedUsage(adapter: adapter) {
+            unsupported = usage.subtracting(supported)
+            usage.formIntersection(supported)
+        }
+        try surface.configure(device: device, format: configuration.format, usage: usage)
+        guard unsupported.isEmpty else {
+            throw WGPUError.validation(
+                "canvas '\(configuration.canvasId)': usage 0x\(String(unsupported.rawValue, radix: 16)) "
+                    + "is not supported by this surface and was dropped"
+            )
+        }
     }
 
     func resizeSurface(_ surface: DawnCanvas, size: CGSize) {

@@ -184,17 +184,18 @@ final class SurfaceInFlightTests: XCTestCase {
         XCTAssertTrue(surface.layer.framebufferOnly)
     }
 
-    /// `configure` from the JS thread lands `framebufferOnly` on main **later**. A same-batch acquisition
-    /// that would hand out a still-framebuffer-only drawable is refused as a validation error — handed
-    /// out, the batch's copy into it or binding of it would make Metal assert.
-    func test_aDrawableStillFramebufferOnlyAfterAnAsyncConfigureIsRefused() throws {
+    /// `configure` from the JS thread lands `framebufferOnly` on main **later**, so the same batch can
+    /// still get a framebuffer-only drawable. Rendering into it is fine; only a use Metal forbids on a
+    /// framebuffer-only texture (here a copy out of it) fails — as a validation error rather than the
+    /// Metal assertion — and once main has applied the configuration the same copy succeeds.
+    func test_aCopyFromAStillFramebufferOnlyDrawableIsAValidationErrorNotACrash() throws {
         let context = try LynxWebGPUContext(device: device)
         let surface = WGPUMetalLayerSurface(identifier: "race", layer: CAMetalLayer())
         surface.updateDrawableSize(CGSize(width: 32, height: 32))
         context.registerSurface(surface)
 
-        func frame(_ id: Int) -> [[String: Any]] {
-            [
+        func frame(_ id: Int, copyInto buffer: Int? = nil) -> [[String: Any]] {
+            var commands: [[String: Any]] = [
                 ["op": "getCurrentTexture", "id": id, "canvas": "race"],
                 ["op": "createTextureView", "id": id + 1, "texture": id],
                 ["op": "beginRenderPass", "colorAttachments": [[
@@ -203,41 +204,63 @@ final class SurfaceInFlightTests: XCTestCase {
                 ]]],
                 ["op": "endPass"],
             ]
+            if let buffer {
+                commands.append(["op": "copyTextureToBuffer",
+                                 "source": ["texture": id],
+                                 "destination": ["buffer": buffer, "bytesPerRow": 256],
+                                 "copySize": ["width": 1, "height": 1]])
+            }
+            return commands
+        }
+        func messages(_ result: [String: Any]) -> [String] {
+            (result["errors"] as? [[String: Any]] ?? []).map { $0["message"] as? String ?? "" }
         }
 
         // On main: RENDER_ATTACHMENT only — device and format land synchronously.
-        let warmup = context.execute(
-            commands: [["op": "configureCanvas", "canvas": "race", "format": "bgra8unorm"]] + frame(1)
-        )
+        let warmup = context.execute(commands: [
+            ["op": "configureCanvas", "canvas": "race", "format": "bgra8unorm"],
+            ["op": "createBuffer", "id": 100, "size": 256, "usage": TestUsage.copyDst],
+        ] + frame(1))
         try XCTSkipIf((warmup["ok"] as? Bool) != true, "could not obtain a drawable headless: \(warmup)")
         XCTAssertTrue(surface.layer.framebufferOnly)
 
         // From another thread while main is blocked: the layer update cannot land before the acquisition.
-        var raced: [String: Any] = [:]
-        let done = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async {
-            raced = context.execute(commands: [
-                ["op": "configureCanvas", "canvas": "race", "format": "bgra8unorm",
-                 "usage": TestUsage.renderAttachment | TestUsage.textureCopyDst],
-                ["op": "getCurrentTexture", "id": 10, "canvas": "race"],
-            ])
-            done.signal()
+        func raced(_ commands: [[String: Any]]) -> [String: Any] {
+            var result: [String: Any] = [:]
+            let done = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                result = context.execute(commands: commands)
+                done.signal()
+            }
+            done.wait()
+            return result
         }
-        done.wait()
-        XCTAssertTrue(surface.layer.framebufferOnly, "the layer update is still queued on main")
-        XCTAssertEqual(raced["ok"] as? Bool, false, "\(raced)")
-        let message = ((raced["errors"] as? [[String: Any]])?.first?["message"] as? String) ?? ""
-        XCTAssertTrue(message.contains("framebuffer-only"), message)
+        let configure: [String: Any] = [
+            "op": "configureCanvas", "canvas": "race", "format": "bgra8unorm",
+            "usage": TestUsage.renderAttachment | TestUsage.textureCopySrc,
+        ]
 
-        // Once main has run, a later frame gets a drawable that can take the copy.
+        // Render-only use in that batch still works — a framebuffer-only drawable is a valid attachment.
+        let renderOnly = raced([configure] + frame(10))
+        XCTAssertTrue(surface.layer.framebufferOnly, "the layer update is still queued on main")
+        XCTAssertEqual(renderOnly["ok"] as? Bool, true, "\(renderOnly)")
+
+        // A copy out of the canvas in such a batch fails alone, as validation.
+        let withCopy = raced([configure] + frame(20, copyInto: 100))
+        XCTAssertTrue(surface.layer.framebufferOnly, "the layer update is still queued on main")
+        XCTAssertEqual(withCopy["ok"] as? Bool, false, "\(withCopy)")
+        XCTAssertEqual(messages(withCopy).count, 1, "only the copy fails: \(withCopy)")
+        XCTAssertTrue(messages(withCopy).first?.contains("framebuffer-only") == true, "\(withCopy)")
+
+        // Once main has run, a later frame's drawable takes the same copy.
         RunLoop.main.run(until: Date().addingTimeInterval(0.05))
         XCTAssertFalse(surface.layer.framebufferOnly)
         var recovered = false
         for attempt in 0..<4 where !recovered {
-            let result = context.execute(commands: frame(20 + attempt * 2))
+            let result = context.execute(commands: frame(30 + attempt * 2, copyInto: 100))
             recovered = (result["ok"] as? Bool) == true
         }
-        XCTAssertTrue(recovered, "the canvas must recover once the configuration has landed")
+        XCTAssertTrue(recovered, "the copy must succeed once the configuration has landed")
     }
 
     /// The offscreen surface honours the canvas usage too — `STORAGE_BINDING` needs a writable texture.
