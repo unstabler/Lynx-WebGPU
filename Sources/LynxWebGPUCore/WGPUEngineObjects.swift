@@ -17,6 +17,10 @@ public final class WGPUEngineBuffer<B: WGPUBackend> {
     /// Whether it is currently mapped to the CPU (between `mapAsync` and `unmap`) — the spec's
     /// "unavailable". The engine's mapping gate is what keeps such a buffer out of queue work.
     public var isMapped = false
+    /// The buffer range of the current **write** mapping (`mapAsync(GPUMapMode.WRITE)` or
+    /// `mappedAtCreation`) — the only range `unmapBuffer`'s `data` may be written back into.
+    /// Nil while unmapped or mapped for reading.
+    public var writeMappedRange: Range<Int>?
 
     public init(raw: B.Buffer, size: Int, usage: WGPUBufferUsage) {
         self.raw = raw

@@ -93,6 +93,60 @@ public extension WebGPUConformance {
 
     // MARK: - Callback APIs
 
+    /// `mapAsync(GPUMapMode.WRITE)` on a `MAP_WRITE` buffer — the mapping starts as the current
+    /// contents, and what `unmapBuffer` carries back (`offset` + `data`) lands in the buffer, whole or
+    /// partial. On a backend with real mapping (Dawn) this is a native write mapping, so the queue-write
+    /// shortcut (which needs COPY_DST) cannot pass by accident.
+    static var mapWriteContract: Check {
+        Check("map-write-contract") { harness in
+            let initial = (0..<16).map(UInt8.init)
+            try harness.executeExpectingSuccess([
+                ["op": "createBuffer", "id": 1,
+                 "usage": WebGPUUsage.mapWrite | WebGPUUsage.copySrc,
+                 "data": initial.conformanceBase64],
+                ["op": "createBuffer", "id": 2, "size": 16,
+                 "usage": WebGPUUsage.copyDst | WebGPUUsage.mapRead],
+            ], present: false)
+
+            /// Copies buffer 1 into the staging buffer 2 and reads it back.
+            func contents() throws -> [UInt8] {
+                try harness.executeExpectingSuccess([
+                    ["op": "copyBufferToBuffer", "source": 1, "destination": 2, "size": 16],
+                ], present: false)
+                let bytes = [UInt8](try harness.readBufferSync(handle: 2))
+                try harness.executeExpectingSuccess([["op": "unmapBuffer", "buffer": 2]], present: false)
+                return bytes
+            }
+
+            let mapped = try harness.readBufferSync(handle: 1)
+            guard [UInt8](mapped) == initial else {
+                throw ConformanceFailure("the write mapping did not start as the current contents — \([UInt8](mapped))")
+            }
+            let upper = [UInt8](repeating: 0xa5, count: 8)
+            try harness.executeExpectingSuccess([
+                ["op": "unmapBuffer", "buffer": 1, "offset": 8, "data": upper.conformanceBase64],
+            ], present: false)
+            let afterWhole = try contents()
+            guard afterWhole == Array(initial[0..<8]) + upper else {
+                throw ConformanceFailure("the unmap write-back did not land — \(afterWhole)")
+            }
+
+            // A partial mapping: buffer offsets, written back at the mapping's start when offset is omitted.
+            let part = try harness.readBufferSync(handle: 1, offset: 8, size: 8)
+            guard [UInt8](part) == upper else {
+                throw ConformanceFailure("the partial write mapping (offset 8) showed \([UInt8](part))")
+            }
+            let lower = [UInt8](repeating: 0x3c, count: 8)
+            try harness.executeExpectingSuccess([
+                ["op": "unmapBuffer", "buffer": 1, "data": lower.conformanceBase64],
+            ], present: false)
+            let afterPart = try contents()
+            guard afterPart == Array(initial[0..<8]) + lower else {
+                throw ConformanceFailure("the partial write-back landed wrong — \(afterPart)")
+            }
+        }
+    }
+
     /// `readBuffer` (mapAsync + getMappedRange) — full and partial reads, refusing re-entry while
     /// mapped, reuse after unmap, and a clean failure for a missing handle.
     static var readBufferContract: Check {

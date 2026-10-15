@@ -220,12 +220,19 @@ public struct WGPUDestroyCommand: WGPUCommandFields {
 }
 
 /// `buffer.unmap()`.
+///
+/// A write mapping (`mapAsync(GPUMapMode.WRITE)`) carries its bytes back here — the JS mapping is a copy,
+/// so `data` is what the app wrote, to be stored at buffer offset `offset` (the mapping's start when omitted).
 public struct WGPUUnmapBufferCommand: WGPUCommandFields {
     public let buffer: WGPUHandle
+    public let offset: Int?
+    public let data: Data?
     public let path: String
 
     public init(from reader: WGPUValueReader) throws {
         buffer = try reader.requiredHandle("buffer")
+        offset = reader.optionalInt("offset")
+        data = try reader.optionalData("data")
         path = reader.path
     }
 }

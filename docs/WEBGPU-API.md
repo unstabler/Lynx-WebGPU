@@ -123,7 +123,26 @@ device.queue.writeBuffer(buffer, 0, float32Array)      // writeBuffer
 const bytes = await staging.mapAsync(GPUMapMode.READ)  // readBuffer (콜백형 네이티브 호출)
 const part  = staging.getMappedRange(8, 16)            // 부분만 (offset 8의 배수, size 4의 배수)
 staging.unmap()
+
+// (4) 매핑해서 쓰기 — MAP_WRITE 버퍼. 쓴 내용은 unmap()에서 네이티브로 간다
+const upload = device.createBuffer({ size: 64, usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC })
+await upload.mapAsync(GPUMapMode.WRITE, 16, 32)         // 버퍼의 현재 내용으로 시작한다 (명세)
+new Float32Array(upload.getMappedRange(16, 32)).set(values)  // offset은 **버퍼** 오프셋
+upload.unmap()                                        // unmapBuffer {offset: 16, data}
+encoder.copyBufferToBuffer(upload, 16, target, 0, 32)
 ```
+
+**`mapAsync`의 `mode`** — `READ`·`WRITE` 중 정확히 하나. 생략하면 `READ`다 (이 구현의 줄임).
+`WRITE`는 `MAP_WRITE` usage가 있어야 하고 offset 8의 배수·size 4의 배수·버퍼 범위 안이어야 한다.
+`MAP_WRITE` 버퍼를 `READ`로 열 수는 없다 (명세는 `MAP_READ`를 요구하는데 `MAP_READ | MAP_WRITE`는
+금지다). 어긋나면 네이티브를 부르지 않고 `OperationError`로 reject한다. `READ`는 `MAP_READ`를
+**요구하지 않는다** — `STORAGE|COPY_SRC` 결과 버퍼를 바로 읽는 이 구현의 기존 리드백 경로를 깨지
+않으려는 것이다 (브라우저로 옮길 코드는 아래의 2단 스테이징을 쓸 것).
+
+**`getMappedRange`의 offset은 버퍼 오프셋이다** (매핑 시작 기준이 아니다 — 명세). `mapAsync(m, 16, 16)`
+뒤에는 `getMappedRange(16, 16)`이 맞고 `getMappedRange(0, 16)`은 매핑 밖이라 `OperationError`다.
+`size`를 생략하면 **버퍼 끝까지**이므로, 끝에 닿지 않는 부분 매핑에서는 `size`를 줘야 한다.
+`mapAsync`가 resolve하는 `ArrayBuffer`는 매핑 구간 전체다 (이 구현의 확장).
 
 `usage` 플래그: `MAP_READ` `MAP_WRITE` `COPY_SRC` `COPY_DST` `INDEX` `VERTEX` `UNIFORM` `STORAGE`
 `INDIRECT` `QUERY_RESOLVE`.
@@ -153,6 +172,13 @@ texture.dimension · format · usage · textureBindingViewDimension
 >
 > 정렬 요구는 **명시한 값에만** 적용한다 — 매핑 크기가 곧 네이티브 버퍼 크기라 3바이트짜리도
 > 정상인데, 생략한 `size`까지 4의 배수를 요구하면 그런 버퍼를 아예 못 읽는다.
+
+> **쓰기 매핑은 `unmap()`에서 바이트를 싣고 간다.** 매핑이 JS 사본이라 그렇다 — `unmap()`이
+> `unmapBuffer`에 매핑 구간 전체(`offset` + `data`)를 실어 보내고, 엔진이 매핑이 아직 걸린 채로
+> 백엔드의 `writeMappedBuffer`로 쓴 다음 매핑을 푼다. `writeBuffer`를 거치지 않는 이유는
+> `MAP_WRITE` 버퍼에 `COPY_DST`가 없어서다 (명세상 둘은 같이 못 붙는다 — Dawn은 그런 큐 쓰기를
+> 거부한다). Metal은 큐 순서를 타는 스테이징 blit으로, Dawn은 진짜 `MapAsync(Write)`로 매핑해
+> 두고 매핑 구간에 memcpy한 뒤 `Unmap`한다.
 
 > **매핑 중인 버퍼는 큐 작업에 쓸 수 없다.** `mapAsync`는 명세대로 버퍼를 "unavailable"로
 > 만들고, `unmap()`을 부를 때까지 쓰기·복사·resolve·드로우 바인딩을 전부 거부한다.

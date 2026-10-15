@@ -143,4 +143,38 @@ final class WGPUCommandDecodeTests: XCTestCase {
         XCTAssertEqual(command.commands.count, 1)
         XCTAssertEqual(try WGPUCommand(from: command.commands[0]).opName, "draw")
     }
+
+    /// A read mapping's unmap carries only the handle — no data means "nothing to write back".
+    func test_unmapBufferWithoutDataHasNoWriteBack() throws {
+        let decoded = try WGPUCommand(from: WGPUValueReader(["op": "unmapBuffer", "buffer": 4]))
+        guard case .unmapBuffer(let command) = decoded else {
+            return XCTFail("not the unmapBuffer case: \(decoded.opName)")
+        }
+        XCTAssertEqual(command.buffer, WGPUHandle(4))
+        XCTAssertNil(command.offset)
+        XCTAssertNil(command.data)
+    }
+
+    /// A write mapping's unmap carries its bytes back (`mapAsync(GPUMapMode.WRITE)` — the JS mapping is a
+    /// copy). `data` arrives as an `ArrayBuffer` (`Data`) from the shim; base64 and byte arrays decode too.
+    func test_unmapBufferDecodesAWriteMappingsOffsetAndData() throws {
+        for data in [Data([1, 2, 3, 4]), "AQIDBA==", [1, 2, 3, 4]] as [Any] {
+            let decoded = try WGPUCommand(from: WGPUValueReader([
+                "op": "unmapBuffer", "buffer": 4, "offset": 16, "data": data,
+            ]))
+            guard case .unmapBuffer(let command) = decoded else {
+                return XCTFail("not the unmapBuffer case: \(decoded.opName)")
+            }
+            XCTAssertEqual(command.offset, 16)
+            XCTAssertEqual(command.data, Data([1, 2, 3, 4]), "\(type(of: data))")
+        }
+    }
+
+    func test_unmapBufferRejectsUndecodableData() {
+        XCTAssertThrowsError(try WGPUCommand(from: WGPUValueReader([
+            "op": "unmapBuffer", "buffer": 4, "data": "not base64!",
+        ]))) { error in
+            XCTAssertEqual((error as? WGPUError)?.kind, .validation)
+        }
+    }
 }

@@ -368,6 +368,7 @@ enum PNGWriter {
 /// The `GPUBufferUsage` / `GPUTextureUsage` constants JS uses (reproduced here for tests).
 enum TestUsage {
     static let mapRead = 0x0001
+    static let mapWrite = 0x0002
     static let copySrc = 0x0004
     static let copyDst = 0x0008
     static let index = 0x0010

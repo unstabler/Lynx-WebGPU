@@ -317,6 +317,13 @@ declare class GPUBuffer extends GPUObjectBase {
     /** Whether `mapAsync` is still waiting for a result (the spec's `"pending"` state). */
     _mapPending: boolean;
     /**
+     * The current mapping's `GPUMapMode` — `WRITE` makes `unmap()` send the mapping back to native.
+     * (`mappedAtCreation` is a write mapping too, but its bytes travel with the creation command instead.)
+     */
+    _mapMode: number;
+    /** The buffer offset the current mapping starts at — `getMappedRange` offsets are buffer offsets. */
+    _mapOffset: number;
+    /**
      * The ranges handed out by `getMappedRange()` — used for the overlap check and `unmap()`'s write-back.
      * @type {{offset: number, length: number, view: ArrayBuffer | null}[]}
      */
@@ -352,10 +359,12 @@ declare class GPUBuffer extends GPUObjectBase {
      * Requesting the whole range first returns the mapping itself with no copy — saving one copy on the
      * common path of filling a large vertex buffer with `mappedAtCreation`.
      *
-     * Spec rules: `offset` must be a multiple of 8, `size` a multiple of 4, and ranges **may not overlap**.
+     * Spec rules: `offset` is a **buffer** offset (not one relative to the mapping) and must be a multiple
+     * of 8, `size` a multiple of 4, the range must lie inside the mapped range, and ranges **may not overlap**.
      *
-     * @param {number} [offset] the byte offset (a multiple of 8)
-     * @param {number} [size] the number of bytes (a multiple of 4). Omitted, it runs to the end
+     * @param {number} [offset] the byte offset in the buffer (a multiple of 8)
+     * @param {number} [size] the number of bytes (a multiple of 4). Omitted, it runs to the end of the buffer
+     *   (spec) — so after a partial `mapAsync` it must be given unless the mapping reaches the end
      * @returns {ArrayBuffer}
      */
     getMappedRange(offset?: number, size?: number): ArrayBuffer;
@@ -366,25 +375,39 @@ declare class GPUBuffer extends GPUObjectBase {
      *
      * For `mappedAtCreation`, this is where the actual creation command (initial data included) is recorded;
      * for something mapped by `mapAsync` it tells native "queue operations may use it now" —
-     * a buffer being mapped is rejected by queue operations per the spec, so **this must be called once you have read.**
+     * a buffer being mapped is rejected by queue operations per the spec, so **this must be called once you are done.**
+     *
+     * A `GPUMapMode.WRITE` mapping **carries its bytes back** here (`unmapBuffer`'s `offset` + `data`) —
+     * the mapping is a JS copy, so without that everything written into it would vanish silently.
      *
      * @returns {void}
      */
     unmap(): void;
     /**
-     * Reads the buffer's contents. It is WebGPU's `mapAsync` + `getMappedRange` merged into one.
+     * Maps the buffer — WebGPU's `mapAsync`, and (an extension) it also resolves with the mapping itself,
+     * the same `ArrayBuffer` `getMappedRange()` hands over whole.
      *
-     * While reading, this buffer becomes **"unavailable"** per the spec and is rejected by queue operations
+     * - `GPUMapMode.READ` (also when `mode` is omitted — a shorthand of this implementation): reads the
+     *   contents once prior GPU work finishes.
+     * - `GPUMapMode.WRITE`: needs `GPUBufferUsage.MAP_WRITE`. The mapping starts as the buffer's current
+     *   contents (spec); what you write into it is **sent back at `unmap()`**.
+     *
+     * While mapped, this buffer becomes **"unavailable"** per the spec and is rejected by queue operations
      * (writes, copies, resolves, draw bindings). Otherwise the next frame's write would overlap the same
      * memory while the readback waits for GPU completion, and which frame the received value belongs to would not be guaranteed.
-     * **Call `unmap()` once you are done reading.**
+     * **Call `unmap()` once you are done.**
      *
-     * @param {number} [_mode] for spec compatibility — this implementation does not look at it
-     * @param {number} [offset] the byte offset
-     * @param {number} [size] the number of bytes to read. Omitted, it runs to the end
+     * Rejects with `OperationError` for a mode that is not exactly one of `READ`/`WRITE`, `WRITE` without
+     * `MAP_WRITE` usage, `READ` on a `MAP_WRITE` buffer (the spec forbids `MAP_READ | MAP_WRITE`, so such a
+     * buffer can only be mapped for writing), and — for `WRITE` — an offset that is not a multiple of 8, a
+     * size that is not a multiple of 4, or a range past the end of the buffer.
+     *
+     * @param {number} [mode] `GPUMapMode.READ` or `GPUMapMode.WRITE`. Omitted, `READ`
+     * @param {number} [offset] the byte offset (a multiple of 8 for `WRITE`)
+     * @param {number} [size] the number of bytes (a multiple of 4 for `WRITE`). Omitted, it runs to the end
      * @returns {Promise<ArrayBuffer>}
      */
-    mapAsync(_mode?: number, offset?: number, size?: number): Promise<ArrayBuffer>;
+    mapAsync(mode?: number, offset?: number, size?: number): Promise<ArrayBuffer>;
 }
 declare class GPUTexture extends GPUObjectBase {
     _frameScoped: boolean;

@@ -51,7 +51,8 @@ test('mapAsync returns the ArrayBuffer native gave, undecoded', async () => {
     const backing = bytes.buffer.slice(0);
     installNativeMock({ readBufferResult: { ok: true, data: backing, byteLength: length } });
     const device = await makeDevice();
-    const buffer = device.createBuffer({ size: Math.max(length, 4), usage: GPUBufferUsage.MAP_READ });
+    // Native maps the whole buffer, so the mapping is exactly the buffer size.
+    const buffer = device.createBuffer({ size: length, usage: GPUBufferUsage.MAP_READ });
 
     const mapped = await buffer.mapAsync(GPUMapMode.READ);
     assert.ok(mapped instanceof ArrayBuffer, `length=${length}: not an ArrayBuffer`);

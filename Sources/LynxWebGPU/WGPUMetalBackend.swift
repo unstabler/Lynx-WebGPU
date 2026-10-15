@@ -248,6 +248,20 @@ public final class WGPUMetalBackend: WGPUBackend {
     /// The dedicated queue waiting on GPU completion — it never blocks the JS thread.
     private static let readbackQueue = DispatchQueue(label: "org.lynxwebgpu.readback")
 
+    public func mapBufferForWrite(
+        _ buffer: WGPUBufferObject, offset: Int, length: Int,
+        deliver: @escaping (Result<Data, WGPUError>) -> Void
+    ) {
+        // Mapping is wire state only here (shared memory) — a write mapping's initial view is the
+        // current contents after prior GPU work, which is exactly what a read delivers.
+        readBuffer(buffer, offset: offset, length: length, deliver: deliver)
+    }
+
+    public func writeMappedBuffer(_ buffer: WGPUBufferObject, offset: Int, data: Data) throws {
+        // Metal has no usage flags, so the queue-ordered staging blit serves a MAP_WRITE buffer as is.
+        try writeBuffer(buffer, offset: offset, data: data)
+    }
+
     public func makeTexture(_ descriptor: WGPUTextureDescriptor) throws -> WGPUTextureObject {
         try WGPUTextureObject(device: device, descriptor: descriptor)
     }
@@ -301,7 +315,8 @@ public final class WGPUMetalBackend: WGPUBackend {
     }
 
     public func unmapBuffer(_ buffer: WGPUBufferObject) {
-        // Mapping on the Metal path is wire state only (shared memory is read directly) — there is nothing to release.
+        // Mapping on the Metal path is wire state only (shared memory is read directly, and a write
+        // mapping's bytes already went through `writeMappedBuffer`) — there is nothing to release.
     }
 
     public func compilationMessages(of module: WGPUShaderModuleObject) -> [WGPUCompilationMessage] {

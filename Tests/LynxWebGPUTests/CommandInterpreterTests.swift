@@ -472,6 +472,80 @@ final class CommandInterpreterTests: XCTestCase {
         XCTAssertThrowsError(try harness.readBufferSync(handle: 1), "a second mapping is rejected")
     }
 
+    /// `mapAsync(GPUMapMode.WRITE)` → write into the mapping → `unmap()` must land in the buffer.
+    /// The JS mapping is a copy, so the bytes come back in `unmapBuffer`'s `data` — before, they were
+    /// silently dropped. Read back through the spec's path (copy into a `MAP_READ` staging buffer).
+    func test_aWriteMappingIsWrittenBackAtUnmap() throws {
+        harness.executeExpectingSuccess([
+            ["op": "createBuffer", "id": 1, "size": 16, "usage": TestUsage.mapWrite | TestUsage.copySrc,
+             "data": [Float]([9, 9, 9, 9]).base64],
+            ["op": "createBuffer", "id": 2, "size": 16, "usage": TestUsage.copyDst | TestUsage.mapRead],
+        ])
+        // The mapping starts as the current contents (spec).
+        XCTAssertEqual(try harness.readBufferSync(handle: 1, as: Float.self), [9, 9, 9, 9])
+
+        // Still unavailable to queue work until unmap.
+        let copy = harness.execute([
+            ["op": "copyBufferToBuffer", "source": 1, "destination": 2, "size": 16],
+        ])
+        XCTAssertTrue(
+            ((errors(copy).first?["message"] as? String) ?? "").contains("is mapped"),
+            harness.describeErrors(copy)
+        )
+
+        harness.executeExpectingSuccess([
+            ["op": "unmapBuffer", "buffer": 1, "offset": 0, "data": [Float]([1, 2, 3, 4]).base64],
+            ["op": "copyBufferToBuffer", "source": 1, "destination": 2, "size": 16],
+        ])
+        XCTAssertEqual(try harness.readBufferSync(handle: 2, as: Float.self), [1, 2, 3, 4])
+    }
+
+    /// A partial write mapping is addressed in buffer offsets: only its range is written back, the rest survives.
+    func test_aPartialWriteMappingWritesBackOnlyItsRange() throws {
+        harness.executeExpectingSuccess([
+            ["op": "createBuffer", "id": 1, "size": 16, "usage": TestUsage.mapWrite | TestUsage.copySrc,
+             "data": [Float]([9, 9, 9, 9]).base64],
+            ["op": "createBuffer", "id": 2, "size": 16, "usage": TestUsage.copyDst | TestUsage.mapRead],
+        ])
+        XCTAssertEqual(try harness.readBufferSync(handle: 1, as: Float.self, offset: 8, size: 8), [9, 9])
+
+        // Outside the mapping — rejected, and the buffer is unmapped anyway (unmap cannot fail in the spec).
+        let outside = harness.execute([
+            ["op": "unmapBuffer", "buffer": 1, "offset": 0, "data": [Float]([5, 5]).base64],
+        ])
+        XCTAssertTrue(
+            ((errors(outside).first?["message"] as? String) ?? "").contains("outside the mapped range"),
+            harness.describeErrors(outside)
+        )
+
+        _ = try harness.readBufferSync(handle: 1, offset: 8, size: 8)
+        harness.executeExpectingSuccess([
+            ["op": "unmapBuffer", "buffer": 1, "offset": 8, "data": [Float]([3, 4]).base64],
+            ["op": "copyBufferToBuffer", "source": 1, "destination": 2, "size": 16],
+        ])
+        XCTAssertEqual(try harness.readBufferSync(handle: 2, as: Float.self), [9, 9, 3, 4])
+    }
+
+    /// Data on an unmap needs a write mapping — otherwise `unmapBuffer` would be a back door around
+    /// `writeBuffer`'s COPY_DST rule.
+    func test_unmapDataWithoutAWriteMappingIsRejected() throws {
+        harness.executeExpectingSuccess([
+            ["op": "createBuffer", "id": 1, "size": 16, "usage": TestUsage.copyDst | TestUsage.mapRead,
+             "data": [Float]([7, 7, 7, 7]).base64],
+        ])
+        _ = try harness.readBufferSync(handle: 1)   // a read mapping
+
+        let result = harness.execute([
+            ["op": "unmapBuffer", "buffer": 1, "data": [Float]([1, 2, 3, 4]).base64],
+        ])
+        XCTAssertTrue(
+            ((errors(result).first?["message"] as? String) ?? "").contains("mapped for writing"),
+            harness.describeErrors(result)
+        )
+        XCTAssertEqual(try harness.readBufferSync(handle: 1, as: Float.self), [7, 7, 7, 7],
+                       "the data was not written, and the buffer was unmapped (mappable again)")
+    }
+
     /// The spec allows `MAP_READ` only with `COPY_DST` and `MAP_WRITE` only with `COPY_SRC`.
     /// Metal covers everything with `.storageModeShared`, but unchecked it breaks only in a browser.
     func test_mappingUsageCombinesOnlyWithCopies() {
