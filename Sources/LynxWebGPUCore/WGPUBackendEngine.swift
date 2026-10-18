@@ -554,7 +554,9 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
                 raw: raw,
                 format: command.descriptor.format,
                 size: command.descriptor.size,
-                sampleCount: command.descriptor.sampleCount
+                sampleCount: command.descriptor.sampleCount,
+                mipLevelCount: command.descriptor.mipLevelCount,
+                dimension: command.descriptor.dimension
             ),
             at: command.id
         )
@@ -694,18 +696,56 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             )
         }
 
+        // The source checks run **regardless of `specValidation`**: the crop below is a `memcpy` out of
+        // engine-owned memory (the decoded pixels), which no native validator ever sees. A negative
+        // origin used to pass the bound check and read before the pixel buffer (an out-of-bounds read
+        // uploaded into the texture). JS can send any integer, so signs are checked first and bounds
+        // are compared by subtraction — nothing here can overflow.
         let sourceOrigin = command.source.origin
+        guard sourceOrigin.x >= 0, sourceOrigin.y >= 0 else {
+            throw WGPUError.validation(
+                "the source origin of copyExternalImageToTexture must not be negative "
+                + "(\(sourceOrigin.x), \(sourceOrigin.y))",
+                path: command.source.fieldPath("origin")
+            )
+        }
+        if let copySize = command.copySize {
+            guard copySize.width >= 0, copySize.height >= 0, copySize.depthOrArrayLayers >= 0 else {
+                throw WGPUError.validation(
+                    "copyExternalImageToTexture copySize must not be negative "
+                    + "(\(copySize.width)x\(copySize.height)x\(copySize.depthOrArrayLayers))",
+                    path: command.fieldPath("copySize")
+                )
+            }
+            guard copySize.depthOrArrayLayers <= 1 else {
+                throw WGPUError.validation(
+                    "an image has a single layer — copySize.depthOrArrayLayers must be at most 1 "
+                    + "(got \(copySize.depthOrArrayLayers))",
+                    path: command.fieldPath("copySize")
+                )
+            }
+        }
+        guard sourceOrigin.x <= bitmap.width, sourceOrigin.y <= bitmap.height else {
+            throw WGPUError.validation(
+                "the copy region exceeds the image — the origin (\(sourceOrigin.x), \(sourceOrigin.y)) "
+                + "lies outside \(bitmap.width)x\(bitmap.height)",
+                path: command.source.fieldPath("origin")
+            )
+        }
         // An omitted copy size means **the whole remainder of the image** — that needs the image size, so it is filled here.
         let size = command.copySize
             ?? WGPUExtent3D(width: bitmap.width - sourceOrigin.x, height: bitmap.height - sourceOrigin.y)
-        guard size.width > 0, size.height > 0 else { return }   // no-op
-        guard sourceOrigin.x + size.width <= bitmap.width,
-              sourceOrigin.y + size.height <= bitmap.height else {
+        guard size.width <= bitmap.width - sourceOrigin.x,
+              size.height <= bitmap.height - sourceOrigin.y else {
             throw WGPUError.validation(
                 "the copy region exceeds the image — (\(sourceOrigin.x), \(sourceOrigin.y)) + "
                 + "\(size.width)x\(size.height) > \(bitmap.width)x\(bitmap.height)"
             )
         }
+        if specValidation {
+            try validateExternalImageDestination(command.destination, texture: target, size: size)
+        }
+        guard size.width > 0, size.height > 0, size.depthOrArrayLayers > 0 else { return }   // no-op
 
         // Spec `GPUCopyExternalImageSourceInfo.flipY` — flips top to bottom **at copy time**.
         // (`createImageBitmap`'s flipY happens at decode time and is separate. Web libraries use this
@@ -736,6 +776,56 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             mipLevel: command.destination.mipLevel,
             bytesPerRow: rowBytes, rowsPerImage: size.height
         )
+    }
+
+    /// The destination end of `copyExternalImageToTexture` (the spec's "validating
+    /// GPUTexelCopyTextureInfo" and "validating texture copy range", for this op only).
+    ///
+    /// A negative origin or an out-of-range mip level would cross into unsigned Metal blit arguments
+    /// and die on an assertion — or write outside the texture. Backends that validate natively
+    /// reject these themselves, so this runs only under `specValidation`. `size` is already known
+    /// to be non-negative and at most one layer deep.
+    private func validateExternalImageDestination(
+        _ destination: WGPUTexelCopyTextureInfo,
+        texture: WGPUEngineTexture<B>,
+        size: WGPUExtent3D
+    ) throws {
+        guard texture.sampleCount == 1 else {
+            throw WGPUError.validation(
+                "copyExternalImageToTexture cannot target a multisampled texture (sampleCount \(texture.sampleCount))",
+                path: destination.fieldPath("texture")
+            )
+        }
+        let mipLevel = destination.mipLevel
+        guard mipLevel >= 0, mipLevel < texture.mipLevelCount else {
+            throw WGPUError.validation(
+                "mipLevel must be between 0 and \(texture.mipLevelCount - 1) (got \(mipLevel))",
+                path: destination.fieldPath("mipLevel")
+            )
+        }
+        let origin = destination.origin
+        guard origin.x >= 0, origin.y >= 0, origin.z >= 0 else {
+            throw WGPUError.validation(
+                "the destination origin must not be negative (\(origin.x), \(origin.y), \(origin.z))",
+                path: destination.fieldPath("origin")
+            )
+        }
+        let levelWidth = max(texture.size.width >> mipLevel, 1)
+        let levelHeight = max(texture.size.height >> mipLevel, 1)
+        let levelDepth = texture.dimension == .threeD
+            ? max(texture.size.depthOrArrayLayers >> mipLevel, 1)
+            : texture.size.depthOrArrayLayers
+        // Compared by subtraction: every operand is non-negative here, so nothing can overflow.
+        guard size.width <= levelWidth - origin.x,
+              size.height <= levelHeight - origin.y,
+              size.depthOrArrayLayers <= levelDepth - origin.z else {
+            throw WGPUError.validation(
+                "the copy region exceeds the destination texture — (\(origin.x), \(origin.y), \(origin.z)) + "
+                + "\(size.width)x\(size.height)x\(size.depthOrArrayLayers) > "
+                + "\(levelWidth)x\(levelHeight)x\(levelDepth) @ level \(mipLevel)",
+                path: destination.fieldPath("origin")
+            )
+        }
     }
 
     /// Block alignment for compressed texture copies (the spec's "validating texel copy range").
