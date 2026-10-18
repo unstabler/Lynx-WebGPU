@@ -65,6 +65,146 @@ final class ShaderSafetyTests: XCTestCase {
         )
     }
 
+    /// A runtime-sized array reached **through a `let` pointer** is clamped by the same table.
+    ///
+    /// Valid WGSL, and the index is a bundle-chosen value: left on the plain pointer path,
+    /// `(*p)[100000000u] = 7u` would write 400 MB past the binding.
+    func test_aRuntimeArrayReachedThroughALetPointerIsClamped() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var<storage, read_write> data: array<u32>;
+        @group(0) @binding(1) var<uniform> idx: u32;
+        @compute @workgroup_size(1) fn cs() {
+            let p = &data;
+            let alsoP = p;
+            (*p)[100000000u] = 7u;
+            (*alsoP)[idx] += (*p)[idx];
+        }
+        """, entryPoints: ["cs"])
+        let count = "(wgpu_buffer_sizes[0] / uint(sizeof(uint)))"
+        XCTAssertTrue(msl.contains("wgpu_store_n((*p), 100000000u, \(count), 7u)"), "a write through a pointer is unclamped\n\(msl)")
+        XCTAssertTrue(msl.contains("wgpu_store_n((*alsoP), idx, \(count),"), "a pointer copied from a pointer is unclamped\n\(msl)")
+        XCTAssertTrue(msl.contains("wgpu_at_n((*p), idx, \(count))"), "a read through a pointer is unclamped\n\(msl)")
+        XCTAssertFalse(msl.contains("wgpu_at((*"), msl)
+        XCTAssertFalse(msl.contains("wgpu_store((*"), msl)
+    }
+
+    /// A storage struct spelled **through an alias** still finds its runtime-sized member — and the
+    /// pipeline still binds the size table (the emitter and the pipeline must agree).
+    func test_aRuntimeArrayMemberOfAnAliasedStructIsClamped() throws {
+        let source = """
+        struct Buf { head: u32, items: array<u32> }
+        alias Inner = Buf;
+        alias B = Inner;
+        @group(0) @binding(0) var<storage, read_write> b: B;
+        @group(0) @binding(1) var<uniform> idx: u32;
+        @compute @workgroup_size(1) fn cs() {
+            b.items[idx] = b.items[idx + 1u] + b.head;
+        }
+        """
+        let msl = try translate(source, entryPoints: ["cs"])
+        // items starts at offset 4; the subtraction saturates at 0.
+        let count = "((wgpu_buffer_sizes[0] > 4u ? wgpu_buffer_sizes[0] - 4u : 0u) / uint(sizeof(uint)))"
+        XCTAssertTrue(msl.contains("wgpu_store_n(b.items, idx, \(count),"), "a write through an alias is unclamped\n\(msl)")
+        XCTAssertTrue(msl.contains("wgpu_at_n(b.items, idx + 1u, \(count))"), "a read through an alias is unclamped\n\(msl)")
+        XCTAssertTrue(
+            try WGSLShaderModule(source: source).usesArrayLength(entryPoints: ["cs"]),
+            "the clamp reads the size table, so the pipeline must bind it"
+        )
+    }
+
+    /// A pointer to the **whole struct** (`(*q).items[i]`) resolves to the same member bound.
+    func test_aRuntimeArrayMemberReachedThroughAStructPointerIsClamped() throws {
+        let msl = try translate("""
+        struct Buf { head: u32, items: array<u32> }
+        @group(0) @binding(0) var<storage, read_write> buf: Buf;
+        @group(0) @binding(1) var<uniform> idx: u32;
+        @compute @workgroup_size(1) fn cs() {
+            let q = &buf;
+            (*q).items[idx] = (*q).head;
+            buf.head = arrayLength(&(*q).items);
+        }
+        """, entryPoints: ["cs"])
+        let count = "((wgpu_buffer_sizes[0] > 4u ? wgpu_buffer_sizes[0] - 4u : 0u) / uint(sizeof(uint)))"
+        XCTAssertTrue(msl.contains("wgpu_store_n((*q).items, idx, \(count),"), "a write through a struct pointer is unclamped\n\(msl)")
+        XCTAssertTrue(msl.contains("buf.head = \(count)"), "arrayLength() through a pointer\n\(msl)")
+
+        // A pointer **straight to the runtime member** carries the member's offset as well.
+        let direct = try translate("""
+        struct Buf { head: u32, items: array<u32> }
+        @group(0) @binding(0) var<storage, read_write> buf: Buf;
+        @group(0) @binding(1) var<uniform> idx: u32;
+        @compute @workgroup_size(1) fn cs() {
+            let p = &buf.items;
+            (*p)[idx] = 7u;
+        }
+        """, entryPoints: ["cs"])
+        XCTAssertTrue(direct.contains("wgpu_store_n((*p), idx, \(count), 7u)"), "a write through a member pointer is unclamped\n\(direct)")
+    }
+
+    /// A pointer the emitter **cannot** bound — a `ptr<storage>` parameter points wherever the caller
+    /// chose — must not fall back to an unchecked access. The emitter refuses it at translate time with
+    /// a WGSL-level message; behind that, the prelude deletes the bare pointer overloads, so a shape
+    /// that slipped past the emitter would still fail to compile rather than index unchecked.
+    func test_aRuntimeArrayIndexThroughAPointerParameterIsRefused() throws {
+        let shapes = [
+            "(*q).items[i] = 1u;",
+            "let r = q; (*r).items[i] = 1u;",
+            "let r = &(*q).items; let v = (*r)[i];",
+        ]
+        for body in shapes {
+            let module = try WGSLShaderModule(source: """
+            struct Buf { head: u32, items: array<u32> }
+            alias B = Buf;
+            @group(0) @binding(0) var<storage, read_write> buf: Buf;
+            @group(0) @binding(1) var<uniform> idx: u32;
+            fn poke(q: ptr<storage, B, read_write>, i: u32) { \(body) }
+            @compute @workgroup_size(1) fn cs() { poke(&buf, idx); }
+            """)
+            let groups = module.autoBindGroupLayouts(entryPoints: ["cs"])
+            XCTAssertThrowsError(
+                try module.translateToMSL(entryPoints: ["cs"], bindings: try WGSLBindingAssigner.assign(groups: groups)),
+                body
+            ) { error in
+                XCTAssertEqual((error as? WGPUError)?.kind, .unsupported, body)
+                XCTAssertTrue(
+                    ((error as? WGPUError)?.message ?? "").contains("through a pointer parameter"), "\(body): \(error)"
+                )
+            }
+        }
+        // The fixed part behind the same parameter is not a runtime-sized array and stays allowed.
+        _ = try translate("""
+        struct Buf { head: u32, items: array<u32> }
+        @group(0) @binding(0) var<storage, read_write> buf: Buf;
+        fn bump(q: ptr<storage, Buf, read_write>) { (*q).head += 1u; }
+        @compute @workgroup_size(1) fn cs() { bump(&buf); }
+        """, entryPoints: ["cs"])
+        XCTAssertFalse(MSLPrelude.source.contains("p[uint(i)]"), "an unbounded pointer overload is back in the prelude")
+    }
+
+    /// A binding too small to hold one element gives a count of 0 — the store helper must then
+    /// **drop** the write rather than fall back to slot 0, which may lie past the binding's end.
+    func test_aRuntimeArrayStoreWithNoElementsIsDropped() {
+        XCTAssertTrue(
+            MSLPrelude.source.contains("wgpu_store_n(device T* p, I i, uint count, V value) { if (count != 0u) {"),
+            "a write with a count of 0 is no longer dropped"
+        )
+    }
+
+    /// A local that **shadows** a runtime-array global is not that global — it keeps the fixed-size clamp.
+    func test_aLocalShadowingARuntimeArrayGlobalIsNotBoundByItsTable() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var<storage, read_write> data: array<u32>;
+        @group(0) @binding(1) var<uniform> idx: u32;
+        @compute @workgroup_size(1) fn cs() {
+            data[0] = 1u;
+            var data = array<u32, 4>(0u, 0u, 0u, 0u);
+            data[idx] = 2u;
+        }
+        """, entryPoints: ["cs"])
+        XCTAssertTrue(msl.contains("wgpu_store_n(data, 0, "), msl)
+        XCTAssertTrue(msl.contains("wgpu_store(wgpu_shadow_data, idx, 2u)"), msl)
+    }
+
     /// Vector components cannot bind to a reference (an MSL limit), so reads go by value and writes through a store helper.
     func test_vectorComponentIndexingIsClampedForBothReadAndWrite() throws {
         let msl = try translate("""

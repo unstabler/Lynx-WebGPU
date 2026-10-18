@@ -240,8 +240,12 @@ fn count_and_sample(uv: vec2f) -> vec4f {
 
 **`arrayLength()`** — Metal 셰이더는 버퍼 크기를 알 수 없다. 그래서 바인딩된 버퍼의 바이트 수를 담은
 작은 표를 예약 인덱스(`WGSLMetalLimits.bufferSizesIndex` = 22)에 꽂아 주고, `arrayLength(&g)`를
-`(크기표[i] - 멤버오프셋) / sizeof(원소)`로 번역한다 (Dawn과 같은 방식). 길이는 **바인딩된 크기**를
+`(크기표[i] - 멤버오프셋) / sizeof(원소)`로 번역한다 (Dawn과 같은 방식). 뺄셈은 **0에서 멈춘다** —
+바인딩이 멤버 오프셋보다 작으면 uint32 뺄셈이 ~40억으로 감겨 그 길이에 기댄 범위 자르기가 통째로
+무력해지기 때문이다. 길이가 0인 배열(원소 하나도 못 담는 바인딩)에 대한 인덱스 쓰기는 버려진다
+(명세가 허용하는 범위 밖 쓰기 처리). 길이는 **바인딩된 크기**를
 따르므로 `{ buffer, offset, size }`로 일부만 묶으면 그만큼만 센다. 쓰지 않는 셰이더에는 표를 넘기지 않는다.
+`let p = &particles.items; arrayLength(p)`처럼 `let` 포인터를 넘겨도 된다.
 
 **`texture_external`** — 샘플링 가능한 2D 텍스처로 내려간다. 바인드 그룹에는 보통
 `GPUTextureView`를 묶으면 된다 (한 면짜리 비디오 프레임과 같은 모양).
@@ -271,17 +275,24 @@ WGSL에는 값이 정해져 있는데 MSL(C++)에서는 **정의되지 않은 �
 검증은 `ShaderSafetyTests`(방출 + 실제 Metal 컴파일)와 `ShaderSafetyRenderTests`(**GPU에서 값으로**)가 한다.
 
 **포인터를 거친 인덱싱은 어떤가** — 파서는 `ptr<…>`를 받는다(`WGSLParser`의 타입 파싱).
-그래도 구멍이 되지 않는 이유는 둘로 갈린다:
+경우는 셋으로 갈린다:
 
 - **고정 크기 배열**(`ptr<function, array<f32, 4>>` 등)은 **잘린다.** 자르기가 C++ 템플릿의
   타입 추론에 얹혀 있어서, `(*p)[i]`도 `wgpu_store((*p), i, …)`로 나가며 템플릿이 배열
   크기를 그대로 안다.
-- **런타임 크기 배열**(`ptr<storage, array<f32>>`)은 애초에 **거부된다** — 방출기가
-  "WGSL: a runtime-sized array (array<T>) can only be used in a storage buffer binding"으로 막는다. 상한을 뽑을 자리가
-  없는 경우가 정확히 이것인데, 그 형태가 함수 매개변수로 들어오는 길이 닫혀 있다.
+- **런타임 크기 배열을 가리키는 `let` 포인터**(`let p = &data; (*p)[i]`, `let q = &buf; (*q).items[i]`)는
+  방출기가 포인터를 **전역 자리까지 되짚어** 같은 크기 표로 자른다 (`wgpu_at_n` · `wgpu_store_n`).
+  `alias B = Buf;`처럼 별칭으로 쓴 저장 타입도 별칭을 풀어 같은 멤버를 찾는다.
+- **상한을 뽑을 수 없는 모양** — `ptr<storage, Buf>` 매개변수처럼 호출자가 무엇을 가리킬지 정하는
+  경우 — 은 방출기가 **번역 시점에 거부한다** ("WGSL: indexing a runtime-sized array through a pointer
+  parameter is not supported"). 매개변수의 고정 크기 부분(`(*q).head`)은 그대로 쓸 수 있다.
+  그 밖에 방출기가 놓친 모양도 **컴파일이 실패한다** — 프렐류드가 크기 없는 포인터용 `wgpu_at` ·
+  `wgpu_store` 오버로드를 `= delete`로 막아 두었기 때문이다 (구조체 말미 `T items[1]`도 포인터로
+  붕괴해 같은 곳에 걸린다). 조용히 범위 밖을 건드리는 대신 파이프라인 생성이 실패한다. `ptr<storage, array<f32>>` 매개변수는
+  그 전에 방출기가 "WGSL: a runtime-sized array (array<T>) can only be used in a storage buffer binding"으로 거부한다.
 
-즉 막는 것은 파서가 아니라 **방출기의 런타임 크기 배열 규칙**이다. 그 규칙을 푸는 변경을
-한다면 상한 전달 수단을 함께 만들어야 한다.
+즉 런타임 크기 배열의 상한은 **방출기가 크기 표 자리를 찾은 경우에만** 붙고, 못 찾은 경우는
+프렐류드가 막는다. 새 접근 모양을 지원하려면 `MSLEmitter.storagePlace(of:)`를 넓히면 된다.
 
 ## 4. 지원하지 않는 것
 

@@ -1133,7 +1133,10 @@ final class WGSLTranspilerTests: XCTestCase {
         let msl = try translate(source, entryPoints: ["cs"])
 
         // items is 16-byte aligned, so it starts at offset 16 (count 4B + 12B padding).
-        XCTAssertTrue(msl.contains("((wgpu_buffer_sizes[0] - 16u) / uint(sizeof(float4)))"), msl)
+        // The subtraction saturates — a binding smaller than the offset gives 0, not a wrapped ~4e9.
+        XCTAssertTrue(
+            msl.contains("((wgpu_buffer_sizes[0] > 16u ? wgpu_buffer_sizes[0] - 16u : 0u) / uint(sizeof(float4)))"), msl
+        )
     }
 
     func test_withoutArrayLengthTheSizeTableIsNotPassed() throws {
