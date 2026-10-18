@@ -32,7 +32,7 @@ JS 클라이언트(shim) 테스트 — 의존성 없이 node 내장 러너로 �
 `NativeModules.WebGPU`를 목으로 바꿔 커맨드 페이로드·왕복 횟수를 단언한다:
 
 ```zsh
-cd JS && npm test            # NODE_OPTIONS=--expose-gc node --test 'tests/*.test.mjs' — 파일 22개 · 케이스 133개
+cd JS && npm test            # NODE_OPTIONS=--expose-gc node --test 'tests/*.test.mjs' — 파일 25개 · 케이스 150개
 cd JS && npm run typecheck   # JSDoc 기준 타입 검사
 ```
 
@@ -74,7 +74,7 @@ arch -arm64 xcodebuild -workspace LynxWebGPUDemo.xcworkspace -scheme WebGPUDemo 
 
 ```swift
 let outcomes = WebGPUConformance.run(on: myRuntime)
-print(WebGPUConformance.summary(outcomes))     // "conformance 29/29 passed"
+print(WebGPUConformance.summary(outcomes))     // "conformance 31/31 passed"
 ```
 
 검사는 **커맨드 스트림 · `readCanvasPixels` · `readBuffer` · `adapterInfo`만** 쓴다.
@@ -87,7 +87,7 @@ print(WebGPUConformance.summary(outcomes))     // "conformance 29/29 passed"
 | **계약** — 커맨드 스트림 수준 | `CommandInterpreterTests` `RenderPipelineTests` `ErrorScopeTests` `StencilTests` `QuerySetTests` `RenderBundleTests` `IndirectDrawTests` `CompressedTextureTests` `ExternalImageTests` `OffscreenReadbackTests` | 그대로 옮길 수 있다. 스위트가 그중 **핵심을 추려** 라이브러리로 옮겨 둔 것이다 |
 | **Metal 내부** | `MetalMappingTests` `StagingPoolTests` `SurfaceInFlightTests` `RenderHarnessTests` | 옮겨지지 않는다 — 인자 테이블 배정·스테이징 풀·드로어블 회계는 이 백엔드에만 있다 |
 
-검사는 렌더 기초·동치성·오류 모델(19개 — `Checks.swift`)에 더해 **경계 계약**(11개 —
+검사는 렌더 기초·동치성·오류 모델(20개 — `Checks.swift`)에 더해 **경계 계약**(11개 —
 `LifecycleChecks.swift`)을 본다 — present:false의 프레임 스코프 핸들 생존(Three.js 회귀)·
 present 후 만료·빈 present 배치의 프레임 닫기, `readBuffer`(매핑 재진입 거부 포함)·
 **`MAP_WRITE` 쓰기 매핑**(현재 내용으로 시작·`unmapBuffer`의 `data`가 버퍼 오프셋에 써지는지 —
@@ -103,7 +103,7 @@ Dawn은 `COPY_DST` 없는 버퍼라 큐 쓰기로는 통과할 수 없다)·
 
 ### 스위트를 거는 자리 셋 — 백엔드 × 플랫폼
 
-같은 29검사를 **세 곳**에서 돌린다. 빠진 칸이 생기면 그 조합만 검증 없이 배포된다:
+같은 31검사를 **세 곳**에서 돌린다. 빠진 칸이 생기면 그 조합만 검증 없이 배포된다:
 
 | 자리 | 백엔드 | 플랫폼 | 실행 |
 |---|---|---|---|
@@ -134,7 +134,7 @@ arch -arm64 xcodebuild -workspace LynxWebGPUDemo.xcworkspace -scheme WebGPUCheck
 
 ```zsh
 swift build --package-path Examples/ExternalRuntime                      # 컴파일 검증
-swift run --package-path Examples/ExternalRuntime external-runtime-check # 29검사 전수 판정 검증
+swift run --package-path Examples/ExternalRuntime external-runtime-check # 31검사 전수 판정 검증
 ```
 
 ### Dawn 연동 검증 — `Projects/DawnCheck`
@@ -325,7 +325,7 @@ try XCTSkipUnless(harness.supports(.indirectArguments), "this device does not su
 - 비동기 경로(`readBuffer`)는 `XCTestExpectation`으로 검증한다.
 - 테스트 더블은 손으로 만든다 (모킹 라이브러리 없음).
 
-## 6. 커버리지 대상 (Swift 374 + JS 133 — 테스트 **케이스** 수다)
+## 6. 커버리지 대상 (Swift 374 + JS 150 — 테스트 **케이스** 수다)
 
 | 영역 | 파일 | 주요 케이스 |
 |---|---|---|

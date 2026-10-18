@@ -164,13 +164,13 @@ final class ShaderSafetyRenderTests: XCTestCase {
 
     /// A binding **smaller than the array's start offset** holds no element. `items` starts at byte 16
     /// but only 4 bytes are bound: in uint32, `4 - 16` wraps to ~4e9 and would let `items[2]` land on
-    /// byte 24 — outside the binding. The count must saturate at 0 and the write must be dropped.
+    /// byte 24 — outside the binding.
     ///
-    /// A conformant implementation **rejects this bind group** — the binding is below the minimum binding
-    /// size (the fixed part plus one element), which Core does not enforce yet. Once it does, this test
-    /// must flip to expecting that validation error; until then it pins the shader-side defence.
-    func test_aBindingSmallerThanTheArrayOffsetDropsTheWrite() throws {
-        harness.executeExpectingSuccess([
+    /// Core now enforces the minimum binding size (the fixed part plus one element — 32 bytes here, from
+    /// the auto layout's `minBindingSize`), so the bind group itself is rejected and nothing is written.
+    /// The shader-side clamp (the count saturating at 0) stays as the second line of defence.
+    func test_aBindingSmallerThanTheArrayOffsetIsRejectedByMinBindingSize() throws {
+        let result = harness.execute([
             ["op": "createShaderModule", "id": 1, "code": """
             struct Buf { head: vec4f, items: array<f32> }
             @group(0) @binding(0) var<storage, read_write> buf: Buf;
@@ -197,8 +197,10 @@ final class ShaderSafetyRenderTests: XCTestCase {
             ["op": "endPass"],
             ["op": "copyBufferToBuffer", "source": 2, "destination": 4, "size": 32],
         ])
-        let result = try harness.readBufferSync(handle: 4, as: Float.self)
-        XCTAssertEqual(result, [Float](repeating: 0, count: 8), "a write past a too-small binding landed in memory")
+        XCTAssertEqual(result["ok"] as? Bool, false)
+        XCTAssertTrue(harness.describeErrors(result).contains("minBindingSize"), harness.describeErrors(result))
+        let readback = try harness.readBufferSync(handle: 4, as: Float.self)
+        XCTAssertEqual(readback, [Float](repeating: 0, count: 8), "a write past a too-small binding landed in memory")
     }
 
     /// `var<workgroup>` starts at zero — reading without writing must give 0.

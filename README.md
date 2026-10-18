@@ -78,7 +78,7 @@ host.attach(to: lynxView)
 | `LynxWebGPUCore` | WebGPU 열거형·디스크립터·오류·핸들 레지스트리 + **커맨드 스트림 엔진**(`WGPUBackendEngine` — 디코딩·검증·오류 스코프·프레임 수명)과 백엔드 동사 프로토콜(`WGPUBackend`). Metal-free |
 | `LynxWebGPUShader` | WGSL 렉서/파서/리플렉션/MSL 방출기 (순수 Swift) |
 | `LynxWebGPU` | 엔진 위의 **Metal 백엔드**(인코딩) + 캔버스 표면 + 기본 런타임 `LynxWebGPUContext` |
-| `LynxWebGPUConformance` | 런타임 무관 **적합성 스위트**(29검사) — 저장소 밖에서 만든 백엔드가 같은 계약을 지키는지 픽셀로 판정한다 ([docs/TESTING.md](docs/TESTING.md) §2-1) |
+| `LynxWebGPUConformance` | 런타임 무관 **적합성 스위트**(31검사) — 저장소 밖에서 만든 백엔드가 같은 계약을 지키는지 픽셀로 판정한다 ([docs/TESTING.md](docs/TESTING.md) §2-1) |
 | `LynxWebGPUBridge` | Lynx NativeModule + `<webgpu-canvas>` 엘리먼트 (iOS 전용) — **SPM 타깃이 아니라 소스**다 |
 
 **이 패키지는 외부 의존성이 0이다.** SPM product는 셋(`LynxWebGPU` 엔진 · `LynxWebGPUCore`
@@ -135,7 +135,7 @@ JS 스레드(터치·타이머 포함)로 번지지 않는다.
 
 ## 검증
 
-Swift 374개 + JS 133개 테스트가 몇 초 안에 돈다 — 시뮬레이터도 기기도 필요 없다.
+Swift 374개 + JS 150개 테스트가 몇 초 안에 돈다 — 시뮬레이터도 기기도 필요 없다.
 
 - 트랜스파일러 테스트는 생성된 MSL을 **실제 Metal 컴파일러로** 통과시킨다.
 - 렌더 테스트는 오프스크린 텍스처에 그린 뒤 **픽셀 값을 단언**한다 (삼각형, 유니폼, 인덱스 드로우,
@@ -152,7 +152,7 @@ Swift 374개 + JS 133개 테스트가 몇 초 안에 돈다 — 시뮬레이터�
 - **호스트가 넘긴 페이로드는 배치를 시작하기 전에 네이티브 컨테이너로 옮긴다** — 원본 `NSDictionary`를
   중간에 비워도 배치 끝까지 같은 값을 읽는지, ObjC 트리로 들어온 페이로드가 프레임을 그려 내는지를
   테스트가 잡는다 (0.5.2에서 고친 크래시의 회귀 방지 — `docs/COMMAND-STREAM.md` §5-1-1).
-- **적합성 스위트(`LynxWebGPUConformance`, 29검사)는 런타임을 갈아끼워도 그대로 돈다** —
+- **적합성 스위트(`LynxWebGPUConformance`, 31검사)는 런타임을 갈아끼워도 그대로 돈다** —
   커맨드 스트림·`readCanvasPixels`·`readBuffer`·`adapterInfo`만 쓰므로, 저장소 밖 백엔드도
   같은 검사로 자신을 증명한다. 기본 Metal 런타임 29/29에 더해, 진짜 Dawn 위에 얹은 백엔드가
   같은 스위트를 28/29(+1 시뮬레이터 건너뜀)로 통과한다 ([docs/TESTING.md](docs/TESTING.md) §2-1).

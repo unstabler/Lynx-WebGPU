@@ -585,8 +585,9 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
                 path: command.fieldPath("offset")
             )
         }
+        // No open-pass gate: `unmap()` is legal at any time, and the write-back rides the queue's upload
+        // path (Metal's upload command buffer, Dawn's mapped memory) like writeBuffer does inside a pass.
         guard !data.isEmpty else { return }
-        try requireNoOpenPass()
         try backend.writeMappedBuffer(object.raw, offset: offset, data: data)
     }
 

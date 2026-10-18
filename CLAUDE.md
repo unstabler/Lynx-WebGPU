@@ -22,13 +22,13 @@ swift build
 swift test                                   # 374개 테스트, ~8초
 swift test --filter LynxWebGPUShaderTests    # WGSL → MSL 트랜스파일러만
 swift test --filter RenderPipelineTests      # GPU 오프스크린 렌더 검증
-swift test --filter ConformanceTests         # 적합성 스위트(29검사) — 런타임 무관 계약
+swift test --filter ConformanceTests         # 적합성 스위트(31검사) — 런타임 무관 계약
 
 # 외부 백엔드 주입 검증 — Core의 public 표면을 바꿨으면 반드시 (회귀 훅에는 없다)
 swift build --package-path Examples/ExternalRuntime
 swift run --package-path Examples/ExternalRuntime external-runtime-check
 
-# iOS 적합성 — **같은 29검사를 두 백엔드 모두** 시뮬레이터에서 돌린다 (docs/TESTING.md §2-1).
+# iOS 적합성 — **같은 31검사를 두 백엔드 모두** 시뮬레이터에서 돌린다 (docs/TESTING.md §2-1).
 # `swift test`는 macOS라 드라이버·GPU 패밀리가 다르다. 실려 나가는 곳은 iOS이므로 여기서도 잰다.
 # 데모와 **같은 워크스페이스**다 — 위의 tuist generate가 스킴 넷(WebGPUDemo·WebGPUCheck·DawnCheck·DawnDemo)을 다 만든다.
 arch -arm64 xcodebuild -workspace LynxWebGPUDemo.xcworkspace -scheme WebGPUCheck \
@@ -38,7 +38,7 @@ arch -arm64 xcodebuild -workspace LynxWebGPUDemo.xcworkspace -scheme DawnCheck \
 xcrun simctl launch <device> org.lynxwebgpu.dawndemo -demo triangle   # DawnDemo 스킴 빌드 후 화면 확인
 
 # JS 클라이언트(shim) — 런타임 의존성 0. TypeScript는 **검사·선언 생성 전용**이다 (빌드 산출물 없음)
-cd JS && npm test            # node 내장 러너, 133개
+cd JS && npm test            # node 내장 러너, 150개
 cd JS && npm run typecheck   # JSDoc 기준 타입 검사 (tsc --noEmit)
 cd JS && npm run types       # webgpu.d.ts 를 JSDoc에서 다시 생성
 
@@ -80,7 +80,7 @@ LynxWebGPUCore    ← (없음)                    WebGPU 열거형·디스크립
 LynxWebGPUShader  ← Core                      WGSL 렉서/파서/리플렉션/MSL 방출기. 순수 Swift.
 LynxWebGPU        ← Core, Shader              `WebGPURuntime`의 **기본 구현** — Metal 백엔드
                                               (리소스·파이프라인·인코더), 캔버스 표면, 해석기.
-LynxWebGPUConformance ← Core                  런타임 무관 **적합성 스위트**(29검사). 테스트 타깃이
+LynxWebGPUConformance ← Core                  런타임 무관 **적합성 스위트**(31검사). 테스트 타깃이
                                               아니라 **라이브러리**다 — 저장소 밖 백엔드가 같은
                                               계약을 지키는지 스스로 재려면 그래야 한다.
 LynxWebGPUBridge  ← Core, Lynx                NativeModule(`NativeModules.WebGPU`) +
@@ -153,7 +153,7 @@ Projects/WebGPUDemo/    — Tuist 데모 호스트 앱 (Sources/) + 데모 번�
                           실험 백엔드보다 검증이 얇아지지 않게.
 Projects/DawnCheck/     — 진짜 Dawn 위의 백엔드 (루트 워크스페이스의 별도 프로젝트, 시뮬레이터
                           전용). DawnBackend가 `WGPUBackend`를 구현하고 공유 엔진에 얹힌다.
-                          스킴 둘: DawnCheck(오프스크린 적합성 29검사) ·
+                          스킴 둘: DawnCheck(오프스크린 적합성 31검사) ·
                           DawnDemo(화면 실증 앱 — 데모 씬·브리지·JS 무변경, 런타임만 Dawn)
 Tuist.swift · Workspace.swift — 데모 앱 전용. 라이브러리 자체는 SPM만으로 완결된다
 docs/                   — ARCHITECTURE / WEBGPU-API / WGSL / LYNX-INTEGRATION / JS-AUTHORING / TESTING
