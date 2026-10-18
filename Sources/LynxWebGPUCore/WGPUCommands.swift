@@ -16,7 +16,8 @@ import Foundation
 /// - **Defaults that depend on an object are not filled here.** Anything needing a registry lookup
 ///   — `copyBufferToBuffer`'s `size` (the rest of the source), say — stays `nil` for the interpreter.
 /// - **Value conversions the spec mandates happen here.** Backend-independent rules such as WebIDL's
-///   `u32` modulo conversion or the workgroup-count floor must be identical on every backend.
+///   `u32` modulo conversion or rejecting a negative workgroup count must be identical on every
+///   backend.
 public protocol WGPUCommandFields {
     /// Position within the command stream (`commands[3]`). The root of the path a late validation attaches.
     var path: String { get }
@@ -459,12 +460,24 @@ public struct WGPUDispatchWorkgroupsCommand: WGPUCommandFields {
     public let z: Int
     public let path: String
 
+    /// Whether this dispatch launches no workgroup at all.
+    public var isEmpty: Bool { x == 0 || y == 0 || z == 0 }
+
     public init(from reader: WGPUValueReader) throws {
-        // Passing 0 makes Metal assert on an empty grid. The spec disallows 0 too, so we raise it to 1.
-        x = try max(reader.int("x", default: 1), 1)
-        y = try max(reader.int("y", default: 1), 1)
-        z = try max(reader.int("z", default: 1), 1)
+        // Values are kept as given — **0 is valid and dispatches nothing** (only an omitted count
+        // defaults to 1). Raising 0 to 1 would run the shader once for `ceil(n / 64)` with n = 0.
+        // Skipping an empty grid (Metal asserts on one) is the engine's job, after state validation.
+        // The spec types these `GPUSize32` (`[EnforceRange] unsigned long`), so a negative never reaches
+        // a browser's encoder; the per-device upper bound (`maxComputeWorkgroupsPerDimension`) is the engine's.
+        x = try reader.int("x", default: 1)
+        y = try reader.int("y", default: 1)
+        z = try reader.int("z", default: 1)
         path = reader.path
+        for (key, value) in [("x", x), ("y", y), ("z", z)] where value < 0 {
+            throw WGPUError.validation(
+                "a workgroup count must be >= 0 (got \(value))", path: reader.fieldPath(key)
+            )
+        }
     }
 }
 

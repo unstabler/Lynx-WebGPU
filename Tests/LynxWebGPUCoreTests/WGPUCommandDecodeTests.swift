@@ -179,4 +179,48 @@ final class WGPUCommandDecodeTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - dispatchWorkgroups counts
+
+    private func dispatch(_ fields: [String: Any]) throws -> WGPUDispatchWorkgroupsCommand {
+        var payload = fields
+        payload["op"] = "dispatchWorkgroups"
+        guard case .dispatchWorkgroups(let command) = try WGPUCommand(from: WGPUValueReader(payload)) else {
+            throw WGPUError.validation("not the dispatchWorkgroups case")
+        }
+        return command
+    }
+
+    func test_aZeroWorkgroupCountIsKeptNotRaisedToOne() throws {
+        // `dispatchWorkgroups(Math.ceil(n / 64))` with n = 0 must dispatch nothing — raising it ran the shader once.
+        let cases: [([String: Any], [Int])] = [
+            (["x": 0, "y": 1, "z": 1], [0, 1, 1]),
+            (["x": 4, "y": 0, "z": 2], [4, 0, 2]),
+            (["x": 4, "y": 3, "z": 0], [4, 3, 0]),
+        ]
+        for (fields, expected) in cases {
+            let command = try dispatch(fields)
+            XCTAssertEqual([command.x, command.y, command.z], expected)
+            XCTAssertTrue(command.isEmpty, "\(fields)")
+        }
+        XCTAssertFalse(try dispatch(["x": 1, "y": 1, "z": 1]).isEmpty)
+    }
+
+    func test_anOmittedWorkgroupCountDefaultsToOne() throws {
+        let command = try dispatch(["x": 5])
+        XCTAssertEqual([command.x, command.y, command.z], [5, 1, 1])
+        XCTAssertFalse(command.isEmpty)
+    }
+
+    func test_aNegativeWorkgroupCountIsAValidationErrorWithItsPath() throws {
+        for key in ["x", "y", "z"] {
+            var fields: [String: Any] = ["x": 1, "y": 1, "z": 1]
+            fields[key] = -1
+            XCTAssertThrowsError(try dispatch(fields)) { error in
+                guard let error = error as? WGPUError else { return XCTFail("not a WGPUError") }
+                XCTAssertEqual(error.kind, .validation)
+                XCTAssertEqual(error.path, key)
+            }
+        }
+    }
 }

@@ -261,6 +261,9 @@ public protocol WGPUBackend: AnyObject {
 
     // MARK: - Draw / dispatch
 
+    /// Unless `validatesNatively`, the direct `draw`/`drawIndexed`/`dispatchWorkgroups` never receive a
+    /// zero vertex/index/instance/workgroup count — the spec makes such a call a valid no-op, so the
+    /// engine validates it and then stops (Metal asserts on an empty grid). Indirect arguments are the GPU's.
     func draw(_ command: WGPUDrawCommand) throws
     func drawIndexed(_ command: WGPUDrawIndexedCommand, index: WGPUResolvedIndexBinding<Self>) throws
     func drawIndirect(buffer: Buffer, offset: Int) throws
