@@ -232,7 +232,7 @@ public struct WGPUUnmapBufferCommand: WGPUCommandFields {
 
     public init(from reader: WGPUValueReader) throws {
         buffer = try reader.requiredHandle("buffer")
-        offset = reader.optionalInt("offset")
+        offset = try reader.optionalInt("offset")
         data = try reader.optionalData("data")
         path = reader.path
     }

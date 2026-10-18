@@ -354,17 +354,21 @@ final class ExternalImageTests: XCTestCase {
         assertCopyRejected(source: ["origin": ["x": -4, "y": -4]], copySize: nil, containing: "must not be negative")
     }
 
+    /// The largest integer a JS number carries exactly (`Number.MAX_SAFE_INTEGER`). Anything past it
+    /// is already rejected by `WGPUValueReader`, so this is the largest value a copy can actually see.
+    private static let maxSafeInteger = (1 << 53) - 1
+
     /// Values that would overflow `origin + size` or `rowBytes * height` are a validation error, not a trap.
     func test_hugeOrNegativeCopyValuesAreAValidationErrorNotATrap() throws {
         let png = try makePNG(width: 4, height: 4, top: (255, 0, 0, 255), bottom: (0, 0, 255, 255))
         try decode(handle: 40, data: png)
 
-        assertCopyRejected(source: ["origin": ["x": 1, "y": 0]], copySize: ["width": Int.max, "height": 1],
+        assertCopyRejected(source: ["origin": ["x": 1, "y": 0]], copySize: ["width": Self.maxSafeInteger, "height": 1],
                            containing: "exceeds the image")
-        assertCopyRejected(source: ["origin": ["x": Int.max, "y": Int.max]], copySize: ["width": 1, "height": 1],
+        assertCopyRejected(source: ["origin": ["x": Self.maxSafeInteger, "y": Self.maxSafeInteger]], copySize: ["width": 1, "height": 1],
                            containing: "exceeds the image")
-        assertCopyRejected(source: ["origin": ["x": Int.max, "y": 0]], copySize: nil, containing: "exceeds the image")
-        assertCopyRejected(source: [:], copySize: ["width": 2, "height": Int.max], containing: "exceeds the image")
+        assertCopyRejected(source: ["origin": ["x": Self.maxSafeInteger, "y": 0]], copySize: nil, containing: "exceeds the image")
+        assertCopyRejected(source: [:], copySize: ["width": 2, "height": Self.maxSafeInteger], containing: "exceeds the image")
         assertCopyRejected(source: [:], copySize: ["width": -1, "height": 2], containing: "must not be negative")
         assertCopyRejected(source: [:], copySize: ["width": 2, "height": 2, "depthOrArrayLayers": 2],
                            containing: "single layer")
@@ -380,7 +384,7 @@ final class ExternalImageTests: XCTestCase {
                            containing: "destination origin must not be negative")
         assertCopyRejected(source: [:], destination: ["origin": ["x": 3, "y": 0]], copySize: size,
                            containing: "exceeds the destination texture")
-        assertCopyRejected(source: [:], destination: ["origin": ["x": 0, "y": Int.max]], copySize: size,
+        assertCopyRejected(source: [:], destination: ["origin": ["x": 0, "y": Self.maxSafeInteger]], copySize: size,
                            containing: "exceeds the destination texture")
         assertCopyRejected(source: [:], destination: ["mipLevel": 1], copySize: size, containing: "mipLevel")
     }

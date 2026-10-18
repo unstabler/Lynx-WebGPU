@@ -502,8 +502,8 @@ final class WGSLTranspilerTests: XCTestCase {
         let module = try WGSLParser.parse("""
         struct S {
             a: array<array<f32, 4000000000>, 4000000000>,
-            @size(9223372036854775807) b: f32,
-            @align(9223372036854775807) c: f32,
+            @size(4294967295) b: f32,
+            @align(2147483648) c: f32,
         }
         """)
         let structure = try XCTUnwrap(module.structNamed("S"))
@@ -1337,11 +1337,14 @@ final class WGSLTranspilerTests: XCTestCase {
     func test_aDepthCutOffIsNotMemoizedAsTheConstantsType() throws {
         // `a` reaches `c` right at the depth limit, so `c` is typed only partially there. That partial
         // nil must not be cached — `b = c` is a plain u32. Sweep around the limit so it stays meaningful.
-        for parens in 250...260 {
-            let nested = String(repeating: "(", count: parens) + "c" + String(repeating: ")", count: parens)
+        // The depth is built from a chain of constants, not parentheses: the parser rejects nesting past
+        // `WGSLParser.maximumNestingDepth` (128), well before the typer's limit, but a chain is not nesting.
+        for hops in 250...260 {
+            var chain = "const k0 = c;\n"
+            for index in 1..<hops { chain += "const k\(index) = k\(index - 1);\n" }
             let source = """
             const c = 1u;
-            override a = \(nested);
+            \(chain)override a = k\(hops - 1);
             override b = c;
 
             @group(0) @binding(0) var<storage, read_write> out: array<f32>;
@@ -1356,8 +1359,8 @@ final class WGSLTranspilerTests: XCTestCase {
             let msl = try module.translateToMSL(
                 entryPoints: ["main"], bindings: bindings, constants: ["a": 3, "b": 3]
             )
-            XCTAssertTrue(msl.contains("uint b = 3u;"), "\(parens) parens poisoned b's type:\n\(msl)")
-            if parens == 255 { MetalCompilerHarness.assertCompiles(msl) }
+            XCTAssertTrue(msl.contains("uint b = 3u;"), "\(hops) hops poisoned b's type:\n\(msl)")
+            if hops == 255 { MetalCompilerHarness.assertCompiles(msl) }
         }
     }
 
