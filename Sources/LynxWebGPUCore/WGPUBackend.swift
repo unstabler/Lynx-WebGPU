@@ -75,14 +75,35 @@ public protocol WGPUBackend: AnyObject {
 
     // MARK: - Batch lifetime
 
-    /// Batch start — the seat for backends needing per-batch diagnostic collection (Dawn: push a
-    /// device error scope). A backend whose failures arrive by completion handler, like Metal, has
-    /// nothing to do.
+    /// Batch start — the seat for backends needing per-batch setup (Dawn: drop a leftover encoder).
+    /// A backend whose failures arrive by completion handler, like Metal, has nothing to do.
     func beginBatch()
 
-    /// After the batch is submitted, the backend hands over the diagnostics it gathered (Dawn: pop
-    /// the scope, pump, collect errors). The engine routes them into error scopes / the batch result.
+    /// After the batch is submitted, the backend hands over the diagnostics that only surface late
+    /// (Dawn: pump events, then drain its uncaptured-error sink — encoder errors raised at Finish,
+    /// stragglers). The engine routes them into error scopes / the batch result.
     func collectBatchDiagnostics() -> [WGPUError]
+
+    /// Diagnostics the backend's own validator has **already raised** — handed over without
+    /// pumping anything. The engine calls this after **every command** (and once at batch start),
+    /// so each error is filed with the error scopes **as they were when the offending command
+    /// ran**. Collecting only at batch end would file it with the scopes open at the end instead:
+    /// a `push → create → pop` in one batch (the shim's `createRenderPipelineAsync`, a user's
+    /// per-frame scope) would resolve clean while the error leaked to `uncapturederror`.
+    ///
+    /// Must be cheap (it runs per command). Dawn: drain the uncaptured-error sink, which its
+    /// validator fills synchronously during the offending API call. Default: none (Metal — its
+    /// spec checks are the engine's and are thrown in-command).
+    func drainImmediateDiagnostics() -> [WGPUError]
+
+    /// Whether a diagnostic is only a **cascading echo** of an earlier root error (Dawn: "[Invalid
+    /// X] is invalid due to a previous error"). The engine drops echoes from the batch result's
+    /// `errors` when a root error is in that same result — an overlay showing the last error
+    /// would otherwise always show the echo and hide the cause. The filter has to be the
+    /// engine's: with per-command draining the root and its echo arrive in **different** drains.
+    /// **Scopes still catch echoes** — the spec raises a real validation error for using an
+    /// invalid object. Default: false.
+    func isCascadingEcho(_ diagnostic: WGPUError) -> Bool
 
     /// Whether GPU work to submit was produced in this batch (Metal: a command buffer exists).
     /// The engine decides present, accounting and frame expiry from this value.
@@ -295,6 +316,13 @@ public protocol WGPUBackend: AnyObject {
                          destination: Buffer, destinationOffset: Int) throws
 }
 
+// MARK: - Defaults
+
+public extension WGPUBackend {
+    func drainImmediateDiagnostics() -> [WGPUError] { [] }
+    func isCascadingEcho(_ diagnostic: WGPUError) -> Bool { false }
+}
+
 // MARK: - Capabilities
 
 public struct WGPUBackendCapabilities {
@@ -316,7 +344,8 @@ public struct WGPUBackendCapabilities {
     /// True makes the engine skip spec-level checks (range, alignment, usage, occlusion nesting,
     /// bundle compatibility, compression limits) and keep only **bridging and minimal exception
     /// handling** — handle lookup, wire mapping state, pass state guards, CPU path protection. Bad
-    /// values are rejected by the backend's own validator (its device error scope), and trap
+    /// values are rejected by the backend's own validator (reported through its uncaptured-error
+    /// sink, drained per command by `drainImmediateDiagnostics` and at batch end), and trap
     /// prevention falls to the backend's safe conversions (the `dawnU32` family) — the same split
     /// react-native-webgpu uses over Dawn (`docs/extra/RN-WEBGPU-LAYERING.md`).
     ///
