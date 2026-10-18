@@ -258,6 +258,28 @@ final class ShaderSafetyTests: XCTestCase {
         )
     }
 
+    /// A user global spelled like the flag stays a separate variable. It used to share the flag's name
+    /// in the emitter's global table, which **trapped** (killing the host process) on the duplicate.
+    func test_aUserGlobalNamedLikeTheDiscardFlagStaysSeparate() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+        var<private> wgpu_discarded: f32 = 2.0;
+        @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+            if (p.x > wgpu_discarded) { discard; }
+            out[0] = wgpu_discarded;
+            return vec4f(1);
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("float wgpu_id_wgpu_discarded = 2.0;"), "the user global was lost\n\(msl)")
+        XCTAssertTrue(msl.contains("bool wgpu_discarded{};"), "the flag was lost\n\(msl)")
+        XCTAssertTrue(msl.contains("p.x > wgpu_id_wgpu_discarded"), "\(msl)")
+        XCTAssertTrue(msl.contains("wgpu_discarded = true"), "discard did not become a flag\n\(msl)")
+        XCTAssertTrue(
+            msl.contains("if (wgpu_discarded) { discard_fragment(); }"),
+            "the real discard must happen at the end of the entry point\n\(msl)"
+        )
+    }
+
     // MARK: - Infinite loops
 
     /// An infinite loop is UB in C++ — the compiler may assume it ends and delete the surrounding code.

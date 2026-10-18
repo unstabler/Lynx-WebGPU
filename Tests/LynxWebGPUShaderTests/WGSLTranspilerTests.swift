@@ -63,8 +63,8 @@ final class WGSLTranspilerTests: XCTestCase {
     func test_triangleShaderVertexAttributesAndUniformsTranslateToMSL() throws {
         let msl = try translate(Self.triangleShader, entryPoints: ["vs_main", "fs_main"])
 
-        XCTAssertTrue(msl.contains("vertex wgpu_vs_main_out vs_main("), "no vertex entry point wrapper")
-        XCTAssertTrue(msl.contains("fragment wgpu_fs_main_out fs_main("), "no fragment entry point wrapper")
+        XCTAssertTrue(msl.contains("vertex wgpu_ep_vs_main_out vs_main("), "no vertex entry point wrapper")
+        XCTAssertTrue(msl.contains("fragment wgpu_ep_fs_main_out fs_main("), "no fragment entry point wrapper")
         XCTAssertTrue(msl.contains("[[attribute(0)]]"), "no vertex attribute 0")
         XCTAssertTrue(msl.contains("[[attribute(1)]]"), "no vertex attribute 1")
         XCTAssertTrue(msl.contains("[[position]]"), "no position builtin")
@@ -381,6 +381,42 @@ final class WGSLTranspilerTests: XCTestCase {
         }
     }
 
+    /// WGSL module scope is **one namespace** — a second declaration of any kind is a shader-creation
+    /// error. It used to reach the emitter, whose name-keyed global table **trapped** (killing the host
+    /// process) on `var<private> a: f32; var<private> a: f32;`.
+    func test_aDuplicateModuleScopeDeclarationIsAShaderCreationError() {
+        let cases: [(source: String, line: Int)] = [
+            ("var<private> a: f32;\nvar<private> a: f32;", 2),
+            ("struct S { x: f32 }\nalias S = f32;", 2),
+            ("const k = 1;\noverride k: i32;", 2),
+            ("var<private> f: f32;\n\nfn f() {}", 3),
+            ("fn g() {}\n@fragment\nfn g() -> @location(0) vec4f { return vec4f(1); }", 3),
+        ]
+        for (source, line) in cases {
+            XCTAssertThrowsError(try WGSLShaderModule(source: source), source) { error in
+                let error = error as? WGPUError
+                XCTAssertEqual(error?.kind, .validation, source)
+                XCTAssertEqual(error?.line, line, "the second declaration's line is reported: \(source)")
+                XCTAssertTrue(error?.message.contains("redeclaration of") == true, error?.message ?? source)
+            }
+        }
+    }
+
+    /// Defence in depth — even if duplicate globals bypass the parser, building the emitter must not trap.
+    func test_theEmitterDoesNotTrapOnDuplicateGlobalsThatBypassTheParser() throws {
+        var ast = try WGSLParser.parse("""
+        var<private> a: f32;
+        @fragment fn fs() -> @location(0) vec4f { return vec4f(a); }
+        """)
+        ast.globals.append(ast.globals[0])
+        var emitter = MSLEmitter(
+            module: ast, reflection: WGSLReflectionBuilder.build(ast), bindings: WGSLBindingAssignment()
+        )
+        // The first declaration wins (`uniquingKeysWith`) — it must emit, not trap.
+        let msl = try emitter.emit(entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("float a"), msl)
+    }
+
     // MARK: - Name collisions / literals / pipeline constants
 
     func test_identifiersCollidingWithMSLKeywordsChangeAtDeclarationAndEveryUse() throws {
@@ -405,6 +441,45 @@ final class WGSLTranspilerTests: XCTestCase {
         XCTAssertTrue(msl.contains("wgpu_id_char"))
         XCTAssertTrue(msl.contains("wgpu_id_sampler"), "the local variable name did not change")
         // A mismatch between declaration and use is caught by the Metal compile (the translate helper verifies it).
+    }
+
+    /// The `wgpu_` namespace belongs to the emitter (prelude helpers, padding members, entry point
+    /// wrappers, …). User identifiers spelled into it move to `wgpu_id_<name>` at declaration and every
+    /// use, the same as MSL reserved words — otherwise they redeclare an internal name or, worse,
+    /// silently **overload** a prelude helper.
+    func test_userIdentifiersInTheInternalNamespaceAreMovedOutOfIt() throws {
+        let source = """
+        struct wgpu_fs_out {
+            a: f32,
+            wgpu_pad0: vec4f,
+        }
+        alias wgpu_vec = vec4f;
+        @group(0) @binding(0) var<uniform> u: wgpu_fs_out;
+
+        fn wgpu_mod(a: f32, b: f32) -> f32 { return a + b; }
+
+        @fragment
+        fn id_wgpu_fs() -> @location(0) vec4f {
+            let wgpu_out = wgpu_mod(u.a, u.wgpu_pad0.x) + u.a % 2.0;
+            return wgpu_vec(wgpu_out, 0.0, 0.0, 1.0);
+        }
+        """
+        let msl = try translate(source, entryPoints: ["id_wgpu_fs"])
+
+        // A user member next to the padding the layout inserts (`char wgpu_pad0[12]`).
+        XCTAssertTrue(msl.contains("char wgpu_pad0[12];"), msl)
+        XCTAssertTrue(msl.contains("float4 wgpu_id_wgpu_pad0;"), msl)
+        // A user function spelled like the `%` helper must not become an overload of it.
+        XCTAssertTrue(msl.contains("float wgpu_id_wgpu_mod(float a, float b)"), msl)
+        XCTAssertTrue(msl.contains("wgpu_id_wgpu_mod(u.a, u.wgpu_id_wgpu_pad0.x) + wgpu_mod(u.a, 2.0)"), msl)
+        // An alias used as a constructor resolves to the renamed declaration.
+        XCTAssertTrue(msl.contains("using wgpu_id_wgpu_vec = float4;"), msl)
+        XCTAssertTrue(msl.contains("return wgpu_id_wgpu_vec(wgpu_id_wgpu_out, "), msl)
+        // The user's `wgpu_fs_out` and the entry point `id_wgpu_fs`'s output struct stay distinct.
+        XCTAssertTrue(msl.contains("struct alignas(16) wgpu_id_wgpu_fs_out {"), msl)
+        XCTAssertTrue(msl.contains("fragment wgpu_ep_id_wgpu_fs_out id_wgpu_fs("), msl)
+        // The runtime looks entry points up by the same mapping.
+        XCTAssertEqual(WGSLShaderModule.mslFunctionName(for: "wgpu_fs"), "wgpu_id_wgpu_fs")
     }
 
     func test_floatingPointRemainderIsRoutedToFmod() throws {

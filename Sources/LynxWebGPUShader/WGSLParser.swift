@@ -98,12 +98,13 @@ struct WGSLParser {
         }
     }
 
-    private func error(_ message: String) -> WGPUError {
+    private func error(_ message: String, line: Int? = nil) -> WGPUError {
         // Carry the line number **as a number too** — this is the value `getCompilationInfo()` hands the editor.
-        WGPUError(
+        let line = line ?? current.line
+        return WGPUError(
             kind: .validation,
-            message: "WGSL parse failed (line \(current.line)): \(message)",
-            line: current.line
+            message: "WGSL parse failed (line \(line)): \(message)",
+            line: line
         )
     }
 
@@ -111,29 +112,41 @@ struct WGSLParser {
 
     private mutating func parseModule() throws -> WGSLModule {
         var module = WGSLModule()
+        // Module-scope name → the line it was first declared on.
+        var declaredLines: [String: Int] = [:]
         while !isAtEnd {
             if match(";") { continue }
             let attributes = try parseAttributes()
+            let declarationLine = current.line
 
             if check("struct") {
                 advance()
-                module.structs.append(try parseStruct())
+                let structure = try parseStruct()
+                try declare(structure.name, line: declarationLine, in: &declaredLines)
+                module.structs.append(structure)
             } else if check("fn") {
                 advance()
-                module.functions.append(try parseFunction(attributes: attributes))
+                let function = try parseFunction(attributes: attributes)
+                try declare(function.name, line: declarationLine, in: &declaredLines)
+                module.functions.append(function)
             } else if check("var") {
                 advance()
-                module.globals.append(try parseGlobalVariable(attributes: attributes))
+                let global = try parseGlobalVariable(attributes: attributes)
+                try declare(global.name, line: declarationLine, in: &declaredLines)
+                module.globals.append(global)
             } else if check("const") || check("override") {
                 let isOverride = current.text == "override"
                 advance()
-                module.constants.append(try parseModuleConstant(isOverride: isOverride))
+                let constant = try parseModuleConstant(isOverride: isOverride)
+                try declare(constant.name, line: declarationLine, in: &declaredLines)
+                module.constants.append(constant)
             } else if check("alias") || check("type") {
                 advance()
                 let name = try expectIdentifier("alias name")
                 try expect("=", "alias")
                 let type = try parseType()
                 try expect(";", "alias")
+                try declare(name, line: declarationLine, in: &declaredLines)
                 module.aliases.append((name, type))
             } else if check("const_assert") {
                 // A compile-time assertion is not translated — skip to the semicolon.
@@ -149,6 +162,21 @@ struct WGSLParser {
             }
         }
         return module
+    }
+
+    /// Registers a module-scope name — **structs, aliases, functions, variables, constants and overrides
+    /// share one namespace** in WGSL, so a second declaration of any kind is a shader-creation error
+    /// (Tint rejects it the same way). Letting it through would leave two declarations that every
+    /// name-keyed table downstream (reflection, resource threading, emission) silently picks between.
+    private func declare(_ name: String, line: Int, in declaredLines: inout [String: Int]) throws {
+        if let first = declaredLines[name] {
+            throw error(
+                "redeclaration of '\(name)' (first declared on line \(first)) — module-scope "
+                    + "structs, aliases, functions, variables, constants and overrides share one namespace",
+                line: line
+            )
+        }
+        declaredLines[name] = line
     }
 
     private mutating func parseAttributes() throws -> [WGSLAttribute] {
