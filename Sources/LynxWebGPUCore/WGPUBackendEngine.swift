@@ -1411,16 +1411,19 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     /// why its message is generic.
     private func applyDrawState() throws {
         let requiredGroups: Set<Int>?
+        let layoutGroupCount: Int?
         if passState == .render {
             guard let pipeline = currentRenderPipeline else {
                 throw WGPUError.validation("setPipeline is required before draw")
             }
             requiredGroups = pipeline.info.requiredGroups
+            layoutGroupCount = pipeline.info.layoutGroupCount
         } else {
             guard let pipeline = currentComputePipeline else {
                 throw WGPUError.validation("setPipeline is required before dispatch")
             }
             requiredGroups = pipeline.info.requiredGroups
+            layoutGroupCount = pipeline.info.layoutGroupCount
         }
 
         // Every group the layout requires must be bound. Without this check a draw silently uses
@@ -1446,11 +1449,28 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             }
         }
 
-        for groupIndex in dirtyGroups.sorted() {
-            guard let bound = boundGroups[groupIndex] else { continue }
+        // Groups bound beyond the current layout are held back. The spec ignores them (draw validity
+        // looks only at the layout's own indices), but a backend that maps groups through the layout
+        // has nowhere to put them — Metal throws "the pipeline layout has no @group(N)" — so a pass
+        // that switched from a 2-group pipeline to a 1-group one would fail every later draw. A held
+        // group **stays dirty**, so a later pipeline whose layout reaches it gets it then.
+        // Every index inside the layout still goes down, empty slots included, so a non-empty group
+        // bound at an empty slot is still rejected by the backend as incompatible. Without
+        // `layoutGroupCount` the layout's length is unknown and "beyond" falls back to "above the
+        // highest required index" (`requiredGroups` omits empty groups, so a trailing empty slot is
+        // then treated as beyond). A group turns clean only once the backend accepted it — after a
+        // throw the failed group (and those after it) stay pending, so each later draw sees the same
+        // invalid state until setBindGroup/setPipeline fixes it.
+        // (Nil metadata: the backend validates natively and tolerates extras, so all go down.)
+        let appliedGroupLimit = layoutGroupCount ?? requiredGroups.map { ($0.max() ?? -1) + 1 } ?? Int.max
+        for groupIndex in dirtyGroups.sorted() where groupIndex < appliedGroupLimit {
+            guard let bound = boundGroups[groupIndex] else {
+                dirtyGroups.remove(groupIndex)
+                continue
+            }
             try backend.applyBindGroup(bound.group.raw, at: groupIndex, dynamicOffsets: bound.offsets)
+            dirtyGroups.remove(groupIndex)
         }
-        dirtyGroups.removeAll()
 
         try applyVertexBuffers()
     }

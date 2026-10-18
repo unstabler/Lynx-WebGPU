@@ -442,6 +442,7 @@ public final class WGPUMetalBackend: WGPUBackend {
             pipeline: pipeline,
             info: WGPURenderPipelineInfo(
                 requiredGroups: resolved.requiredGroups,
+                layoutGroupCount: resolved.groups.count,
                 requiredVertexSlots: pipeline.requiredVertexSlots,
                 writesDepth: pipeline.writesDepth,
                 writesStencil: pipeline.writesStencil
@@ -465,7 +466,9 @@ public final class WGPUMetalBackend: WGPUBackend {
         )
         return WGPUComputePipelineCreation(
             pipeline: pipeline,
-            info: WGPUComputePipelineInfo(requiredGroups: resolved.requiredGroups)
+            info: WGPUComputePipelineInfo(
+                requiredGroups: resolved.requiredGroups, layoutGroupCount: resolved.groups.count
+            )
         )
     }
 

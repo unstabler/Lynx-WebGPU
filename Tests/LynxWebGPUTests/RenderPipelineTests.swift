@@ -370,6 +370,138 @@ final class RenderPipelineTests: XCTestCase {
         XCTAssertEqual(try harness.pixel(x: 48, y: 32).a, 255)
     }
 
+    // MARK: - Bind groups beyond the layout
+
+    /// The spec ignores a bind group bound beyond the current pipeline layout. Switching from a
+    /// 2-group pipeline to a 1-group one in the same pass used to send @group(1) down to a layout with
+    /// no Metal index for it — the draw threw, and so did every later draw in the pass. Coming back to
+    /// the 2-group pipeline must reuse the group 1 still bound, with no new setBindGroup.
+    func test_aGroupBoundBeyondTheLayoutIsIgnoredAndComesBackForALaterPipeline() throws {
+        let vertex = """
+        @vertex
+        fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+            var positions = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+            return vec4f(positions[index], 0.0, 1.0);
+        }
+        """
+        let twoGroups = """
+        struct Tint { color: vec4f }
+        @group(0) @binding(0) var<uniform> base: Tint;
+        @group(1) @binding(0) var<uniform> extra: Tint;
+        \(vertex)
+        @fragment
+        fn fs_main() -> @location(0) vec4f { return base.color + extra.color; }
+        """
+        let oneGroup = """
+        struct Tint { color: vec4f }
+        @group(0) @binding(0) var<uniform> base: Tint;
+        \(vertex)
+        @fragment
+        fn fs_main() -> @location(0) vec4f { return base.color; }
+        """
+        let fragmentStage = 0x2
+
+        harness.executeExpectingSuccess([
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+            ["op": "createShaderModule", "id": 1, "code": twoGroups],
+            ["op": "createShaderModule", "id": 2, "code": oneGroup],
+            ["op": "createBuffer", "id": 5, "size": 16, "usage": TestUsage.uniform | TestUsage.copyDst,
+             "data": [Float]([1, 0, 0, 1]).base64],
+            ["op": "createBuffer", "id": 6, "size": 16, "usage": TestUsage.uniform | TestUsage.copyDst,
+             "data": [Float]([0, 0, 1, 0]).base64],
+            // Explicit layouts, so both pipelines accept the same bind groups (auto layouts are exclusive).
+            ["op": "createBindGroupLayout", "id": 10, "entries": [
+                ["binding": 0, "visibility": fragmentStage, "buffer": ["type": "uniform"]],
+            ]],
+            ["op": "createPipelineLayout", "id": 12, "bindGroupLayouts": [10, 10]],
+            ["op": "createPipelineLayout", "id": 13, "bindGroupLayouts": [10]],
+            ["op": "createRenderPipeline", "id": 3, "layout": 12,
+             "vertex": ["module": 1, "entryPoint": "vs_main"],
+             "fragment": ["module": 1, "entryPoint": "fs_main", "targets": [["format": "rgba8unorm"]]]],
+            ["op": "createRenderPipeline", "id": 4, "layout": 13,
+             "vertex": ["module": 2, "entryPoint": "vs_main"],
+             "fragment": ["module": 2, "entryPoint": "fs_main", "targets": [["format": "rgba8unorm"]]]],
+            ["op": "createBindGroup", "id": 20, "layout": 10,
+             "entries": [["binding": 0, "resource": ["buffer": 5]]]],
+            ["op": "createBindGroup", "id": 21, "layout": 10,
+             "entries": [["binding": 0, "resource": ["buffer": 6]]]],
+            ["op": "getCurrentTexture", "id": 30, "canvas": "test"],
+            ["op": "createTextureView", "id": 31, "texture": 30],
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 31, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 0, "g": 0, "b": 0, "a": 1],
+            ]]],
+            // Left third: both groups (red + blue).
+            ["op": "setPipeline", "pipeline": 3],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 20],
+            ["op": "setBindGroup", "index": 1, "bindGroup": 21],
+            ["op": "setScissorRect", "x": 0, "y": 0, "width": 21, "height": 64],
+            ["op": "draw", "vertexCount": 3],
+            // Middle third: the 1-group pipeline — group 1 stays bound but lies beyond its layout.
+            ["op": "setPipeline", "pipeline": 4],
+            ["op": "setScissorRect", "x": 21, "y": 0, "width": 21, "height": 64],
+            ["op": "draw", "vertexCount": 3],
+            // Right third: back to the 2-group pipeline with no new setBindGroup.
+            ["op": "setPipeline", "pipeline": 3],
+            ["op": "setScissorRect", "x": 42, "y": 0, "width": 22, "height": 64],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+        ])
+
+        try harness.assertPixel(x: 10, y: 32, equals: (255, 0, 255, 255), "two groups")
+        try harness.assertPixel(x: 32, y: 32, equals: (255, 0, 0, 255), "one group (group 1 ignored)")
+        try harness.assertPixel(x: 53, y: 32, equals: (255, 0, 255, 255), "group 1 back for the 2-group pipeline")
+    }
+
+    /// The other side of the line: a layout that **ends** in an empty group still owns that index, so a
+    /// non-empty group bound there is incompatible (spec, Dawn) — not "beyond the layout" and ignored.
+    func test_aNonEmptyGroupAtATrailingEmptyLayoutSlotIsStillRejected() {
+        let shader = """
+        struct Tint { color: vec4f }
+        @group(0) @binding(0) var<uniform> base: Tint;
+
+        @vertex
+        fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+            var positions = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+            return vec4f(positions[index], 0.0, 1.0);
+        }
+
+        @fragment
+        fn fs_main() -> @location(0) vec4f { return base.color; }
+        """
+        let fragmentStage = 0x2
+        let result = harness.execute([
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+            ["op": "createShaderModule", "id": 1, "code": shader],
+            ["op": "createBuffer", "id": 5, "size": 16, "usage": TestUsage.uniform | TestUsage.copyDst,
+             "data": [Float]([1, 0, 0, 1]).base64],
+            ["op": "createBindGroupLayout", "id": 10, "entries": [
+                ["binding": 0, "visibility": fragmentStage, "buffer": ["type": "uniform"]],
+            ]],
+            ["op": "createBindGroupLayout", "id": 11, "entries": [[String: Any]]()],
+            ["op": "createPipelineLayout", "id": 12, "bindGroupLayouts": [10, 11]],
+            ["op": "createRenderPipeline", "id": 3, "layout": 12,
+             "vertex": ["module": 1, "entryPoint": "vs_main"],
+             "fragment": ["module": 1, "entryPoint": "fs_main", "targets": [["format": "rgba8unorm"]]]],
+            ["op": "createBindGroup", "id": 20, "layout": 10,
+             "entries": [["binding": 0, "resource": ["buffer": 5]]]],
+            ["op": "getCurrentTexture", "id": 30, "canvas": "test"],
+            ["op": "createTextureView", "id": 31, "texture": 30],
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 31, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 0, "g": 0, "b": 0, "a": 1],
+            ]]],
+            ["op": "setPipeline", "pipeline": 3],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 20],
+            ["op": "setBindGroup", "index": 1, "bindGroup": 20],   // non-empty group at the empty slot 1
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+        ])
+
+        XCTAssertEqual(result["ok"] as? Bool, false)
+        XCTAssertTrue(harness.describeErrors(result).contains("@group(1)"), harness.describeErrors(result))
+    }
+
     // MARK: - Compute
 
     func test_aComputeShaderComputesIntoAStorageBuffer() throws {

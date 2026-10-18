@@ -231,7 +231,9 @@ public protocol WGPUBackend: AnyObject {
 
     /// Right before a draw, **only the dirty groups** come down from the engine's shadow state —
     /// because binding invalidation at bundle boundaries is expressed in that shadow state (see
-    /// `WGPUBackendEngine`).
+    /// `WGPUBackendEngine`). A group bound beyond the pipeline layout (index ≥ `layoutGroupCount`, or
+    /// above the highest `requiredGroups` index when that is nil) is held back — the spec ignores it —
+    /// until a pipeline whose layout reaches it is set. With nil metadata every dirty group comes down.
     func applyBindGroup(_ group: BindGroup, at index: Int, dynamicOffsets: [Int]) throws
     /// Right before a draw, only the dirty slots come down. A `validatesNatively` backend must
     /// convert slot and offset safely itself (the engine's range check is skipped).
@@ -376,15 +378,20 @@ public struct WGPUCompilationMessage {
 public struct WGPURenderPipelineInfo {
     /// Group indices that must be bound before a draw (empty groups excluded).
     public let requiredGroups: Set<Int>?
+    /// Number of bind group layouts in the pipeline layout (trailing empty ones included). Groups
+    /// bound at this index or above are ignored (spec) and not sent down; nil falls back to
+    /// "above the highest `requiredGroups` index".
+    public let layoutGroupCount: Int?
     /// Vertex buffer slots that must be bound before a draw (declared by `vertex.buffers`).
     public let requiredVertexSlots: Set<Int>?
     /// Used when rejecting in a `depthReadOnly`/`stencilReadOnly` pass.
     public let writesDepth: Bool?
     public let writesStencil: Bool?
 
-    public init(requiredGroups: Set<Int>? = nil, requiredVertexSlots: Set<Int>? = nil,
-                writesDepth: Bool? = nil, writesStencil: Bool? = nil) {
+    public init(requiredGroups: Set<Int>? = nil, layoutGroupCount: Int? = nil,
+                requiredVertexSlots: Set<Int>? = nil, writesDepth: Bool? = nil, writesStencil: Bool? = nil) {
         self.requiredGroups = requiredGroups
+        self.layoutGroupCount = layoutGroupCount
         self.requiredVertexSlots = requiredVertexSlots
         self.writesDepth = writesDepth
         self.writesStencil = writesStencil
@@ -393,9 +400,12 @@ public struct WGPURenderPipelineInfo {
 
 public struct WGPUComputePipelineInfo {
     public let requiredGroups: Set<Int>?
+    /// See `WGPURenderPipelineInfo.layoutGroupCount`.
+    public let layoutGroupCount: Int?
 
-    public init(requiredGroups: Set<Int>? = nil) {
+    public init(requiredGroups: Set<Int>? = nil, layoutGroupCount: Int? = nil) {
         self.requiredGroups = requiredGroups
+        self.layoutGroupCount = layoutGroupCount
     }
 }
 
