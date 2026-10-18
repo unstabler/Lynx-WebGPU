@@ -71,6 +71,15 @@ context.unconfigure()        // 다시 configure하기 전까지 그릴 수 없�
 
 - `configure`는 `CAMetalLayer` 설정을 메인 스레드에 **비동기**로 반영한다. `getPreferredCanvasFormat()`
   (= `bgra8unorm`)을 쓰면 엘리먼트 기본값과 같아 첫 프레임부터 일치한다.
+- `usage` 기본값은 `RENDER_ATTACHMENT`다. 그 밖의 플래그(`COPY_SRC` · `COPY_DST` ·
+  `TEXTURE_BINDING` · `STORAGE_BINDING`)가 **하나라도** 있으면 드로어블을 framebuffer-only로
+  만들지 않는다 — 렌더 패스 밖 접근(블릿·셰이더 읽기/쓰기)을 Metal이 막기 때문이다.
+  framebuffer-only 쪽이 빠르므로 필요한 플래그만 켤 것. 이 설정도 포맷처럼 **비동기**로 반영되므로,
+  `configure`로 플래그를 켠 직후 프레임의 드로어블은 아직 framebuffer-only일 수 있다. 그 프레임에도
+  렌더 패스는 정상이고, framebuffer-only로는 안 되는 사용(복사·`writeTexture`·바인드 그룹에 묶기)만
+  Metal 단언으로 죽는 대신 **그 op 하나가 검증 오류**가 된다 — 프레임은 그대로 present되고, 설정이
+  반영된 뒤 프레임부터 정상이다. Dawn 백엔드는 같은 `usage`를 표면 설정에 넘기되, 표면이 지원하지
+  않는 비트는 검증 오류로 알리고 뺀다.
 - `getSize()`는 **제출 응답의 `canvases`로 갱신되는 캐시**를 읽는다. 동기 네이티브 조회는
   캐시가 빌 때(= `configure` 직후) 한 번뿐이므로 프레임 안에서 불러도 왕복이 없다.
 - `unconfigure()`는 포맷을 바꿔 재구성하는 코드(HDR 토글 등)가 밟는 자리다. 이후

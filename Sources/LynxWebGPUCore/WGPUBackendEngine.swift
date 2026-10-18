@@ -1167,8 +1167,11 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
                     + "(check that <webgpu-canvas canvas-id=\"…\"> is attached on screen)"
             )
         }
-        try backend.configureSurface(entry.raw, configuration: configuration)
+        // Recorded before the backend call: a configure can take effect and still throw (Dawn drops an
+        // unsupported usage bit, configures with the rest, then reports it), and the batch's `canvases`
+        // must still report the canvas.
         touchedCanvases[configuration.canvasId] = entry.raw
+        try backend.configureSurface(entry.raw, configuration: configuration)
     }
 
     private func getCurrentTexture(_ command: WGPUGetCurrentTextureCommand) throws {

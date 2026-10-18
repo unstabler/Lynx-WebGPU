@@ -380,6 +380,7 @@ enum TestUsage {
     static let textureCopySrc = 0x01
     static let textureCopyDst = 0x02
     static let textureBinding = 0x04
+    static let textureStorageBinding = 0x08
     static let renderAttachment = 0x10
 }
 
