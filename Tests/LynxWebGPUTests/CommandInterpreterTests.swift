@@ -523,11 +523,12 @@ final class CommandInterpreterTests: XCTestCase {
         XCTAssertEqual(harness.liveObjects, 0)
     }
 
-    // MARK: - writeTexture queue ordering
+    // MARK: - Queue write ordering
 
-    /// In one batch (1) a render pass paints the texture red and (2) **after that** writeTexture uploads
-    /// green. In stream order the final content is green — under the old scheme, where writeTexture ran its
-    /// own command buffer to completion first, red would remain.
+    /// Queue writes (`writeBuffer`/`writeTexture`) land on the queue timeline **at the call** — before
+    /// the batch's encoder work, which is the batch's submit (`WGPUBackend.writeBuffer`). Under the old
+    /// scheme they rode the frame command buffer's blit in stream order instead, so a write after a
+    /// pass in the same batch ran after it, and a write while a pass was open was rejected outright.
     /// The `bytesPerRow` of a buffer↔texture copy must be **a multiple of 256** (a spec requirement the
     /// engine enforces). So the readback buffer carries padding per row and the tight pixels must be re-extracted.
     private static let copyRowStride = 256
@@ -542,7 +543,9 @@ final class CommandInterpreterTests: XCTestCase {
         }
     }
 
-    func test_writeTextureRunsAfterAnEarlierRenderPassInTheSameBatch() throws {
+    /// Batch 1 paints the texture red and is submitted; batch 2 uploads green. The upload is serialized
+    /// **after** the earlier submit — not run ahead of it, which would leave red.
+    func test_writeTextureRunsAfterARenderPassSubmittedEarlier() throws {
         let green = [UInt8]([0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255])
         harness.executeExpectingSuccess([
             ["op": "createTexture", "id": 1, "size": ["width": 2, "height": 2], "format": "rgba8unorm",
@@ -553,6 +556,8 @@ final class CommandInterpreterTests: XCTestCase {
                 "clearValue": ["r": 1, "g": 0, "b": 0, "a": 1],
             ]]],
             ["op": "endPass"],
+        ])
+        harness.executeExpectingSuccess([
             // `queue.writeTexture` has no 256 limit — the tight 8B rows go up as they are.
             ["op": "writeTexture", "texture": 1, "data": Data(green).base64EncodedString(),
              "size": ["width": 2, "height": 2], "bytesPerRow": 8],
@@ -566,8 +571,133 @@ final class CommandInterpreterTests: XCTestCase {
         let bytes = Array(try harness.readBufferSync(handle: 3))
         XCTAssertEqual(
             packedRows(bytes, rowBytes: 8, rows: 2), green,
-            "the writeTexture later in the stream must be the final content"
+            "the upload must land after the earlier submit's render pass"
         )
+    }
+
+    /// In **one** batch a render pass paints red and a writeTexture **later in the stream** uploads green.
+    /// The batch's encoder work is one submit at the batch's end, so the queue write lands first and
+    /// the pass's clear is the final content — the browser and Dawn order of
+    /// `writeTexture(…); queue.submit([cb])` with the pass recorded into `cb` before the call.
+    func test_writeTextureLandsBeforeTheEncoderWorkOfItsOwnBatch() throws {
+        let green = [UInt8]([0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255])
+        let red = [UInt8]([255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255])
+        harness.executeExpectingSuccess([
+            ["op": "createTexture", "id": 1, "size": ["width": 2, "height": 2], "format": "rgba8unorm",
+             "usage": TestUsage.renderAttachment | TestUsage.textureCopyDst | TestUsage.textureCopySrc],
+            ["op": "createTextureView", "id": 2, "texture": 1],
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 2, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 1, "g": 0, "b": 0, "a": 1],
+            ]]],
+            ["op": "endPass"],
+            ["op": "writeTexture", "texture": 1, "data": Data(green).base64EncodedString(),
+             "size": ["width": 2, "height": 2], "bytesPerRow": 8],
+            ["op": "createBuffer", "id": 3, "size": 512, "usage": TestUsage.copyDst | TestUsage.mapRead],
+            ["op": "copyTextureToBuffer",
+             "source": ["texture": 1],
+             "destination": ["buffer": 3, "bytesPerRow": Self.copyRowStride],
+             "copySize": ["width": 2, "height": 2]],
+        ])
+
+        let bytes = Array(try harness.readBufferSync(handle: 3))
+        XCTAssertEqual(
+            packedRows(bytes, rowBytes: 8, rows: 2), red,
+            "the queue write precedes the batch's command buffer, so the pass's clear wins"
+        )
+    }
+
+    /// A fragment shader painting the color held in a uniform — for the open-pass write tests below.
+    private static let uniformColorShader = """
+    struct Tint { color: vec4f };
+    @group(0) @binding(0) var<uniform> tint: Tint;
+
+    @vertex
+    fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+        var positions = array<vec2f, 3>(
+            vec2f(-1.0, -1.0),
+            vec2f( 3.0, -1.0),
+            vec2f(-1.0,  3.0),
+        );
+        return vec4f(positions[index], 0.0, 1.0);
+    }
+
+    @fragment
+    fn fs_main() -> @location(0) vec4f {
+        return tint.color;
+    }
+    """
+
+    /// Resources for a full-screen draw whose color comes from uniform buffer 2 (initially red).
+    private func uniformColorSetup() -> [[String: Any]] {
+        let red: [Float] = [1, 0, 0, 1]
+        return [
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+            ["op": "createShaderModule", "id": 1, "code": Self.uniformColorShader],
+            ["op": "createBuffer", "id": 2, "size": 16,
+             "usage": TestUsage.uniform | TestUsage.copyDst, "data": red.base64],
+            ["op": "createRenderPipeline", "id": 3, "layout": "auto",
+             "vertex": ["module": 1, "entryPoint": "vs_main"],
+             "fragment": ["module": 1, "entryPoint": "fs_main", "targets": [["format": "rgba8unorm"]]]],
+            ["op": "getBindGroupLayout", "id": 4, "pipeline": 3, "index": 0],
+            ["op": "createBindGroup", "id": 5, "layout": 4,
+             "entries": [["binding": 0, "resource": ["buffer": 2]]]],
+            ["op": "getCurrentTexture", "id": 10, "canvas": "test"],
+            ["op": "createTextureView", "id": 11, "texture": 10],
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 11, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 0, "g": 0, "b": 0, "a": 1],
+            ]]],
+        ]
+    }
+
+    /// The everyday per-object loop — `queue.writeBuffer(uniform); pass.setBindGroup(); pass.draw()`
+    /// with the pass still recording. A queue operation is legal at any moment; it used to be rejected
+    /// as "copy and upload commands cannot be used inside a render/compute pass".
+    func test_aWriteBufferWhileARenderPassIsOpenIsAcceptedAndSeenByTheDraw() throws {
+        let green: [Float] = [0, 1, 0, 1]
+        harness.executeExpectingSuccess(uniformColorSetup() + [
+            ["op": "writeBuffer", "buffer": 2, "data": green.base64],
+            ["op": "setPipeline", "pipeline": 3],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 5],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+        ])
+
+        try harness.assertPixel(x: 4, y: 4, equals: (0, 255, 0, 255), "the draw sees the written uniform")
+    }
+
+    /// A draw **recorded before** the write but submitted after it sees the **new** value — the pass is
+    /// still recording, so its command buffer is necessarily submitted after the write (spec queue
+    /// timeline; what browsers and Dawn do). Stream order would have painted red.
+    func test_aDrawRecordedBeforeAnOpenPassWriteSeesTheNewValue() throws {
+        let green: [Float] = [0, 1, 0, 1]
+        harness.executeExpectingSuccess(uniformColorSetup() + [
+            ["op": "setPipeline", "pipeline": 3],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 5],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "writeBuffer", "buffer": 2, "data": green.base64],
+            ["op": "endPass"],
+        ])
+
+        try harness.assertPixel(
+            x: 4, y: 4, equals: (0, 255, 0, 255), "the write lands before the pass is submitted"
+        )
+    }
+
+    /// Queue writes keep **call order among themselves** wherever the pass state stood when they were
+    /// issued — a write outside a pass and a later one inside a pass, to the same bytes, leave the
+    /// later value.
+    func test_queueWritesKeepCallOrderAcrossAnOpenPass() throws {
+        harness.executeExpectingSuccess([
+            ["op": "createBuffer", "id": 1, "size": 16, "usage": TestUsage.copyDst | TestUsage.mapRead],
+            ["op": "writeBuffer", "buffer": 1, "data": [Float]([1, 2, 3, 4]).base64],
+            ["op": "beginComputePass"],
+            ["op": "writeBuffer", "buffer": 1, "data": [Float]([5, 6, 7, 8]).base64],
+            ["op": "endPass"],
+        ])
+
+        XCTAssertEqual(try harness.readBufferSync(handle: 1, as: Float.self), [5, 6, 7, 8])
     }
 
     func test_writeTextureUploadsArrayTextureLayersSliceBySlice() throws {
@@ -735,7 +865,8 @@ final class CommandInterpreterTests: XCTestCase {
         let result = harness.execute([
             ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
             ["op": "createBuffer", "id": 1, "size": 16, "usage": TestUsage.copyDst],
-            // Outside a pass — it attaches to the command buffer. writeBuffer opens a blit encoder.
+            // Outside a pass — it attaches to the command buffer. (writeBuffer rides the separate
+            // queue-write command buffer — not a scope.)
             ["op": "pushDebugGroup", "groupLabel": "upload"],
             ["op": "writeBuffer", "buffer": 1, "data": [Float](repeating: 1, count: 4).base64],
             ["op": "insertDebugMarker", "markerLabel": "marker"],

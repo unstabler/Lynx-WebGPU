@@ -503,13 +503,19 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         }
     }
 
-    /// Copies and uploads only outside a pass — they are command-encoder-level commands (and the JS
+    /// Encoder copies only outside a pass — they are command-encoder-level commands (and the JS
     /// shim only sends them that way). On a natively-validating backend the backend's validator
-    /// catches it (encoder copies — at Dawn's Finish).
+    /// catches it (at Dawn's Finish).
+    ///
+    /// **Queue uploads (`writeBuffer`/`writeTexture`/`copyExternalImageToTexture`) must not call
+    /// this.** They are `GPUQueue` operations, legal at any moment — including while a pass encoder is
+    /// still recording (`queue.writeBuffer(u); pass.setBindGroup(…); pass.draw()` per object is the
+    /// everyday loop). Their ordering is the backend's job: they take effect on the queue timeline
+    /// before the batch's encoder work (`WGPUBackend.writeBuffer`).
     private func requireNoOpenPass() throws {
         guard specValidation else { return }
         guard passState == nil else {
-            throw WGPUError.validation("copy and upload commands cannot be used inside a render/compute pass")
+            throw WGPUError.validation("copy commands cannot be used inside a render/compute pass")
         }
     }
 
@@ -562,7 +568,6 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             }
         }
         guard !data.isEmpty else { return }   // a zero-size write is a no-op
-        try requireNoOpenPass()
         try backend.writeBuffer(target.raw, offset: offset, data: data)
     }
 
@@ -685,7 +690,6 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
                 throw WGPUError.validation("writeTexture data is too short (\(data.count)B, at least \(required)B needed)")
             }
         }
-        try requireNoOpenPass()
         try backend.writeTexture(
             target.raw, data: data, origin: command.origin, size: size,
             mipLevel: command.mipLevel, bytesPerRow: bytesPerRow, rowsPerImage: rowsPerImage
@@ -791,7 +795,6 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             }
         }
 
-        try requireNoOpenPass()
         try backend.writeTexture(
             target.raw, data: slice,
             origin: command.destination.origin,

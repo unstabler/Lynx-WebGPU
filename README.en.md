@@ -147,8 +147,9 @@ The measurement harness ships in the repo, so the numbers can be re-taken anytim
   alpha blending, compute + readback, texture sampling, edge-clamp sampling, depth testing).
   `rgba16float` surfaces are read back and checked that **values above 1.0 and below 0 survive** — the
   evidence that HDR results are never crushed to 8 bits.
-- Command stream contracts are asserted too — that `writeTexture` executes **after** an earlier render pass
-  in the same batch (queue order), that the staging pool stops growing across frames, that the in-flight
+- Command stream contracts are asserted too — that queue writes execute **after** an earlier submitted
+  render pass and **before** their own batch's encoder work (queue timeline — accepted even while a pass
+  is open), that the staging pool stops growing across frames, that the in-flight
   counter rises and falls with commit/completion.
 - Values the runtime slips into shaders behind the scenes (like `arrayLength()`) are read back from the GPU
   and **asserted as numbers**.

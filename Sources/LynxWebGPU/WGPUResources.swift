@@ -213,12 +213,14 @@ public final class WGPUTextureObject {
         self.isDrawable = true
     }
 
-    /// Encodes the blit copying staging buffer CPU data into a texture **onto the frame command buffer**.
+    /// Encodes the blit copying staging buffer CPU data into a texture **onto the batch's upload
+    /// command buffer** (`WGPUMetalBackend.uploadCommandBuffer`).
     ///
-    /// The old approach of making its own command buffer and waiting for it to finish (1) stalled the
-    /// JS thread until the GPU drained on every call and (2) ran **before** the not-yet-committed frame
-    /// buffer, breaking stream order. Commit order on one queue is execution order, so riding the frame
-    /// blit solves both.
+    /// The old approach of making its own command buffer and waiting for it to finish stalled the JS
+    /// thread until the GPU drained on every call. The upload buffer is committed without waiting,
+    /// ahead of the batch's encoder work — commit order on one queue is execution order, so the write
+    /// lands after earlier batches and before the commands submitted with this batch (the spec's
+    /// queue-timeline order for `queue.writeTexture`).
     func encodeWrite(
         from staging: MTLBuffer,
         origin: WGPUOrigin3D,

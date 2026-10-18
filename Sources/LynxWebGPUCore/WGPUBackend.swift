@@ -143,6 +143,20 @@ public protocol WGPUBackend: AnyObject {
     // MARK: - Resources
 
     func makeBuffer(_ descriptor: WGPUBufferDescriptor) throws -> Buffer
+
+    /// `queue.writeBuffer` — a **queue** operation, not an encoder one.
+    ///
+    /// - It can arrive **while a pass is open** (the engine does not reject it — the spec allows a
+    ///   queue write at any moment, and a hand-written stream may interleave one with pass commands).
+    /// - Its effect lands on the queue timeline **before this batch's encoder work** (passes, copies,
+    ///   resolves — the batch's command buffer, submitted at the end of the batch), and in call order
+    ///   relative to the other queue writes (`writeTexture` included). This is the spec order
+    ///   `queue.writeBuffer(…); queue.submit([cb])` produces — even for commands recorded into `cb`
+    ///   before the write — and the shape of every batch the JS shim sends (queue ops at call time,
+    ///   the submit's command buffers at the end).
+    ///
+    /// Metal: a separate upload command buffer committed ahead of the batch's command buffer.
+    /// Dawn: `wgpuQueueWriteBuffer`, already on the queue timeline.
     func writeBuffer(_ buffer: Buffer, offset: Int, data: Data) throws
 
     /// `unmap()` — the wire mapping state is the engine's; only a backend with **real mapping**
@@ -159,6 +173,8 @@ public protocol WGPUBackend: AnyObject {
     /// Uploads CPU data into a texture — `writeTexture` and `copyExternalImageToTexture` converge
     /// here (for the latter the engine finishes decoding, cropping and flipY and passes pixels only).
     /// Omitted defaults for `bytesPerRow`/`rowsPerImage` arrive already filled in by the engine.
+    /// A queue operation with the same ordering contract as `writeBuffer` (allowed inside an open
+    /// pass, lands before the batch's encoder work, in call order with the other queue writes).
     func writeTexture(_ texture: Texture, data: Data, origin: WGPUOrigin3D, size: WGPUExtent3D,
                       mipLevel: Int, bytesPerRow: Int, rowsPerImage: Int) throws
 
