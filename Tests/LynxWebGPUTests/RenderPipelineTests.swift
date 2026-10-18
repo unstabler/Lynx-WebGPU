@@ -500,6 +500,92 @@ final class RenderPipelineTests: XCTestCase {
         XCTAssertEqual(Array(lengths.prefix(3)), [10, 3, 2])
     }
 
+    /// A compute pass that follows a render pass **in the same batch** binds with its own pipeline's layout.
+    ///
+    /// The backend used to pick the layout as "the render pipeline if one is set, else the compute
+    /// one", and the render pipeline survived its pass until the next batch. So the compute pass's
+    /// groups were mapped through the render layout — here that layout has no @group(0) @binding(1),
+    /// so the dispatch was dropped with a bogus validation error (with matching binding numbers it
+    /// would instead have bound the wrong Metal indices silently).
+    func test_aComputePassAfterARenderPassInOneBatchUsesTheComputeLayout() throws {
+        let renderShader = """
+        struct Tint { color: vec4f };
+        @group(0) @binding(0) var<uniform> tint: Tint;
+
+        @vertex
+        fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+            var positions = array<vec2f, 3>(
+                vec2f(-1.0, -1.0),
+                vec2f( 3.0, -1.0),
+                vec2f(-1.0,  3.0),
+            );
+            return vec4f(positions[index], 0.0, 1.0);
+        }
+
+        @fragment
+        fn fs_main() -> @location(0) vec4f {
+            return tint.color;
+        }
+        """
+        let computeShader = """
+        @group(0) @binding(0) var<storage, read> input: array<f32>;
+        @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+        @compute @workgroup_size(4)
+        fn double_values(@builtin(global_invocation_id) id: vec3u) {
+            output[id.x] = input[id.x] * 2.0;
+        }
+        """
+        let tint: [Float] = [0.0, 1.0, 0.0, 1.0]   // green
+        let input: [Float] = [1, 2, 3, 4, 5, 6, 7, 8]
+
+        harness.executeExpectingSuccess([
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+            ["op": "createShaderModule", "id": 1, "code": renderShader],
+            ["op": "createShaderModule", "id": 2, "code": computeShader],
+            ["op": "createBuffer", "id": 3, "size": 16,
+             "usage": TestUsage.uniform | TestUsage.copyDst, "data": tint.base64],
+            ["op": "createBuffer", "id": 4, "usage": TestUsage.storage | TestUsage.copyDst,
+             "data": input.base64],
+            ["op": "createBuffer", "id": 5, "size": 32,
+             "usage": TestUsage.storage | TestUsage.copySrc],
+            ["op": "createRenderPipeline", "id": 6, "layout": "auto",
+             "vertex": ["module": 1, "entryPoint": "vs_main"],
+             "fragment": ["module": 1, "entryPoint": "fs_main", "targets": [["format": "rgba8unorm"]]]],
+            ["op": "getBindGroupLayout", "id": 7, "pipeline": 6, "index": 0],
+            ["op": "createBindGroup", "id": 8, "layout": 7,
+             "entries": [["binding": 0, "resource": ["buffer": 3]]]],
+            ["op": "createComputePipeline", "id": 9, "layout": "auto",
+             "compute": ["module": 2, "entryPoint": "double_values"]],
+            ["op": "getBindGroupLayout", "id": 10, "pipeline": 9, "index": 0],
+            ["op": "createBindGroup", "id": 11, "layout": 10, "entries": [
+                ["binding": 0, "resource": ["buffer": 4]],
+                ["binding": 1, "resource": ["buffer": 5]],
+            ]],
+            ["op": "getCurrentTexture", "id": 20, "canvas": "test"],
+            ["op": "createTextureView", "id": 21, "texture": 20],
+            // Render first — leaves a render pipeline behind in the backend.
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 21, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 0.0, "g": 0.0, "b": 0.0, "a": 1.0],
+            ]]],
+            ["op": "setPipeline", "pipeline": 6],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 8],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+            // Then compute, in the same batch.
+            ["op": "beginComputePass"],
+            ["op": "setPipeline", "pipeline": 9],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 11],
+            ["op": "dispatchWorkgroups", "x": 2],
+            ["op": "endPass"],
+        ])
+
+        try harness.assertPixel(x: 32, y: 32, equals: (0, 255, 0, 255), "the render pass still draws")
+        let output = try harness.readBufferSync(handle: 5, as: Float.self, size: 32)
+        XCTAssertEqual(output, [2, 4, 6, 8, 10, 12, 14, 16])
+    }
+
     // MARK: - Textures
 
     func test_textureSamplingWorks() throws {
