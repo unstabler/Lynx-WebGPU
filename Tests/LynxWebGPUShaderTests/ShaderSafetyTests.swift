@@ -331,4 +331,155 @@ final class ShaderSafetyTests: XCTestCase {
         XCTAssertTrue(msl.contains("wgpu_loop_guard_1"), "\(msl)")
         XCTAssertTrue(msl.contains("wgpu_loop_guard_2"), "guard names of nested loops collide\n\(msl)")
     }
+
+    // MARK: - Builtin argument counts
+
+    /// The shader source comes from the bundle, so a builtin with missing arguments is **untrusted input**.
+    /// Lowerings that pick arguments out by position used to index past the end — a Swift trap that
+    /// killed the host process. It must be an ordinary compile error instead.
+    private func assertRejected(
+        _ source: String,
+        entryPoints: [String],
+        mentioning callee: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        do {
+            let module = try WGSLShaderModule(source: source)
+            let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: entryPoints))
+            XCTAssertThrowsError(
+                try module.translateToMSL(entryPoints: entryPoints, bindings: bindings), file: file, line: line
+            ) { error in
+                let error = error as? WGPUError
+                XCTAssertEqual(error?.kind, .validation, "\(String(describing: error))", file: file, line: line)
+                XCTAssertTrue(
+                    error?.message.contains("\(callee)()") == true,
+                    "the error must name the builtin: \(String(describing: error))", file: file, line: line
+                )
+            }
+        } catch {
+            XCTFail("must parse and fail at translation, not \(error)", file: file, line: line)
+        }
+    }
+
+    func test_atomicsAndQuantizeWithMissingArgumentsAreCompileErrors() {
+        let header = """
+        @group(0) @binding(0) var<storage, read_write> counter: atomic<u32>;
+        @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+        """
+        let calls = [
+            ("atomicLoad", "out[0] = f32(atomicLoad());"),
+            ("atomicStore", "atomicStore(&counter);"),
+            ("atomicExchange", "out[0] = f32(atomicExchange(&counter));"),
+            ("atomicAdd", "out[0] = f32(atomicAdd(&counter));"),
+            ("quantizeToF16", "out[0] = quantizeToF16();"),
+        ]
+        for (callee, statement) in calls {
+            assertRejected("""
+            \(header)
+            @compute @workgroup_size(1) fn cs() { \(statement) }
+            """, entryPoints: ["cs"], mentioning: callee)
+        }
+    }
+
+    /// Every builtin in the arity table, one short and one long — the table is the only guard in
+    /// front of the positional lowerings, so an entry that is too permissive shows up here as a trap.
+    func test_everyPositionalBuiltinRejectsAWrongArgumentCount() {
+        for (callee, arity) in MSLTypeMapping.builtinArities.sorted(by: { $0.key < $1.key }) {
+            var counts = [arity.upperBound + 1]
+            if arity.lowerBound > 0 { counts.append(arity.lowerBound - 1) }
+            for count in counts {
+                let arguments = Array(repeating: "1.0", count: count).joined(separator: ", ")
+                assertRejected("""
+                @compute @workgroup_size(1) fn cs() { \(callee)(\(arguments)); }
+                """, entryPoints: ["cs"], mentioning: callee)
+            }
+        }
+    }
+
+    func test_wellFormedAtomicCallsStillTranslate() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var<storage, read_write> counter: atomic<u32>;
+        @group(0) @binding(1) var<storage, read_write> out: array<u32>;
+        @compute @workgroup_size(1) fn cs() {
+            atomicStore(&counter, 1u);
+            let added = atomicAdd(&counter, 2u);
+            let swapped = atomicExchange(&counter, 3u);
+            out[0] = atomicLoad(&counter) + added + swapped;
+        }
+        """, entryPoints: ["cs"])
+        XCTAssertTrue(msl.contains("atomic_store_explicit(&counter, 1u, memory_order_relaxed)"), msl)
+        XCTAssertTrue(msl.contains("atomic_fetch_add_explicit(&counter, 2u, memory_order_relaxed)"), msl)
+        XCTAssertTrue(msl.contains("atomic_exchange_explicit(&counter, 3u, memory_order_relaxed)"), msl)
+        XCTAssertTrue(msl.contains("atomic_load_explicit(&counter, memory_order_relaxed)"), msl)
+    }
+
+    func test_wellFormedQuantizeAndBitcastStillTranslate() throws {
+        let msl = try translate("""
+        @fragment fn fs() -> @location(0) vec4f {
+            let q = quantizeToF16(1.5);
+            let bits = bitcast<f32>(1065353216u);
+            return vec4f(q, bits, 0.0, 1.0);
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("float(half(1.5))"), msl)
+        XCTAssertTrue(msl.contains("as_type<float>(1065353216u)"), msl)
+    }
+
+    func test_wellFormedTextureCallsAtTheirLowerArityBoundsStillTranslate() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var tex: texture_2d<f32>;
+        @group(0) @binding(1) var samp: sampler;
+        @group(0) @binding(2) var depth: texture_depth_2d;
+        @group(0) @binding(3) var cmp: sampler_comparison;
+        @fragment fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+            let biased = textureSampleBias(tex, samp, uv, 0.5);
+            let graded = textureSampleGrad(tex, samp, uv, vec2f(0.01, 0.0), vec2f(0.0, 0.01));
+            let shadow = textureSampleCompare(depth, cmp, uv, 0.5);
+            let levels = textureNumLevels(tex);
+            let size = textureDimensions(tex, 0);
+            return biased + graded + vec4f(shadow, f32(levels), f32(size.x), 1.0);
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("tex.sample(samp, uv, bias(0.5))"), msl)
+        XCTAssertTrue(msl.contains("tex.sample(samp, uv, gradient2d("), msl)
+        XCTAssertTrue(msl.contains("depth.sample_compare(cmp, uv, 0.5)"), msl)
+        XCTAssertTrue(msl.contains("tex.get_num_mip_levels()"), msl)
+    }
+
+    /// The table's risk is at the **upper** bounds — an arrayed texture plus an offset is the longest form of each family.
+    /// The sampling assertions stop before the closing parenthesis on purpose: the emitter accepts the trailing
+    /// `offset` but does not emit it yet, and this test pins the arity bounds, not that omission.
+    func test_wellFormedTextureCallsAtTheirUpperArityBoundsStillTranslate() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var arr: texture_2d_array<f32>;
+        @group(0) @binding(1) var samp: sampler;
+        @group(0) @binding(2) var depths: texture_depth_2d_array;
+        @group(0) @binding(3) var cmp: sampler_comparison;
+        @fragment fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+            let a = textureSample(arr, samp, uv, 0, vec2i(1, 1));
+            let b = textureSampleBias(arr, samp, uv, 0, 0.5, vec2i(1, 1));
+            let c = textureSampleLevel(arr, samp, uv, 0, 0.0, vec2i(1, 1));
+            let d = textureSampleGrad(arr, samp, uv, 0, vec2f(0.01, 0.0), vec2f(0.0, 0.01), vec2i(1, 1));
+            let e = textureSampleCompare(depths, cmp, uv, 0, 0.5, vec2i(1, 1));
+            let f = textureSampleCompareLevel(depths, cmp, uv, 0, 0.5, vec2i(1, 1));
+            let g = textureLoad(arr, vec2i(0, 0), 0, 0);
+            return a + b + c + d + g + vec4f(e, f, 0.0, 1.0);
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("arr.sample(samp, uv, 0"), msl)
+        XCTAssertTrue(msl.contains("arr.sample(samp, uv, 0, bias(0.5)"), msl)
+        XCTAssertTrue(msl.contains("arr.sample(samp, uv, 0, level(0.0)"), msl)
+        XCTAssertTrue(msl.contains("arr.sample(samp, uv, 0, gradient2d("), msl)
+        XCTAssertTrue(msl.contains("depths.sample_compare(cmp, uv, 0, 0.5"), msl)
+        XCTAssertTrue(msl.contains("arr.read(uint2("), msl)
+
+        let store = try translate("""
+        @group(0) @binding(0) var layers: texture_storage_2d_array<rgba8unorm, write>;
+        @compute @workgroup_size(1) fn cs() {
+            textureStore(layers, vec2i(0, 0), 1, vec4f(1.0, 0.0, 0.0, 1.0));
+        }
+        """, entryPoints: ["cs"])
+        XCTAssertTrue(store.contains("layers.write("), store)
+    }
 }

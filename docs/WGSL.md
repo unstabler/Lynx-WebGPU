@@ -259,6 +259,10 @@ WGSL에는 값이 정해져 있는데 MSL(C++)에서는 **정의되지 않은 �
   프렐류드의 `wgpu_aint<N>` 대역이 그 결정을 C++ 오버로드 해석에 넘긴다 (§2-1).
   단 대역 값을 **Metal 내장 함수에 그대로 넘기는 자리**(`normalize(vec3(1))`)는 타입 추론이
   걸릴 수 있다. 그럴 때는 `vec3f(1)`처럼 성분 타입을 적으면 된다.
+- 인자를 **자리로 골라 옮기는** 내장 함수(`atomic*` · `texture*` · `bitcast` · `arrayLength` ·
+  `quantizeToF16` · 배리어)는 방출 전에 인자 개수를 명세 범위와 대조한다
+  (`MSLTypeMapping.builtinArities`). 어긋나면 `"WGSL: atomicLoad() expects 1 argument, got 0"`
+  같은 검증 오류로 파이프라인 생성이 실패한다 — 셰이더 소스는 번들이 주는 값이므로 호스트가 죽으면 안 된다.
 - 여기 표에 없는 내장 함수는 **이름 그대로 통과**한다. MSL에 같은 이름이 없으면 파이프라인 생성 시
   "MSL compilation failed" 오류와 함께 생성된 MSL 전문이 나온다.
 
