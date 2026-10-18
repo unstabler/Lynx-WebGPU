@@ -545,6 +545,311 @@ final class WGSLTranspilerTests: XCTestCase {
         MetalCompilerHarness.assertCompiles(msl)
     }
 
+    // MARK: - Pipeline constant conversion (WebIDL semantics, never a trap)
+
+    private static let overrideTypesShader = """
+    enable f16;
+    override n: u32 = 1;
+    override k: i32 = 1;
+    override s: f32 = 1.0;
+    override h: f16 = 1.0h;
+    override flag: bool = false;
+    override untypedInt = 1;
+    override untypedFloat = 0.5;
+
+    @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+
+    @compute @workgroup_size(1)
+    fn main() {
+        var v = f32(n) + f32(k) + s + f32(h) + f32(untypedInt) + untypedFloat;
+        if (flag) { v = -v; }
+        out[0] = v;
+    }
+    """
+
+    private func translateOverrides(_ constants: [String: Double]) throws -> String {
+        let module = try WGSLShaderModule(source: Self.overrideTypesShader)
+        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["main"]))
+        return try module.translateToMSL(entryPoints: ["main"], bindings: bindings, constants: constants)
+    }
+
+    func test_pipelineConstantsAtTheEdgeOfTheirTypeAreAccepted() throws {
+        let msl = try translateOverrides([
+            "n": 4_294_967_295, "k": -2_147_483_648, "s": 1e30, "h": 65504, "flag": 2,
+            "untypedInt": 2_147_483_647, "untypedFloat": 2,
+        ])
+        XCTAssertTrue(msl.contains("4294967295u"), "u32 max must be planted as an unsigned literal:\n\(msl)")
+        // `-2147483648` would be `-(2147483648)` in C++ — not an int literal. Spelled like the prelude.
+        XCTAssertTrue(msl.contains("int k = (-2147483647 - 1);"), msl)
+        XCTAssertTrue(msl.contains("1e+30"), msl)
+        XCTAssertTrue(msl.contains("half h = 65504.0"), msl)
+        XCTAssertTrue(msl.contains("bool flag = true"), "a nonzero number is true:\n\(msl)")
+        XCTAssertTrue(msl.contains("2147483647"), msl)
+        // `override untypedFloat = 0.5;` is f32 — supplying the integral `2` must not turn it into an int.
+        XCTAssertTrue(msl.contains("float untypedFloat = 2.0"), "the untyped f32 override lost its type:\n\(msl)")
+        MetalCompilerHarness.assertCompiles(msl)
+    }
+
+    func test_pipelineConstantFractionsAreTruncatedForIntegerOverrides() throws {
+        // [EnforceRange] truncates toward zero rather than rejecting a fraction.
+        let msl = try translateOverrides(["n": 7.9, "k": -3.7, "untypedInt": 5.5])
+        XCTAssertTrue(msl.contains("uint n = 7u"), msl)
+        XCTAssertTrue(msl.contains("int k = -3"), msl)
+        XCTAssertTrue(msl.contains("int untypedInt = 5"), msl)
+        MetalCompilerHarness.assertCompiles(msl)
+    }
+
+    func test_pipelineConstantsTheTypeCannotHoldAreValidationErrors() throws {
+        // Each of these used to reach `Int(value)` (or plant `inf`/`nan` text) — a trap kills the host.
+        let rejected: [(name: String, value: Double)] = [
+            ("n", 1e30), ("n", .infinity), ("n", -1), ("n", 4_294_967_296), ("n", .nan),
+            ("k", 2_147_483_648), ("k", -2_147_483_649), ("k", -.infinity), ("k", .nan),
+            ("s", .infinity), ("s", .nan), ("s", 1e39),
+            // f16 follows Dawn: |value| ≤ 65504 (65510 would still round to 65504, but Dawn rejects it).
+            ("h", 65510), ("h", -65504.5), ("h", -1e6),
+            // The untyped `override untypedInt = 1;` is i32.
+            ("untypedInt", 1e30), ("untypedInt", .infinity),
+            ("untypedFloat", .infinity),
+        ]
+        for (name, value) in rejected {
+            XCTAssertThrowsError(try translateOverrides([name: value]), "\(name) = \(value) was accepted") { error in
+                let error = error as? WGPUError
+                XCTAssertEqual(error?.kind, .validation, "\(name) = \(value): \(String(describing: error))")
+                XCTAssertTrue(
+                    error?.message.contains("'\(name)'") == true,
+                    "it must name the constant: \(String(describing: error))"
+                )
+            }
+        }
+    }
+
+    func test_untypedOverridesTakeTheirTypeFromBuiltinsAndShifts() throws {
+        // An integral value supplied to an f32 override must stay a float — planted as `4`, MSL would
+        // infer `int` and `a / 4` would become integer division.
+        let source = """
+        override a = max(0.5, 1.0);
+        override b = min(1, 2.0);
+        override c = abs(-3);
+        override d = clamp(1u, 0u, 4u);
+        override e = select(0.5, 1.0, true);
+        override f = pow(2.0, 3.0);
+        override g = sqrt(4);
+        override sh = 1 << 2u;
+        override unknown = vec2(1.0, 2.0).x;
+
+        @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            out[0] = a / 4 + b + f32(c) + f32(d) + e + f + g + f32(sh) + unknown / 4;
+        }
+        """
+        let module = try WGSLShaderModule(source: source)
+        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["main"]))
+        let names = ["a", "b", "c", "d", "e", "f", "g", "sh", "unknown"]
+        let msl = try module.translateToMSL(
+            entryPoints: ["main"], bindings: bindings,
+            constants: Dictionary(uniqueKeysWithValues: names.map { ($0, 4.0) })
+        )
+        for expected in [
+            "float a = 4.0", "float b = 4.0", "int c = 4;", "uint d = 4u", "float e = 4.0",
+            "float f = 4.0", "float g = 4.0", "int sh = 4;",
+            // Member access takes the vector's component type (`vec2(1.0, 2.0)` is a vec2<f32>).
+            "float unknown = 4.0",
+        ] {
+            XCTAssertTrue(msl.contains(expected), "missing `\(expected)`:\n\(msl)")
+        }
+        MetalCompilerHarness.assertCompiles(msl)
+
+        // The f32 fallback still rejects what f32 cannot hold.
+        XCTAssertThrowsError(try module.translateToMSL(
+            entryPoints: ["main"], bindings: bindings,
+            constants: Dictionary(uniqueKeysWithValues: names.map { ($0, $0 == "unknown" ? 1e39 : 4.0) })
+        )) { error in
+            XCTAssertEqual((error as? WGPUError)?.kind, .validation)
+        }
+    }
+
+    func test_untypedIntegerAndBoolOverridesKeepTheirTypeThroughBuiltinsAndAccess() throws {
+        // The f32 fallback is only for initializers that cannot be typed — integer and bool builtins,
+        // bitcast, and member/index access on typed vectors and arrays must keep their real type.
+        let source = """
+        alias Count = u32;
+        alias Count2 = Count;
+        const lanes: vec2<u32> = vec2<u32>(1u, 2u);
+        override bits = countOneBits(7u);
+        override lead = firstLeadingBit(8);
+        override bc = bitcast<u32>(1.0);
+        override every = all(vec2(true, true));
+        override packed = pack4x8unorm(vec4f(0.0));
+        override dp = dot(vec2i(1, 2), vec2i(3, 4));
+        override len = length(vec2f(3.0, 4.0));
+        override mx = vec2i(1, 2).x;
+        override el = array<u32, 2>(1u, 2u)[1];
+        override lane = lanes.y;
+        override sum = 1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1;
+        override chained: Count2 = 1u;
+
+        @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            var v = f32(bits + bc + packed + el + lane + chained) + f32(lead + dp + mx + sum) + len;
+            if (every) { v = -v; }
+            out[0] = v;
+        }
+        """
+        let module = try WGSLShaderModule(source: source)
+        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["main"]))
+        let names = ["bits", "lead", "bc", "every", "packed", "dp", "len", "mx", "el", "lane", "sum", "chained"]
+        let msl = try module.translateToMSL(
+            entryPoints: ["main"], bindings: bindings,
+            constants: Dictionary(uniqueKeysWithValues: names.map { ($0, 4.0) })
+        )
+        for expected in [
+            "uint bits = 4u;", "int lead = 4;", "uint bc = 4u;", "bool every = true;", "uint packed = 4u;",
+            "int dp = 4;", "float len = 4.0;", "int mx = 4;", "uint el = 4u;", "uint lane = 4u;",
+            // A 20-term sum nests 19 binaries deep — still typed, not dropped to the f32 fallback.
+            "int sum = 4;",
+            "chained = 4u;",
+        ] {
+            XCTAssertTrue(msl.contains(expected), "missing `\(expected)`:\n\(msl)")
+        }
+        MetalCompilerHarness.assertCompiles(msl)
+
+        // The alias chain resolves to u32, so the u32 range check applies.
+        XCTAssertThrowsError(try module.translateToMSL(
+            entryPoints: ["main"], bindings: bindings,
+            constants: Dictionary(uniqueKeysWithValues: names.map { ($0, $0 == "chained" ? -1 : 4.0) })
+        )) { error in
+            let error = error as? WGPUError
+            XCTAssertEqual(error?.kind, .validation)
+            XCTAssertTrue(error?.message.contains("u32") == true, String(describing: error))
+        }
+    }
+
+    private func translateWithOverride(_ declarations: String, value: Double = 4) throws -> String {
+        let source = """
+        \(declarations)
+
+        @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            out[0] = f32(o);
+        }
+        """
+        let module = try WGSLShaderModule(source: source)
+        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["main"]))
+        return try module.translateToMSL(entryPoints: ["main"], bindings: bindings, constants: ["o": value])
+    }
+
+    func test_selfReferentialAliasesAndConstantsDoNotCrashOverrideTyping() {
+        // Invalid shaders, but user input: typing the override must terminate (these recursed until the
+        // stack overflowed). Either a graceful fallback or a thrown error is fine — not a crash.
+        let shapes = [
+            "alias A = array<A, 2>;\noverride o = bitcast<A>(1u);",
+            "alias A = array<A, 2>;\nconst c: A = A();\noverride o = c[0];",
+            "alias A = vec2<A>;\noverride o = bitcast<A>(1u);",
+            "alias A = atomic<A>;\noverride o = bitcast<A>(1u);",
+            "alias A = array<B, 2>;\nalias B = array<A, 2>;\noverride o = bitcast<A>(1u);",
+            "alias A = B;\nalias B = A;\noverride o: A = 1;",
+            "const a = a + 1;\noverride o = a;",
+            "const a = b;\nconst b = a;\noverride o = a;",
+        ]
+        for shape in shapes {
+            if let msl = try? translateWithOverride(shape, value: 1) {
+                XCTAssertTrue(msl.contains(" o = "), "the override must still be planted:\n\(msl)")
+            }
+        }
+    }
+
+    func test_overrideTypingIsLinearInConstantChains() throws {
+        // `x(k) = x(k-1) + x(k-1)` — without memoizing each constant's type this walks 2^30 nodes.
+        var declarations = ["const x0 = 1u;"]
+        for k in 1...30 { declarations.append("const x\(k) = x\(k - 1) + x\(k - 1);") }
+        declarations.append("override o = x30;")
+        let started = Date()
+        let msl = try translateWithOverride(declarations.joined(separator: "\n"))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5, "typing the override must not blow up")
+        XCTAssertTrue(msl.contains("uint o = 4u;"), msl)
+        MetalCompilerHarness.assertCompiles(msl)
+    }
+
+    func test_longAliasChainsDoNotOverflowASmallStack() {
+        // A 10k-link alias chain used to recurse once per link — signal 11 on a 512 KB stack (a JS
+        // thread's size), and O(n²) on top. Past the hop budget the override falls back gracefully.
+        var aliases = ["alias A0 = u32;"]
+        for k in 1..<10_000 { aliases.append("alias A\(k) = A\(k - 1);") }
+        let chain = aliases.joined(separator: "\n")
+
+        for declaration in ["override o: A9999 = 1u;", "override o = A9999(1u);"] {
+            let finished = DispatchSemaphore(value: 0)
+            let outcome = ThreadOutcome()
+            let source = chain + "\n" + declaration
+            let thread = Thread { [self] in
+                do { outcome.msl = try translateWithOverride(source, value: 1) } catch { outcome.error = error }
+                finished.signal()
+            }
+            thread.stackSize = 512 * 1024
+            thread.start()
+            XCTAssertEqual(finished.wait(timeout: .now() + 20), .success, "\(declaration) did not finish in time")
+            // Read only after the semaphore — the thread is done writing by then.
+            if let msl = outcome.msl {
+                XCTAssertTrue(msl.contains(" o = "), "the override must still be planted")
+            } else {
+                XCTAssertNotNil(outcome.error)
+            }
+        }
+    }
+
+    func test_aDepthCutOffIsNotMemoizedAsTheConstantsType() throws {
+        // `a` reaches `c` right at the depth limit, so `c` is typed only partially there. That partial
+        // nil must not be cached — `b = c` is a plain u32. Sweep around the limit so it stays meaningful.
+        for parens in 250...260 {
+            let nested = String(repeating: "(", count: parens) + "c" + String(repeating: ")", count: parens)
+            let source = """
+            const c = 1u;
+            override a = \(nested);
+            override b = c;
+
+            @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+
+            @compute @workgroup_size(1)
+            fn main() {
+                out[0] = f32(a) + f32(b);
+            }
+            """
+            let module = try WGSLShaderModule(source: source)
+            let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["main"]))
+            let msl = try module.translateToMSL(
+                entryPoints: ["main"], bindings: bindings, constants: ["a": 3, "b": 3]
+            )
+            XCTAssertTrue(msl.contains("uint b = 3u;"), "\(parens) parens poisoned b's type:\n\(msl)")
+            if parens == 255 { MetalCompilerHarness.assertCompiles(msl) }
+        }
+    }
+
+    func test_aStructNamedLikeAMatrixIsNotAMatrixConstructor() throws {
+        // `matter` is six letters starting with "mat" — it is a struct, not `mat2x2`-like. Its member is
+        // f32 even though the argument is an AbstractInt, so the override must not be pinned to int.
+        let msl = try translateWithOverride("struct matter { a: f32 };\noverride o = matter(1).a;")
+        XCTAssertTrue(msl.contains("float o = 4.0;"), msl)
+        MetalCompilerHarness.assertCompiles(msl)
+
+        let matrix = try translateWithOverride("override o = mat2x2(1, 2, 3, 4)[0][1];")
+        XCTAssertTrue(matrix.contains("int o = 4;"), "a real matrix constructor still types from its arguments:\n\(matrix)")
+    }
+
+    func test_pipelineBoolConstantFollowsIDLBoolean() throws {
+        // IDL `boolean`: 0, -0 and NaN are false.
+        for value in [0, -0.0, Double.nan] {
+            let msl = try translateOverrides(["flag": value])
+            XCTAssertTrue(msl.contains("bool flag = false"), "\(value):\n\(msl)")
+            MetalCompilerHarness.assertCompiles(msl)
+        }
+    }
+
     func test_enableDeclarationsAreIgnored() throws {
         let source = """
         enable f16;
@@ -1128,13 +1433,14 @@ final class WGSLTranspilerTests: XCTestCase {
         """
         let module = try WGSLShaderModule(source: source)
         let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["main"]))
-        for value in [-3.0, 0.0] {
+        // -3 does not reach the length check: a u32 override rejects it on conversion ([EnforceRange]).
+        for (value, reason) in [(-3.0, "cannot be converted to u32"), (0.0, "an array length must be positive")] {
             XCTAssertThrowsError(
                 try module.translateToMSL(entryPoints: ["main"], bindings: bindings, constants: ["N": value]),
                 "N = \(value)"
             ) { error in
                 let message = (error as? WGPUError)?.message ?? ""
-                XCTAssertTrue(message.contains("an array length must be positive"), message)
+                XCTAssertTrue(message.contains(reason), message)
             }
         }
 
@@ -1310,7 +1616,9 @@ final class WGSLTranspilerTests: XCTestCase {
         assertRejected("byOverride", constants: ["wy": 300], "300 exceeds maxComputeWorkgroupSizeY (256)")
         assertRejected("byOverride", constants: ["wx": 0], "must be at least 1")
         assertRejected("byOverride", constants: ["wx": -2], "must be at least 1")
-        assertRejected("byOverride", constants: ["wx": 2.5], "not an integer")
+        // `wx` is an i32, so 2.5 converts to 2 ([EnforceRange] truncates toward zero) — not an error.
+        let truncated = try XCTUnwrap(module.workgroupSize(of: "byOverride", constants: ["wx": 2.5]))
+        XCTAssertEqual([truncated.x, truncated.y, truncated.z], [2, 1, 1])
 
         // A device that advertises more lets more through — the backend passes its own limits.
         let generous = WGSLWorkgroupLimits(maxSizeX: 1024, maxSizeY: 1024, maxSizeZ: 1024, maxInvocations: 1024)
@@ -1359,4 +1667,10 @@ final class WGSLTranspilerTests: XCTestCase {
         // texture_external lowers to a sampleable 2D texture.
         XCTAssertTrue(msl.contains("texture2d<float>"), msl)
     }
+}
+
+/// What a worker thread produced — handed back through a semaphore, so the access is ordered.
+private final class ThreadOutcome: @unchecked Sendable {
+    var msl: String?
+    var error: Error?
 }

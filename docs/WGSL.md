@@ -174,6 +174,15 @@ device.createComputePipeline({
 값은 **MSL 방출 시점에 상수로 박힌다**. 배열 길이가 `override`에 걸린 경우까지 자연히 풀린다.
 기본값도 없고 `constants`로도 주지 않으면 파이프라인 생성이 명확한 오류로 실패한다.
 
+값은 명세대로 **`override`의 WGSL 타입으로 WebIDL 변환**한다 — `i32`/`u32`는 `[EnforceRange] long`/
+`unsigned long`(소수는 0 쪽으로 버리고, 범위 밖·`NaN`·`Infinity`는 거부), `f32`는 유한하고 f32로
+반올림해도 무한대가 아니어야 하며(`f16`은 그 위에 절댓값 65504 이하 — Dawn과 같은 기준), `bool`은
+0·`NaN`만 `false`다. 변환이 안 되는 값은 파이프라인 생성의 **검증 오류**가 된다. 타입 표기가 없는
+`override`는 초기식으로 타입이 정해진다 (`override s = 0.5;`는 f32 — `constants: { s: 2 }`를 줘도
+정수가 되지 않는다). 리터럴·연산·다른 상수·별칭 체인·내장 함수(`min`/`max`/`clamp`/`select`/`pow`,
+`countOneBits` 같은 비트 함수, `all`/`any`, `pack*`, `dot`/`length`, `bitcast<T>`)·벡터/배열의 멤버·인덱스 접근까지 읽고,
+그래도 타입을 알 수 없는 초기식이면 정수로 단정할 수 없으므로 **f32로 박는다**.
+
 `@workgroup_size`도 `override`를 받는다 (webgpu-samples `gameOfLife`의
 `@workgroup_size(blockSize, blockSize)`). 크기는 **`constants`를 적용한 모듈에서 파이프라인 생성 시점에**
 계산하고, 디스패치의 threadsPerThreadgroup과 `var<workgroup>` 0 초기화 루프의 보폭이 같은 값을 쓴다
