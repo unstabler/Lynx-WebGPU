@@ -109,7 +109,7 @@ public struct WGPUTexelCopyTextureInfo: WGPUCommandFields {
 
     public init(from reader: WGPUValueReader) throws {
         texture = try reader.requiredHandle("texture")
-        mipLevel = reader.int("mipLevel", default: 0)
+        mipLevel = try reader.int("mipLevel", default: 0)
         origin = try reader.origin("origin")
         path = reader.path
     }
@@ -128,9 +128,9 @@ public struct WGPUTexelCopyBufferInfo: WGPUCommandFields {
 
     public init(from reader: WGPUValueReader) throws {
         buffer = try reader.requiredHandle("buffer")
-        offset = reader.int("offset", default: 0)
-        bytesPerRow = reader.optionalInt("bytesPerRow")
-        rowsPerImage = reader.optionalInt("rowsPerImage")
+        offset = try reader.int("offset", default: 0)
+        bytesPerRow = try reader.optionalInt("bytesPerRow")
+        rowsPerImage = try reader.optionalInt("rowsPerImage")
         path = reader.path
     }
 }
@@ -147,7 +147,7 @@ public struct WGPUWriteBufferCommand: WGPUCommandFields {
     public init(from reader: WGPUValueReader) throws {
         buffer = try reader.requiredHandle("buffer")
         data = try reader.requiredData("data")
-        bufferOffset = reader.int("bufferOffset", default: 0)
+        bufferOffset = try reader.int("bufferOffset", default: 0)
         path = reader.path
     }
 }
@@ -166,11 +166,11 @@ public struct WGPUWriteTextureCommand: WGPUCommandFields {
     public init(from reader: WGPUValueReader) throws {
         texture = try reader.requiredHandle("texture")
         data = try reader.requiredData("data")
-        mipLevel = reader.int("mipLevel", default: 0)
+        mipLevel = try reader.int("mipLevel", default: 0)
         origin = try reader.origin("origin")
         size = try reader.requiredExtent("size")
-        bytesPerRow = reader.optionalInt("bytesPerRow")
-        rowsPerImage = reader.optionalInt("rowsPerImage")
+        bytesPerRow = try reader.optionalInt("bytesPerRow")
+        rowsPerImage = try reader.optionalInt("rowsPerImage")
         path = reader.path
     }
 }
@@ -203,7 +203,7 @@ public struct WGPUCopyExternalImageCommand: WGPUCommandFields {
     public init(from reader: WGPUValueReader) throws {
         source = try WGPUExternalImageSource(from: try reader.requiredObject("source"))
         destination = try WGPUTexelCopyTextureInfo(from: try reader.requiredObject("destination"))
-        copySize = reader.extent("copySize")
+        copySize = try reader.extent("copySize")
         path = reader.path
     }
 }
@@ -296,9 +296,10 @@ public struct WGPUSetBindGroupCommand: WGPUCommandFields {
     public init(from reader: WGPUValueReader) throws {
         index = try reader.requiredInt("index")
         bindGroup = try reader.requiredHandle("bindGroup")
-        // Unreadable means **treat it as empty.** Layouts without dynamic offsets are overwhelmingly
-        // common, and if one really was needed, applying the bind group catches it as "too few".
-        dynamicOffsets = (try? reader.integers("dynamicOffsets")) ?? []
+        // Absent means empty — the shim omits the field when there are no offsets. A present but
+        // unreadable array is an error (WebIDL `[EnforceRange]`): reading it as empty would hide a
+        // NaN/Infinity offset behind a misleading "too few dynamic offsets" later.
+        dynamicOffsets = try reader.has("dynamicOffsets") ? reader.integers("dynamicOffsets") : []
         path = reader.path
     }
 }
@@ -313,7 +314,7 @@ public struct WGPUSetVertexBufferCommand: WGPUCommandFields {
     public init(from reader: WGPUValueReader) throws {
         slot = try reader.requiredInt("slot")
         buffer = try reader.requiredHandle("buffer")
-        offset = reader.int("offset", default: 0)
+        offset = try reader.int("offset", default: 0)
         path = reader.path
     }
 }
@@ -331,7 +332,7 @@ public struct WGPUSetIndexBufferCommand: WGPUCommandFields {
     public init(from reader: WGPUValueReader) throws {
         buffer = try reader.requiredHandle("buffer")
         format = try reader.requiredEnum("format", WGPUIndexFormat.self)
-        offset = reader.int("offset", default: 0)
+        offset = try reader.int("offset", default: 0)
         path = reader.path
     }
 }
@@ -366,8 +367,8 @@ public struct WGPUSetScissorRectCommand: WGPUCommandFields {
     public let path: String
 
     public init(from reader: WGPUValueReader) throws {
-        x = reader.int("x", default: 0)
-        y = reader.int("y", default: 0)
+        x = try reader.int("x", default: 0)
+        y = try reader.int("y", default: 0)
         width = try reader.requiredInt("width")
         height = try reader.requiredInt("height")
         path = reader.path
@@ -394,7 +395,7 @@ public struct WGPUSetStencilReferenceCommand: WGPUCommandFields {
     public let path: String
 
     public init(from reader: WGPUValueReader) throws {
-        reference = UInt32(truncatingIfNeeded: reader.int("reference", default: 0))
+        reference = UInt32(truncatingIfNeeded: try reader.int("reference", default: 0))
         path = reader.path
     }
 }
@@ -411,9 +412,9 @@ public struct WGPUDrawCommand: WGPUCommandFields {
 
     public init(from reader: WGPUValueReader) throws {
         vertexCount = try reader.requiredInt("vertexCount")
-        instanceCount = reader.int("instanceCount", default: 1)
-        firstVertex = reader.int("firstVertex", default: 0)
-        firstInstance = reader.int("firstInstance", default: 0)
+        instanceCount = try reader.int("instanceCount", default: 1)
+        firstVertex = try reader.int("firstVertex", default: 0)
+        firstInstance = try reader.int("firstInstance", default: 0)
         path = reader.path
     }
 }
@@ -429,10 +430,10 @@ public struct WGPUDrawIndexedCommand: WGPUCommandFields {
 
     public init(from reader: WGPUValueReader) throws {
         indexCount = try reader.requiredInt("indexCount")
-        instanceCount = reader.int("instanceCount", default: 1)
-        firstIndex = reader.int("firstIndex", default: 0)
-        baseVertex = reader.int("baseVertex", default: 0)
-        firstInstance = reader.int("firstInstance", default: 0)
+        instanceCount = try reader.int("instanceCount", default: 1)
+        firstIndex = try reader.int("firstIndex", default: 0)
+        baseVertex = try reader.int("baseVertex", default: 0)
+        firstInstance = try reader.int("firstInstance", default: 0)
         path = reader.path
     }
 }
@@ -446,7 +447,7 @@ public struct WGPUIndirectCommand: WGPUCommandFields {
 
     public init(from reader: WGPUValueReader) throws {
         indirectBuffer = try reader.requiredHandle("indirectBuffer")
-        indirectOffset = reader.int("indirectOffset", default: 0)
+        indirectOffset = try reader.int("indirectOffset", default: 0)
         path = reader.path
     }
 }
@@ -460,9 +461,9 @@ public struct WGPUDispatchWorkgroupsCommand: WGPUCommandFields {
 
     public init(from reader: WGPUValueReader) throws {
         // Passing 0 makes Metal assert on an empty grid. The spec disallows 0 too, so we raise it to 1.
-        x = max(reader.int("x", default: 1), 1)
-        y = max(reader.int("y", default: 1), 1)
-        z = max(reader.int("z", default: 1), 1)
+        x = try max(reader.int("x", default: 1), 1)
+        y = try max(reader.int("y", default: 1), 1)
+        z = try max(reader.int("z", default: 1), 1)
         path = reader.path
     }
 }
@@ -503,10 +504,10 @@ public struct WGPUResolveQuerySetCommand: WGPUCommandFields {
 
     public init(from reader: WGPUValueReader) throws {
         querySet = try reader.requiredHandle("querySet")
-        firstQuery = reader.int("firstQuery", default: 0)
-        queryCount = reader.optionalInt("queryCount")
+        firstQuery = try reader.int("firstQuery", default: 0)
+        queryCount = try reader.optionalInt("queryCount")
         destination = try reader.requiredHandle("destination")
-        destinationOffset = reader.int("destinationOffset", default: 0)
+        destinationOffset = try reader.int("destinationOffset", default: 0)
         path = reader.path
     }
 }
@@ -525,10 +526,10 @@ public struct WGPUCopyBufferToBufferCommand: WGPUCommandFields {
 
     public init(from reader: WGPUValueReader) throws {
         source = try reader.requiredHandle("source")
-        sourceOffset = reader.int("sourceOffset", default: 0)
+        sourceOffset = try reader.int("sourceOffset", default: 0)
         destination = try reader.requiredHandle("destination")
-        destinationOffset = reader.int("destinationOffset", default: 0)
-        size = reader.optionalInt("size")
+        destinationOffset = try reader.int("destinationOffset", default: 0)
+        size = try reader.optionalInt("size")
         path = reader.path
     }
 }
@@ -543,8 +544,8 @@ public struct WGPUClearBufferCommand: WGPUCommandFields {
 
     public init(from reader: WGPUValueReader) throws {
         buffer = try reader.requiredHandle("buffer")
-        offset = reader.int("offset", default: 0)
-        size = reader.optionalInt("size")
+        offset = try reader.int("offset", default: 0)
+        size = try reader.optionalInt("size")
         path = reader.path
     }
 }

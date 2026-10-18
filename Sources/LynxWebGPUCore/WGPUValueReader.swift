@@ -49,21 +49,51 @@ public struct WGPUValueReader {
         .validation("\(expected) required", path: childPath(key))
     }
 
-    // MARK: - Scalars
+    // MARK: - Integers
+
+    /// Largest integer a JS number holds exactly (`Number.MAX_SAFE_INTEGER`, 2^53 − 1).
+    public static let maxSafeInteger = 9_007_199_254_740_991
+
+    /// The **single** conversion from a payload number to `Int` — every integer accessor goes
+    /// through it.
+    ///
+    /// JS numbers are doubles, so NaN, ±Infinity and 1e20 all arrive here, and `Int(Double)` traps
+    /// on each of them (process death — the `WGPUError` contract forbids that), while
+    /// `NSNumber.intValue` silently saturates or wraps them. This follows WebIDL `[EnforceRange]`
+    /// instead: non-finite → error, otherwise truncate toward zero, then outside
+    /// ±`maxSafeInteger` → error. The per-type range (`unsigned long`, …) stays with the caller
+    /// that knows the usage; this only guarantees the value is a real integer `Int` can hold.
+    static func enforceRange(_ number: NSNumber, path: String) throws -> Int {
+        let double = number.doubleValue
+        guard double.isFinite else {
+            throw WGPUError.validation("an integer is required (got \(double))", path: path)
+        }
+        let truncated = double.rounded(.towardZero)
+        guard abs(truncated) <= Double(maxSafeInteger) else {
+            throw WGPUError.validation(
+                "\(double) is outside the safe integer range ±(2^53 - 1)", path: path)
+        }
+        return Int(truncated)
+    }
 
     public func requiredInt(_ key: String) throws -> Int {
         guard let raw = value(key) else { throw missing(key) }
         guard let number = raw as? NSNumber else { throw mismatch(key, expected: "an integer") }
-        return number.intValue
+        return try Self.enforceRange(number, path: childPath(key))
     }
 
-    public func int(_ key: String, default fallback: Int) -> Int {
-        (value(key) as? NSNumber)?.intValue ?? fallback
+    /// A non-number value falls back like an absent one; a number that is not a usable integer throws.
+    public func int(_ key: String, default fallback: Int) throws -> Int {
+        try optionalInt(key) ?? fallback
     }
 
-    public func optionalInt(_ key: String) -> Int? {
-        (value(key) as? NSNumber)?.intValue
+    /// A non-number value reads as nil like an absent one; a number that is not a usable integer throws.
+    public func optionalInt(_ key: String) throws -> Int? {
+        guard let number = value(key) as? NSNumber else { return nil }
+        return try Self.enforceRange(number, path: childPath(key))
     }
+
+    // MARK: - Scalars
 
     public func requiredDouble(_ key: String) throws -> Double {
         guard let raw = value(key) else { throw missing(key) }
@@ -99,8 +129,8 @@ public struct WGPUValueReader {
         WGPUHandle(try requiredInt(key))
     }
 
-    public func optionalHandle(_ key: String) -> WGPUHandle? {
-        optionalInt(key).map(WGPUHandle.init)
+    public func optionalHandle(_ key: String) throws -> WGPUHandle? {
+        try optionalInt(key).map(WGPUHandle.init)
     }
 
     // MARK: - Enums / flags
@@ -131,9 +161,10 @@ public struct WGPUValueReader {
         T.allCases.map { "\($0.rawValue)" }.joined(separator: ", ")
     }
 
-    public func flags<T: OptionSet>(_ key: String, _ type: T.Type, default fallback: T) -> T where T.RawValue == Int {
-        guard let number = value(key) as? NSNumber else { return fallback }
-        return T(rawValue: number.intValue)
+    public func flags<T: OptionSet>(_ key: String, _ type: T.Type, default fallback: T) throws -> T
+    where T.RawValue == Int {
+        guard let raw = try optionalInt(key) else { return fallback }
+        return T(rawValue: raw)
     }
 
     public func requiredFlags<T: OptionSet>(_ key: String, _ type: T.Type) throws -> T where T.RawValue == Int {
@@ -181,7 +212,15 @@ public struct WGPUValueReader {
     }
 
     public func integers(_ key: String) throws -> [Int] {
-        try numbers(key).map { Int($0) }
+        guard let raw = value(key) else { throw missing(key) }
+        guard let array = raw as? [Any] else { throw mismatch(key, expected: "an integer array") }
+        return try array.enumerated().map { index, element in
+            let path = "\(childPath(key))[\(index)]"
+            guard let number = element as? NSNumber else {
+                throw WGPUError.validation("an integer is required", path: path)
+            }
+            return try Self.enforceRange(number, path: path)
+        }
     }
 
     /// A numeric map of the form `{ "name": value }` (pipeline `constants`).
@@ -228,10 +267,12 @@ public struct WGPUValueReader {
             var bytes = [UInt8]()
             bytes.reserveCapacity(array.count)
             for (index, element) in array.enumerated() {
+                let path = "\(childPath(key))[\(index)]"
                 guard let number = element as? NSNumber else {
-                    throw WGPUError.validation("a byte (0...255) is required", path: "\(childPath(key))[\(index)]")
+                    throw WGPUError.validation("a byte (0...255) is required", path: path)
                 }
-                bytes.append(UInt8(truncatingIfNeeded: number.intValue))
+                // Wraps like a JS `Uint8Array` store once the value is a real integer.
+                bytes.append(UInt8(truncatingIfNeeded: try Self.enforceRange(number, path: path)))
             }
             return Data(bytes)
         }
@@ -285,12 +326,12 @@ public struct WGPUValueReader {
             let reader = WGPUValueReader(dictionary, path: childPath(key))
             return WGPUExtent3D(
                 width: try reader.requiredInt("width"),
-                height: reader.int("height", default: 1),
-                depthOrArrayLayers: reader.int("depthOrArrayLayers", default: 1)
+                height: try reader.int("height", default: 1),
+                depthOrArrayLayers: try reader.int("depthOrArrayLayers", default: 1)
             )
         }
         if let array = raw as? [Any] {
-            let components = array.compactMap { ($0 as? NSNumber)?.intValue }
+            let components = try integerComponents(array, key: key)
             guard let width = components.first else {
                 throw WGPUError.validation("a size needs at least 1 component", path: childPath(key))
             }
@@ -304,9 +345,11 @@ public struct WGPUValueReader {
     }
 
     /// Same as `requiredExtent` but nil when absent — for callers that default to the source size.
-    public func extent(_ key: String) -> WGPUExtent3D? {
+    /// A present but unreadable size is an error, not "absent": falling back to the source size
+    /// would silently copy more than was asked for.
+    public func extent(_ key: String) throws -> WGPUExtent3D? {
         guard value(key) != nil else { return nil }
-        return try? requiredExtent(key)
+        return try requiredExtent(key)
     }
 
     /// `{x,y,z}` or `[x,y,z]` (WebGPU `GPUOrigin3D`). Absent means the origin.
@@ -315,13 +358,13 @@ public struct WGPUValueReader {
         if let dictionary = raw as? [String: Any] {
             let reader = WGPUValueReader(dictionary, path: childPath(key))
             return WGPUOrigin3D(
-                x: reader.int("x", default: 0),
-                y: reader.int("y", default: 0),
-                z: reader.int("z", default: 0)
+                x: try reader.int("x", default: 0),
+                y: try reader.int("y", default: 0),
+                z: try reader.int("z", default: 0)
             )
         }
         if let array = raw as? [Any] {
-            let components = array.compactMap { ($0 as? NSNumber)?.intValue }
+            let components = try integerComponents(array, key: key)
             return WGPUOrigin3D(
                 x: components.count > 0 ? components[0] : 0,
                 y: components.count > 1 ? components[1] : 0,
@@ -329,6 +372,15 @@ public struct WGPUValueReader {
             )
         }
         throw mismatch(key, expected: "an origin ({x,y,z} or [x,y,z])")
+    }
+
+    /// The numbers of a `[w,h,d]` / `[x,y,z]` array form. Non-numbers are skipped as before;
+    /// numbers go through `enforceRange` with their index in the path.
+    private func integerComponents(_ array: [Any], key: String) throws -> [Int] {
+        try array.enumerated().compactMap { index, element in
+            guard let number = element as? NSNumber else { return nil }
+            return try Self.enforceRange(number, path: "\(childPath(key))[\(index)]")
+        }
     }
 }
 

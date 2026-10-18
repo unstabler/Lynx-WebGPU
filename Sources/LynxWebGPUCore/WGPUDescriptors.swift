@@ -27,7 +27,7 @@ public struct WGPUBufferDescriptor {
     public init(from reader: WGPUValueReader) throws {
         let initialData = try reader.optionalData("data")
         // With size omitted, infer it from the initial data length.
-        size = reader.optionalInt("size") ?? (initialData?.count ?? 0)
+        size = try reader.optionalInt("size") ?? (initialData?.count ?? 0)
         usage = try reader.requiredFlags("usage", WGPUBufferUsage.self)
         mappedAtCreation = reader.bool("mappedAtCreation", default: false)
         label = reader.optionalString("label")
@@ -78,8 +78,8 @@ public struct WGPUTextureDescriptor {
         format = try reader.requiredEnum("format", WGPUTextureFormat.self)
         usage = try reader.requiredFlags("usage", WGPUTextureUsage.self)
         dimension = try reader.enumValue("dimension", default: WGPUTextureDimension.twoD)
-        mipLevelCount = reader.int("mipLevelCount", default: 1)
-        sampleCount = reader.int("sampleCount", default: 1)
+        mipLevelCount = try reader.int("mipLevelCount", default: 1)
+        sampleCount = try reader.int("sampleCount", default: 1)
         label = reader.optionalString("label")
         guard size.width > 0, size.height > 0, size.depthOrArrayLayers > 0 else {
             throw WGPUError.validation("every component of a texture size must be at least 1", path: reader.path)
@@ -101,10 +101,10 @@ public struct WGPUTextureViewDescriptor {
         format = try reader.optionalEnum("format", WGPUTextureFormat.self)
         dimension = try reader.optionalEnum("dimension", WGPUTextureViewDimension.self)
         aspect = try reader.enumValue("aspect", default: WGPUTextureAspect.all)
-        baseMipLevel = reader.int("baseMipLevel", default: 0)
-        mipLevelCount = reader.optionalInt("mipLevelCount")
-        baseArrayLayer = reader.int("baseArrayLayer", default: 0)
-        arrayLayerCount = reader.optionalInt("arrayLayerCount")
+        baseMipLevel = try reader.int("baseMipLevel", default: 0)
+        mipLevelCount = try reader.optionalInt("mipLevelCount")
+        baseArrayLayer = try reader.int("baseArrayLayer", default: 0)
+        arrayLayerCount = try reader.optionalInt("arrayLayerCount")
         label = reader.optionalString("label")
     }
 }
@@ -132,7 +132,7 @@ public struct WGPUSamplerDescriptor {
         lodMinClamp = reader.double("lodMinClamp", default: 0)
         lodMaxClamp = reader.double("lodMaxClamp", default: 32)
         compare = try reader.optionalEnum("compare", WGPUCompareFunction.self)
-        maxAnisotropy = reader.int("maxAnisotropy", default: 1)
+        maxAnisotropy = try reader.int("maxAnisotropy", default: 1)
         label = reader.optionalString("label")
     }
 }
@@ -248,7 +248,7 @@ public struct WGPUBindGroupLayoutEntry: Equatable {
             layout = .buffer(WGPUBufferBindingLayout(
                 type: try buffer.enumValue("type", default: WGPUBufferBindingType.uniform),
                 hasDynamicOffset: buffer.bool("hasDynamicOffset", default: false),
-                minBindingSize: buffer.int("minBindingSize", default: 0)
+                minBindingSize: try buffer.int("minBindingSize", default: 0)
             ))
         } else if let sampler = reader.object("sampler") {
             layout = .sampler(WGPUSamplerBindingLayout(
@@ -303,9 +303,9 @@ public struct WGPUBindGroupEntry {
     public init(from reader: WGPUValueReader) throws {
         binding = try reader.requiredInt("binding")
         let resourceReader = try reader.requiredObject("resource")
-        if let buffer = resourceReader.optionalHandle("buffer") {
-            let offset = resourceReader.int("offset", default: 0)
-            let size = resourceReader.optionalInt("size")
+        if let buffer = try resourceReader.optionalHandle("buffer") {
+            let offset = try resourceReader.int("offset", default: 0)
+            let size = try resourceReader.optionalInt("size")
             // A negative value traps the UInt32 conversion when filling the size table for
             // `arrayLength()` — filtering here is what keeps the "bad arguments never kill the
             // process" contract.
@@ -315,9 +315,9 @@ public struct WGPUBindGroupEntry {
                 )
             }
             resource = .buffer(handle: buffer, offset: offset, size: size)
-        } else if let sampler = resourceReader.optionalHandle("sampler") {
+        } else if let sampler = try resourceReader.optionalHandle("sampler") {
             resource = .sampler(sampler)
-        } else if let view = resourceReader.optionalHandle("textureView") {
+        } else if let view = try resourceReader.optionalHandle("textureView") {
             resource = .textureView(view)
         } else {
             throw WGPUError.validation(
@@ -345,7 +345,7 @@ public enum WGPUPipelineLayoutRef {
     case explicit(WGPUHandle)
 
     public init(from reader: WGPUValueReader, key: String = "layout") throws {
-        if let handle = reader.optionalHandle(key) {
+        if let handle = try reader.optionalHandle(key) {
             self = .explicit(handle)
         } else if let string = reader.optionalString(key) {
             guard string == "auto" else {
@@ -377,7 +377,7 @@ public struct WGPUVertexAttribute: Equatable {
 
     public init(from reader: WGPUValueReader) throws {
         format = try reader.requiredEnum("format", WGPUVertexFormat.self)
-        offset = reader.int("offset", default: 0)
+        offset = try reader.int("offset", default: 0)
         shaderLocation = try reader.requiredInt("shaderLocation")
     }
 }
@@ -446,7 +446,7 @@ public struct WGPUColorTargetState {
     public init(from reader: WGPUValueReader) throws {
         format = try reader.requiredEnum("format", WGPUTextureFormat.self)
         blend = try reader.object("blend").map(WGPUBlendState.init(from:))
-        writeMask = reader.flags("writeMask", WGPUColorWriteMask.self, default: .all)
+        writeMask = try reader.flags("writeMask", WGPUColorWriteMask.self, default: .all)
     }
 }
 
@@ -548,13 +548,13 @@ public struct WGPUDepthStencilState {
         format = try reader.requiredEnum("format", WGPUTextureFormat.self)
         depthWriteEnabled = reader.bool("depthWriteEnabled", default: false)
         depthCompare = try reader.enumValue("depthCompare", default: WGPUCompareFunction.always)
-        depthBias = reader.int("depthBias", default: 0)
+        depthBias = try reader.int("depthBias", default: 0)
         depthBiasSlopeScale = reader.double("depthBiasSlopeScale", default: 0)
         depthBiasClamp = reader.double("depthBiasClamp", default: 0)
         stencilFront = try WGPUStencilFaceState(from: reader.object("stencilFront"))
         stencilBack = try WGPUStencilFaceState(from: reader.object("stencilBack"))
-        stencilReadMask = reader.int("stencilReadMask", default: 0xFFFF_FFFF)
-        stencilWriteMask = reader.int("stencilWriteMask", default: 0xFFFF_FFFF)
+        stencilReadMask = try reader.int("stencilReadMask", default: 0xFFFF_FFFF)
+        stencilWriteMask = try reader.int("stencilWriteMask", default: 0xFFFF_FFFF)
         guard format.isDepthOrStencil else {
             throw WGPUError.validation("depthStencil.format must be a depth/stencil format", path: reader.path)
         }
@@ -579,9 +579,9 @@ public struct WGPUMultisampleState {
     public var mask: Int
     public var alphaToCoverageEnabled: Bool
 
-    public init(from reader: WGPUValueReader?) {
-        count = reader?.int("count", default: 1) ?? 1
-        mask = reader?.int("mask", default: 0xFFFF_FFFF) ?? 0xFFFF_FFFF
+    public init(from reader: WGPUValueReader?) throws {
+        count = try reader?.int("count", default: 1) ?? 1
+        mask = try reader?.int("mask", default: 0xFFFF_FFFF) ?? 0xFFFF_FFFF
         alphaToCoverageEnabled = reader?.bool("alphaToCoverageEnabled", default: false) ?? false
     }
 }
@@ -600,7 +600,7 @@ public struct WGPURenderPipelineDescriptor {
         vertex = try WGPUVertexState(from: reader.requiredObject("vertex"))
         primitive = try WGPUPrimitiveState(from: reader.object("primitive"))
         depthStencil = try reader.object("depthStencil").map(WGPUDepthStencilState.init(from:))
-        multisample = WGPUMultisampleState(from: reader.object("multisample"))
+        multisample = try WGPUMultisampleState(from: reader.object("multisample"))
         fragment = try reader.object("fragment").map(WGPUFragmentState.init(from:))
         label = reader.optionalString("label")
     }
@@ -636,7 +636,7 @@ public struct WGPURenderPassColorAttachment {
 
     public init(from reader: WGPUValueReader) throws {
         view = try reader.requiredHandle("view")
-        resolveTarget = reader.optionalHandle("resolveTarget")
+        resolveTarget = try reader.optionalHandle("resolveTarget")
         clearValue = try reader.color("clearValue", default: .transparent)
         loadOp = try reader.enumValue("loadOp", default: WGPULoadOp.clear)
         storeOp = try reader.enumValue("storeOp", default: WGPUStoreOp.store)
@@ -660,7 +660,7 @@ public struct WGPURenderPassDepthStencilAttachment {
         depthLoadOp = try reader.optionalEnum("depthLoadOp", WGPULoadOp.self)
         depthStoreOp = try reader.optionalEnum("depthStoreOp", WGPUStoreOp.self)
         depthReadOnly = reader.bool("depthReadOnly", default: false)
-        stencilClearValue = reader.int("stencilClearValue", default: 0)
+        stencilClearValue = try reader.int("stencilClearValue", default: 0)
         stencilLoadOp = try reader.optionalEnum("stencilLoadOp", WGPULoadOp.self)
         stencilStoreOp = try reader.optionalEnum("stencilStoreOp", WGPUStoreOp.self)
         stencilReadOnly = reader.bool("stencilReadOnly", default: false)
@@ -689,8 +689,8 @@ public struct WGPUPassTimestampWrites {
 
     public init(from reader: WGPUValueReader) throws {
         querySet = try reader.requiredHandle("querySet")
-        beginningOfPassWriteIndex = reader.optionalInt("beginningOfPassWriteIndex")
-        endOfPassWriteIndex = reader.optionalInt("endOfPassWriteIndex")
+        beginningOfPassWriteIndex = try reader.optionalInt("beginningOfPassWriteIndex")
+        endOfPassWriteIndex = try reader.optionalInt("endOfPassWriteIndex")
     }
 }
 
@@ -706,7 +706,7 @@ public struct WGPURenderPassDescriptor {
             .map(WGPURenderPassColorAttachment.init(from:))
         depthStencilAttachment = try reader.object("depthStencilAttachment")
             .map(WGPURenderPassDepthStencilAttachment.init(from:))
-        occlusionQuerySet = reader.optionalHandle("occlusionQuerySet")
+        occlusionQuerySet = try reader.optionalHandle("occlusionQuerySet")
         timestampWrites = try reader.object("timestampWrites").map(WGPUPassTimestampWrites.init(from:))
         label = reader.optionalString("label")
     }
@@ -776,7 +776,7 @@ public struct WGPURenderBundleDescriptor {
             return format
         }
         depthStencilFormat = try reader.optionalEnum("depthStencilFormat", WGPUTextureFormat.self)
-        sampleCount = reader.int("sampleCount", default: 1)
+        sampleCount = try reader.int("sampleCount", default: 1)
         depthReadOnly = reader.bool("depthReadOnly", default: false)
         stencilReadOnly = reader.bool("stencilReadOnly", default: false)
         label = reader.optionalString("label")
@@ -804,7 +804,7 @@ public struct WGPUCanvasConfiguration {
     public init(from reader: WGPUValueReader) throws {
         canvasId = try reader.requiredString("canvas")
         format = try reader.enumValue("format", default: WGPUTextureFormat.bgra8unorm)
-        usage = reader.flags("usage", WGPUTextureUsage.self, default: .renderAttachment)
+        usage = try reader.flags("usage", WGPUTextureUsage.self, default: .renderAttachment)
         alphaMode = try reader.enumValue("alphaMode", default: WGPUCanvasAlphaMode.opaque)
         colorSpace = try reader.enumValue("colorSpace", default: WGPUPredefinedColorSpace.srgb)
         // In the spec toneMapping is a nested object of the form `{mode: …}`.
