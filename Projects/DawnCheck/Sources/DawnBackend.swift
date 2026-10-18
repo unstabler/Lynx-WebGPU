@@ -286,6 +286,7 @@ final class DawnBackend: WGPUBackend {
     }
 
     func unmapBuffer(_ buffer: DawnBufferObject) {
+        buffer.mapGeneration += 1   // a write mapping still pending is aborted — its callback is stale
         if buffer.dawnMapped {
             wgpuBufferUnmap(buffer.buffer)
             buffer.dawnMapped = false
@@ -389,6 +390,90 @@ final class DawnBackend: WGPUBackend {
         }
         callbackInfo.userdata1 = Unmanaged.passRetained(context).toOpaque()
         _ = wgpuBufferMapAsync(buffer, WGPUMapMode_Read, 0, mapSize, callbackInfo)
+    }
+
+    /// `mapAsync(GPUMapMode.WRITE)` — a real Dawn write mapping of the MAP_WRITE buffer itself. The
+    /// mapped range starts as the buffer's current contents (spec), which go to JS; the buffer **stays
+    /// mapped** until `unmapBuffer`, and `writeMappedBuffer` copies JS's bytes into it right before.
+    /// (`wgpuQueueWriteBuffer` cannot serve the write-back: a MAP_WRITE buffer has no COPY_DST usage.)
+    func mapBufferForWrite(
+        _ buffer: DawnBufferObject, offset: Int, length: Int,
+        deliver: @escaping (Result<Data, WGPUError>) -> Void
+    ) {
+        final class WriteMapContext {
+            let object: DawnBufferObject
+            let offset: Int
+            let length: Int
+            let generation: Int
+            let deliver: (Result<Data, WGPUError>) -> Void
+            init(object: DawnBufferObject, offset: Int, length: Int, generation: Int,
+                 deliver: @escaping (Result<Data, WGPUError>) -> Void) {
+                self.object = object
+                self.offset = offset
+                self.length = length
+                self.generation = generation
+                self.deliver = deliver
+            }
+        }
+        // Marked up front so an unmap while still pending also releases it (Dawn aborts the map).
+        buffer.dawnMapped = true
+        buffer.mapGeneration += 1
+        let context = WriteMapContext(
+            object: buffer, offset: offset, length: length,
+            generation: buffer.mapGeneration, deliver: deliver
+        )
+        var callbackInfo = WGPUBufferMapCallbackInfo()
+        callbackInfo.mode = WGPUCallbackMode_AllowProcessEvents
+        callbackInfo.callback = { status, message, userdata1, _ in
+            guard let userdata1 else { return }
+            let context = Unmanaged<WriteMapContext>.fromOpaque(userdata1).takeRetainedValue()
+            // A mapping `unmapBuffer` aborted may report after a newer one began — it must not touch
+            // the newer mapping's state (clearing `dawnMapped` would make its unmap skip the Dawn unmap).
+            let isCurrent = context.object.mapGeneration == context.generation
+            guard status == WGPUMapAsyncStatus_Success else {
+                if isCurrent { context.object.dawnMapped = false }
+                context.deliver(.failure(WGPUError.backend(
+                    "mapAsync(WRITE) failed — \(String(wgpu: message))"
+                )))
+                return
+            }
+            guard isCurrent else {
+                // Defensive: Dawn reports an unmapped pending map as Aborted, so this is not expected —
+                // but a stale success must not read the newer mapping's range either way.
+                context.deliver(.failure(WGPUError.backend("mapAsync(WRITE) was superseded by unmap()")))
+                return
+            }
+            guard context.length > 0 else {
+                context.deliver(.success(Data()))
+                return
+            }
+            guard let pointer = wgpuBufferGetMappedRange(
+                context.object.buffer, context.offset, context.length
+            ) else {
+                wgpuBufferUnmap(context.object.buffer)
+                context.object.dawnMapped = false
+                context.deliver(.failure(WGPUError.backend(
+                    "could not obtain the mapped range (offset \(context.offset), length \(context.length))"
+                )))
+                return
+            }
+            context.deliver(.success(Data(bytes: pointer, count: context.length)))
+        }
+        callbackInfo.userdata1 = Unmanaged.passRetained(context).toOpaque()
+        _ = wgpuBufferMapAsync(buffer.buffer, WGPUMapMode_Write, offset, length, callbackInfo)
+    }
+
+    func writeMappedBuffer(_ buffer: DawnBufferObject, offset: Int, data: Data) throws {
+        guard buffer.dawnMapped,
+              let mapped = wgpuBufferGetMappedRange(buffer.buffer, offset, data.count) else {
+            throw WGPUError.backend(
+                "the buffer is not mapped for writing at the Dawn level (offset \(offset), \(data.count)B)"
+            )
+        }
+        data.withUnsafeBytes { source in
+            guard let base = source.baseAddress else { return }
+            mapped.copyMemory(from: base, byteCount: data.count)
+        }
     }
 
     // MARK: - Textures

@@ -15,6 +15,7 @@ public struct ConformanceFailure: LocalizedError {
 /// numbers by hand in a check makes it unreadable which bit is which, so they get names.
 public enum WebGPUUsage {
     public static let mapRead = 0x0001
+    public static let mapWrite = 0x0002
     public static let copySrc = 0x0004
     public static let copyDst = 0x0008
     public static let index = 0x0010

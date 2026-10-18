@@ -530,15 +530,57 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         // (The JS shim folds this flag on the client and sends initialData instead — this path
         //  belongs to native users building the command stream directly.)
         object.isMapped = command.descriptor.mappedAtCreation
+        // It is a write mapping of the whole buffer — `unmapBuffer` may carry its contents.
+        object.writeMappedRange = command.descriptor.mappedAtCreation ? 0..<command.descriptor.size : nil
         registry.insert(object, at: command.id)
     }
 
+    /// `unmap()`. A write mapping's bytes come back in `data` (the JS mapping is a copy) and are stored
+    /// **while the buffer is still mapped**, then the mapping is released.
+    ///
+    /// `unmap` cannot fail in the spec, so the mapping is released **even when the write-back is
+    /// rejected** — otherwise one bad command would leave the buffer unavailable to queue work forever.
     private func unmapBuffer(_ command: WGPUUnmapBufferCommand) throws {
         let object = try registry.lookup(
             command.buffer, as: WGPUEngineBuffer<B>.self, kind: "GPUBuffer"
         )
-        object.isMapped = false
-        backend.unmapBuffer(object.raw)
+        let writable = object.isMapped ? object.writeMappedRange : nil
+        defer {
+            object.isMapped = false
+            object.writeMappedRange = nil
+            object.mapGeneration += 1   // a still-pending mapping's completion is stale from here on
+            backend.unmapBuffer(object.raw)
+        }
+        guard let data = command.data else { return }
+        guard let range = writable else {
+            throw WGPUError.validation(
+                "unmapBuffer data needs a buffer mapped for writing "
+                    + "(mapAsync(GPUMapMode.WRITE) or mappedAtCreation)",
+                path: command.fieldPath("data")
+            )
+        }
+        // Checked whatever the backend: the write-back is a CPU copy into the mapping (Dawn) — the same
+        // CPU path protection a natively validating backend keeps.
+        let offset = command.offset ?? range.lowerBound
+        guard offset >= range.lowerBound, offset <= range.upperBound,
+              data.count <= range.upperBound - offset else {
+            throw WGPUError.validation(
+                "unmapBuffer data is outside the mapped range — offset \(offset) + \(data.count)B, "
+                    + "mapped \(range.lowerBound)~\(range.upperBound)",
+                path: command.fieldPath("offset")
+            )
+        }
+        // The getMappedRange alignment — a range JS can obtain always satisfies it.
+        guard offset % 8 == 0, data.count % 4 == 0 else {
+            throw WGPUError.validation(
+                "unmapBuffer's offset must be a multiple of 8 and its data a multiple of 4 bytes "
+                    + "(got \(offset), \(data.count)B)",
+                path: command.fieldPath("offset")
+            )
+        }
+        guard !data.isEmpty else { return }
+        try requireNoOpenPass()
+        try backend.writeMappedBuffer(object.raw, offset: offset, data: data)
     }
 
     private func writeBuffer(_ command: WGPUWriteBufferCommand) throws {
@@ -2105,6 +2147,10 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     ///
     /// While reading, this buffer is "unavailable" — if a write from the next frame overlaps the same
     /// memory, which frame's values JS receives is not guaranteed (`WGPUEngineBuffer.isMapped`).
+    ///
+    /// A `MAP_WRITE` buffer is mapped **for writing** instead (`mapAsync(GPUMapMode.WRITE)` — the
+    /// backend's `mapBufferForWrite`): the result is its current contents, and `unmapBuffer`'s `data`
+    /// writes the mapping back.
     public func readBuffer(
         handle: Int,
         offset: Int = 0,
@@ -2133,40 +2179,70 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             ])
             return
         }
-        target.isMapped = true
+
+        // On failure we do not set up the mapping — a failed mapAsync leaves the buffer unmapped in the spec too.
+        func reject(_ message: String) {
+            executionLock.unlock()
+            completion(["ok": false, "errors": [WGPUError.validation(message).payload]])
+        }
 
         let length = size ?? (target.size - offset)
         guard offset >= 0, length >= 0, offset + length <= target.size else {
-            // On failure we do not set up the mapping — a failed mapAsync leaves the buffer unmapped in the spec too.
-            target.isMapped = false
-            executionLock.unlock()
-            completion([
-                "ok": false,
-                "errors": [WGPUError.validation(
-                    "readBuffer out of range — offset \(offset) + \(length)B > buffer size \(target.size)B"
-                ).payload],
-            ])
+            reject("readBuffer out of range — offset \(offset) + \(length)B > buffer size \(target.size)B")
             return
         }
+        // A MAP_WRITE buffer cannot also be MAP_READ (spec), so its only mapping is a write mapping —
+        // its contents come back at unmap (`unmapBuffer`'s `data`). The JS shim rejects a READ on it.
+        let forWrite = target.usage.contains(.mapWrite)
+        if forWrite {
+            guard offset % 8 == 0, length % 4 == 0 else {
+                reject(
+                    "mapAsync(GPUMapMode.WRITE)'s offset must be a multiple of 8 and its size a multiple of 4 "
+                        + "(got \(offset), \(length)B)"
+                )
+                return
+            }
+            target.writeMappedRange = offset..<(offset + length)
+        }
+        target.isMapped = true
+        target.mapGeneration += 1
+        let generation = target.mapGeneration
 
         // Waiting on previously submitted GPU work is the backend's job. Completion arrives on an
         // arbitrary thread, so the wrapper retakes the lock — safe even when it arrives synchronously
         // during registration, because the lock is recursive.
         noteReadbackStarted()
-        backend.readBuffer(target.raw, offset: offset, length: length) { [weak self] result in
+        let deliver: (Result<Data, WGPUError>) -> Void = { [weak self] result in
             guard let self else { return }
             self.executionLock.lock()
             defer { self.executionLock.unlock() }
             self.noteReadbackFinished()
+            // A mapping unmapped while pending is over: its completion may arrive after a newer mapping
+            // began, so it must leave that one's state alone, and it reports failure whatever the backend
+            // returned (the spec rejects it with an AbortError) — on every backend alike.
+            guard target.mapGeneration == generation else {
+                let error: WGPUError
+                if case .failure(let failure) = result { error = failure } else {
+                    error = .backend("mapAsync was aborted by unmap() before it completed")
+                }
+                completion(["ok": false, "errors": [error.payload]])
+                return
+            }
             switch result {
             case .failure(let error):
                 target.isMapped = false
+                target.writeMappedRange = nil
                 completion(["ok": false, "errors": [error.payload]])
             case .success(let data):
                 // Carry `Data` straight through — Lynx turns `NSData` into a JS `ArrayBuffer`.
                 // base64 would add 33% inflation plus a decoding loop on the JS side.
                 completion(["ok": true, "data": data, "byteLength": data.count])
             }
+        }
+        if forWrite {
+            backend.mapBufferForWrite(target.raw, offset: offset, length: length, deliver: deliver)
+        } else {
+            backend.readBuffer(target.raw, offset: offset, length: length, deliver: deliver)
         }
         executionLock.unlock()
     }

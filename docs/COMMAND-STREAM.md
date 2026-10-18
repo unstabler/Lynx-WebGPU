@@ -208,7 +208,7 @@ Metal은 배치의 큐 쓰기를 **별도 커맨드 버퍼**(스테이징 + blit
 | `writeBuffer` | `buffer` · `data` · `bufferOffset`(0). 대상은 `COPY_DST`여야 하고 offset·크기는 **4의 배수**여야 한다 |
 | `writeTexture` | `texture` · `data` · `mipLevel`(0) · `origin` · `size`(extent) · `bytesPerRow`(포맷에서 유도) · `rowsPerImage`(블록 행 수) |
 | `copyExternalImageToTexture` | `source:{source(ImageBitmap 핸들), origin?, flipY?}` · `destination:{texture, mipLevel?, origin?}` · `copySize`(생략 시 이미지의 남은 전부) |
-| `unmapBuffer` | `buffer` — `mapAsync` 상태를 푼다 |
+| `unmapBuffer` | `buffer` · `offset`(매핑 시작) · `data` — `mapAsync` 상태를 푼다. **쓰기 매핑**(`mapAsync(GPUMapMode.WRITE)`·네이티브 `mappedAtCreation`)이면 `data`가 그 매핑의 바이트이고 **버퍼 오프셋** `offset`에 써진 뒤 매핑이 풀린다 (JS 매핑은 사본이라 이게 없으면 쓴 내용이 사라진다). `data`는 매핑 구간 안이어야 하고 offset은 8의 배수·크기는 4의 배수 — 읽기 매핑이나 매핑 안 된 버퍼에 `data`를 실으면 거부된다 (`COPY_DST` 없이 쓰는 뒷문이 되므로). 명세의 `unmap`은 실패하지 않으므로 **write-back이 거부돼도 매핑은 풀린다** |
 
 `bytesPerRow`·`rowsPerImage`는 **블록 단위**다 (명세 `GPUTexelCopyBufferLayout`). 비압축
 포맷은 블록이 1×1이라 픽셀 행과 같다.
@@ -337,7 +337,7 @@ uncaptured 콜백이 실패한 wgpu 호출 **안에서 동기로** 싱크를 채
 | `adapterInfo()` | `requestAdapter()`의 `info`·`limits`·`features`. **키는 명세 철자 그대로** |
 | `shaderCompilationInfo({module})` | `getCompilationInfo()` |
 | `canvasInfo({canvas})` | `{ok, width, height, format}` |
-| `readBuffer({buffer, offset?, size?}, cb)` | `mapAsync` + `getMappedRange` |
+| `readBuffer({buffer, offset?, size?}, cb)` | `mapAsync` + `getMappedRange`. **`MAP_WRITE` 버퍼는 쓰기 매핑**으로 연다 — 명세가 `MAP_READ \| MAP_WRITE`를 금하므로 usage로 모드가 정해진다. 결과는 버퍼의 현재 내용이고(명세의 쓰기 매핑 초기값), offset은 8의 배수·size는 4의 배수여야 한다. 쓴 바이트는 `unmapBuffer`의 `data`로 돌아온다 |
 | `loadAsset({name}, cb)` | 브라우저 `fetch()` 자리. 해석은 `WGPUAssetProvider`가 한다 |
 | `decodeImage({id, data?/name?, flipY?, premultiplyAlpha?, resizeWidth?, resizeHeight?}, cb)` | `createImageBitmap()` |
 | `startFrameLoop({fps})` / `stopFrameLoop()` | `webgpu:frame` 전역 이벤트 |

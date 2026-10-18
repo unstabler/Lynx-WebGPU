@@ -160,13 +160,28 @@ public protocol WGPUBackend: AnyObject {
     func writeBuffer(_ buffer: Buffer, offset: Int, data: Data) throws
 
     /// `unmap()` — the wire mapping state is the engine's; only a backend with **real mapping**
-    /// (Dawn's `mappedAtCreation`) releases its own here. A no-op where there is none.
+    /// (Dawn's `mappedAtCreation` and `mapBufferForWrite`) releases its own here. A no-op where there is none.
     func unmapBuffer(_ buffer: Buffer)
 
     /// Reads buffer contents — guarantee the values are those after previously submitted GPU work.
     /// `deliver` may be called from any thread, and synchronously when the work already finished.
     func readBuffer(_ buffer: Buffer, offset: Int, length: Int,
                     deliver: @escaping (Result<Data, WGPUError>) -> Void)
+
+    /// `mapAsync(GPUMapMode.WRITE)` — maps `[offset, offset + length)` for writing and delivers its
+    /// **current contents** (the spec's initial view of a write mapping), with the same completion
+    /// contract as `readBuffer`. The engine calls this instead of `readBuffer` for a `MAP_WRITE` buffer
+    /// (the spec forbids `MAP_READ | MAP_WRITE`, so such a buffer has no other mapping). A backend with
+    /// real mapping keeps the buffer mapped until `unmapBuffer` (Dawn); offset is a multiple of 8 and
+    /// length of 4 (checked by the engine).
+    func mapBufferForWrite(_ buffer: Buffer, offset: Int, length: Int,
+                           deliver: @escaping (Result<Data, WGPUError>) -> Void)
+
+    /// The write-back of a write mapping at `unmap()` — stores `data` at buffer offset `offset`, inside
+    /// the mapped range (checked by the engine), **right before** `unmapBuffer` on the same buffer.
+    /// It is not `writeBuffer`: the target has `MAP_WRITE` usage, not `COPY_DST`, so a queue write is
+    /// invalid on a natively validating backend (Dawn writes through its mapped range instead).
+    func writeMappedBuffer(_ buffer: Buffer, offset: Int, data: Data) throws
 
     func makeTexture(_ descriptor: WGPUTextureDescriptor) throws -> Texture
 

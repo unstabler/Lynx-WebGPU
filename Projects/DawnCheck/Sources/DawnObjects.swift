@@ -15,9 +15,13 @@ final class DawnBufferObject {
     let buffer: WGPUBuffer
     let size: Int
     let usage: LynxWebGPUCore.WGPUBufferUsage
-    /// Whether it is actually mapped at the Dawn level (mappedAtCreation and the direct map path).
+    /// Whether it is actually mapped at the Dawn level (mappedAtCreation and `mapBufferForWrite`,
+    /// pending included).
     /// The wire contract's mapping state is managed by the engine (`WGPUEngineBuffer.isMapped`).
     var dawnMapped = false
+    /// Bumped at every `mapBufferForWrite` request and every `unmapBuffer` — a map callback carrying
+    /// an older value belongs to a mapping already aborted, and must not clear a newer one's `dawnMapped`.
+    var mapGeneration = 0
 
     init(buffer: WGPUBuffer, size: Int, usage: LynxWebGPUCore.WGPUBufferUsage) {
         self.buffer = buffer

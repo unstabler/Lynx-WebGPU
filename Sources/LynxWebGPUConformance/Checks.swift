@@ -53,6 +53,7 @@ public extension WebGPUConformance {
             presentExpiresFrame,
             emptyPresentClosesFrame,
             readBufferContract,
+            mapWriteContract,
             resizeCanvasReflects,
             shaderCompilationInfoShape,
             mslOptional,
