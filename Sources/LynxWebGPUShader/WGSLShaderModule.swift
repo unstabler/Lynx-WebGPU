@@ -58,7 +58,9 @@ public final class WGSLShaderModule {
         let isFloatType: Bool
         if case .scalar(let name)? = type { isFloatType = name == "f32" || name == "f16" } else { isFloatType = false }
         if !isFloatType, value == value.rounded() {
-            return .intLiteral(String(Int(value)))
+            // WGSL has no negative literals — a negative value is negation applied to one.
+            let literal = WGSLExpression.intLiteral(String(Int(value).magnitude))
+            return value < 0 ? .unary(op: "-", literal) : literal
         }
         return .floatLiteral(String(value))
     }
@@ -102,9 +104,36 @@ public final class WGSLShaderModule {
         return entryPoints.contains(where: users.contains)
     }
 
-    /// The entry point's `@workgroup_size` — used as threadsPerThreadgroup in a compute dispatch.
-    public func workgroupSize(of entryPoint: String) -> (x: Int, y: Int, z: Int)? {
-        reflection.entryPoint(named: entryPoint)?.workgroupSize
+    /// The entry point's `@workgroup_size` as a pipeline dispatches it — used as threadsPerThreadgroup.
+    ///
+    /// The arguments are override-expressions, so they are evaluated with the pipeline's `constants`
+    /// applied (the same ones `translateToMSL` gets) and then checked against the device `limits`.
+    /// A size that cannot be computed, or one out of bounds, is a pipeline-creation validation error.
+    /// nil when the entry point does not exist or declares no workgroup size.
+    public func workgroupSize(
+        of entryPoint: String,
+        constants: [String: Double] = [:],
+        limits: WGSLWorkgroupLimits = .specDefaults
+    ) throws -> (x: Int, y: Int, z: Int)? {
+        let module = Self.applying(constants, to: ast)
+        guard let function = module.functionNamed(entryPoint),
+              let size = try module.workgroupSize(of: function) else { return nil }
+
+        func failure(_ reason: String) -> WGPUError {
+            WGPUError.validation(
+                "@workgroup_size of '\(entryPoint)' is (\(size.x), \(size.y), \(size.z)) — \(reason)"
+            )
+        }
+        for (value, limit, name) in [(size.x, limits.maxSizeX, "X"), (size.y, limits.maxSizeY, "Y"),
+                                     (size.z, limits.maxSizeZ, "Z")] where value > limit {
+            throw failure("\(value) exceeds maxComputeWorkgroupSize\(name) (\(limit))")
+        }
+        // Each dimension is within its limit by now, so the product cannot overflow.
+        let invocations = size.x * size.y * size.z
+        guard invocations <= limits.maxInvocations else {
+            throw failure("\(invocations) invocations exceed maxComputeInvocationsPerWorkgroup (\(limits.maxInvocations))")
+        }
+        return size
     }
 
     /// The spec's **"get the entry point"** — with no name, use the stage's **only** entry point.

@@ -582,9 +582,9 @@ struct MSLEmitter {
                 try emitter.emitLocalGlobal(global)
             }
             if stage == .compute, !workgroupGlobals.isEmpty {
-                try emitter.emitWorkgroupZeroInit(
-                    workgroupGlobals, threadsPerGroup: function.workgroupSize ?? (1, 1, 1)
-                )
+                // The module here has the pipeline constants applied — the same size the dispatch uses.
+                let threadsPerGroup = try emitter.module.workgroupSize(of: function) ?? (1, 1, 1)
+                try emitter.emitWorkgroupZeroInit(workgroupGlobals, threadsPerGroup: threadsPerGroup)
             }
             for statement in interface.prelude { emitter.line(statement) }
 
@@ -621,7 +621,17 @@ struct MSLEmitter {
         _ globals: [WGSLGlobalVariable],
         threadsPerGroup: (Int, Int, Int)
     ) throws {
-        let total = max(threadsPerGroup.0 * threadsPerGroup.1 * threadsPerGroup.2, 1)
+        // `translateToMSL` does not apply the device limits, so the product is checked here: it must
+        // not overflow, and it is emitted as a `uint` literal.
+        let (partial, overflowXY) = threadsPerGroup.0.multipliedReportingOverflow(by: threadsPerGroup.1)
+        let (product, overflowXYZ) = partial.multipliedReportingOverflow(by: threadsPerGroup.2)
+        guard !overflowXY, !overflowXYZ, product <= Int(UInt32.max) else {
+            throw WGPUError.validation(
+                "@workgroup_size (\(threadsPerGroup.0), \(threadsPerGroup.1), \(threadsPerGroup.2)) — "
+                    + "the invocation count does not fit in u32"
+            )
+        }
+        let total = max(product, 1)
         let index = Self.localInvocationIndexName
         line("// WGSL guarantees zero-initialization of var<workgroup> (MSL threadgroup storage does not).")
         for global in globals {

@@ -52,6 +52,27 @@
 `@location(n)`은 정점 입력에서 `[[attribute(n)]]`, 정점→프래그먼트 보간에서 `[[user(locnN)]]`,
 프래그먼트 출력에서 `[[color(n)]]`이 된다. `@interpolate(flat)` → `[[flat]]`.
 
+### 컴파일 시점 정수 (속성 인자 · 배열 길이)
+
+`@group` `@binding` `@location` `@align` `@size`의 인자와 `array<T, N>`의 길이는 **상수식으로 계산**한다
+(`WGSLConstantEvaluator`). 지원 범위:
+
+- 정수 리터럴 — 명세 문법 그대로: 10진(`0`, 선행 0 없음) · 16진(`0x10` `0X1F`) · 접미사 `i`(i32) `u`(u32).
+  접미사 없는 값은 AbstractInt(i64 범위). 형식이 틀리거나 타입 범위를 넘으면 거부한다
+- 모듈 스코프 `const` 이름 (선언이 사용보다 뒤에 와도 된다) · 괄호 · 단항 `-` · `+ - * / %` ·
+  변환 `i32(e)` `u32(e)` (값이 대상 타입 범위에 들 때)
+- 배열 길이에서만: `override` 이름(§2-2)과 함수 지역 `const` (모듈 전체에서 값이 하나로 정해질 때)
+- `@workgroup_size(x, y?, z?)`도 같은 계산을 거치고 `override` 이름을 받는다 (§2-2). 생략한 y·z는 1
+
+속성은 const-expression 자리라 `override`를 받지 않는다 (`@workgroup_size` 제외). 계산할 수 없거나 범위를 벗어난 값
+(`@binding(-1)`, `@align(3)`, 순환하는 `const`, 지원하지 않는 연산자·함수 호출)은 **셰이더 모듈 생성
+오류**다 — 줄 번호와 이유가 함께 나온다. 중첩(연산자·`const` 사슬 합산)이 256단을 넘는 식도
+같은 오류다 (JS 스레드의 작은 스택을 넘치지 않게). 예전에는 숫자 아닌 글자를 지워 읽어서 `@binding(0x10)`이
+10, `array<u32, 0x100>`이 길이 100이 되는 식으로 **조용히 틀렸다**.
+`@workgroup_size`는 인자를 `Int(글자) ?? 1`로 읽어서 `64u` · `0x40` · `const` 이름이 전부 **스레드 1개**가
+됐다. 이제 인자가 1~3개가 아니거나, 계산할 수 없거나, `override`가 아닌 값이 1보다 작으면 셰이더 모듈
+생성 오류다. `@compute` 진입점에 `@workgroup_size`가 없는 것도 같은 오류다 (명세상 필수).
+
 ### 내장 함수
 
 이름이 같은 것은 그대로 통과한다 (`min` `max` `clamp` `mix` `dot` `cross` `normalize` `length`
@@ -152,6 +173,18 @@ device.createComputePipeline({
 
 값은 **MSL 방출 시점에 상수로 박힌다**. 배열 길이가 `override`에 걸린 경우까지 자연히 풀린다.
 기본값도 없고 `constants`로도 주지 않으면 파이프라인 생성이 명확한 오류로 실패한다.
+
+`@workgroup_size`도 `override`를 받는다 (webgpu-samples `gameOfLife`의
+`@workgroup_size(blockSize, blockSize)`). 크기는 **`constants`를 적용한 모듈에서 파이프라인 생성 시점에**
+계산하고, 디스패치의 threadsPerThreadgroup과 `var<workgroup>` 0 초기화 루프의 보폭이 같은 값을 쓴다
+(어긋나면 실제 스레드 수 너머의 칸이 0으로 깔리지 않는다). 파이프라인 생성 시점의 검사 —
+어기면 validation 오류다:
+
+- 각 차원 ≥ 1 (`override`가 0이나 음수로 정해진 경우)
+- x ≤ `maxComputeWorkgroupSizeX`, y ≤ `…SizeY`, z ≤ `…SizeZ`, x·y·z ≤ `maxComputeInvocationsPerWorkgroup` —
+  한도는 어댑터가 알리는 값이다 (Metal: `maxThreadsPerThreadgroup`. 명세 기본값은 256 · 256 · 64 · 256)
+- 커널 자체의 `maxTotalThreadsPerThreadgroup`(레지스터 사용량에 따라 기기 한도보다 낮을 수 있다)을 넘으면
+  backend 오류 — Metal 단언으로 죽지 않게
 
 ## 3. 구조체 배치
 

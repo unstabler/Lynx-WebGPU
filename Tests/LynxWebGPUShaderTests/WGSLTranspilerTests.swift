@@ -875,6 +875,473 @@ final class WGSLTranspilerTests: XCTestCase {
         XCTAssertThrowsError(try module.translateToMSL(entryPoints: ["fs"], bindings: bindings))
     }
 
+    // MARK: - Integer attribute arguments / array lengths
+
+    func test_integerLiteralsFollowTheWGSLGrammar() {
+        XCTAssertEqual(WGSLIntegerLiteral("0")?.value, 0)
+        XCTAssertEqual(WGSLIntegerLiteral("42")?.value, 42)
+        XCTAssertEqual(WGSLIntegerLiteral("0x10")?.value, 16)
+        XCTAssertEqual(WGSLIntegerLiteral("0XfF")?.value, 255)
+        XCTAssertEqual(WGSLIntegerLiteral("7")?.suffix, WGSLIntegerLiteral.Suffix.none)
+        XCTAssertEqual(WGSLIntegerLiteral("2u")?.value, 2)
+        XCTAssertEqual(WGSLIntegerLiteral("2u")?.suffix, .u)
+        XCTAssertEqual(WGSLIntegerLiteral("0x10i")?.value, 16)
+        XCTAssertEqual(WGSLIntegerLiteral("0x10i")?.suffix, .i)
+        XCTAssertEqual(WGSLIntegerLiteral("0u")?.value, 0)
+        XCTAssertEqual(WGSLIntegerLiteral("2147483647i")?.value, Int(Int32.max))
+        XCTAssertEqual(WGSLIntegerLiteral("4294967295u")?.value, Int(UInt32.max))
+        XCTAssertEqual(WGSLIntegerLiteral("9223372036854775807")?.value, Int.max)
+
+        // Malformed, or out of range for the suffix's type (AbstractInt is i64).
+        for text in ["", "0x", "0xg", "08", "1_0", "1.5", "-1", "+1", "u", "1uu", "٣",
+                     "2147483648i", "4294967296u", "9223372036854775808", "0x8000000000000000"] {
+            XCTAssertNil(WGSLIntegerLiteral(text), "'\(text)' must be rejected")
+        }
+    }
+
+    func test_hexAndSuffixedAttributeArgumentsAreReadAsWGSLLiterals() throws {
+        // Stripping non-digits used to read 0x10 as 10 and (1 + 1) as 11.
+        let source = """
+        struct VertexInput {
+            @location(0x1) position: vec2f,
+            @location(0u) weight: f32,
+        };
+        @group(0) @binding(0x10) var<storage, read> data: array<f32>;
+        @group(0u) @binding(1 + 1) var<uniform> tint: vec4f;
+
+        @vertex
+        fn vs(input: VertexInput) -> @builtin(position) vec4f {
+            return vec4f(input.position * input.weight * data[0], 0.0, 1.0) * tint;
+        }
+        """
+        let module = try WGSLShaderModule(source: source)
+        XCTAssertEqual(module.reflection.resource(named: "data")?.binding, 16)
+        XCTAssertEqual(module.reflection.resource(named: "tint")?.binding, 2)
+
+        let msl = try translate(source, entryPoints: ["vs"])
+        XCTAssertTrue(msl.contains("[[attribute(1)]]"), msl)
+        XCTAssertTrue(msl.contains("[[attribute(0)]]"), msl)
+    }
+
+    func test_aHexArrayLengthSetsTheStructLayout() throws {
+        let source = """
+        struct Lights {
+            colors: array<vec4f, 0x10>,
+            @align(0x20) count: u32,
+            @size(0x10u) scale: f32,
+        };
+        @group(0) @binding(0) var<uniform> lights: Lights;
+
+        @fragment
+        fn fs() -> @location(0) vec4f {
+            return lights.colors[lights.count] * lights.scale;
+        }
+        """
+        let module = try WGSLParser.parse(source)
+        let structure = try XCTUnwrap(module.structNamed("Lights"))
+        let placement = WGSLLayout.layout(of: structure, module: module, uniform: true)
+        // 16 × vec4f = 256 bytes — 0x10 read as 10 used to put `count` at 160.
+        XCTAssertEqual(placement.members.map(\.offset), [0, 256, 260])
+        XCTAssertEqual(placement.members.map(\.size), [256, 4, 16])
+        XCTAssertEqual(placement.size, 288)
+
+        let msl = try translate(source, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("array<float4, 16> colors;"), msl)
+    }
+
+    func test_constNamedAttributeArgumentsResolveThroughModuleConstants() throws {
+        // A module-scope const may be declared after its use.
+        let source = """
+        @group(GROUP) @binding(LIGHTS) var<uniform> lights: array<vec4f, COUNT>;
+        @group(GROUP) @binding(BASE) var<uniform> tint: vec4f;
+
+        @fragment
+        fn fs(@location(BASE - 2) uv: vec2f) -> @location(0) vec4f {
+            return lights[1] * tint * uv.x;
+        }
+
+        const GROUP = 0;
+        const BASE = 2u;
+        const LIGHTS = (BASE + 0x1) * 2;
+        const COUNT = BASE * 2;
+        """
+        let module = try WGSLShaderModule(source: source)
+        XCTAssertEqual(module.reflection.resource(named: "lights")?.binding, 6)
+        XCTAssertEqual(module.reflection.resource(named: "lights")?.group, 0)
+        XCTAssertEqual(module.reflection.resource(named: "tint")?.binding, 2)
+
+        let msl = try translate(source, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("[[user(locn0)]]"), msl)
+        XCTAssertTrue(msl.contains("array<float4, 4>"), msl)
+    }
+
+    func test_anAttributeArgumentThatIsNotAUsableIntegerIsAShaderCreationError() {
+        // The attribute text as the message quotes it (argument tokens joined).
+        let cases: [(attribute: String, prelude: String, reason: String)] = [
+            ("@binding(0x)", "", "not a valid integer literal"),
+            ("@binding(08)", "", "not a valid integer literal"),
+            ("@binding(4294967296u)", "", "not a valid integer literal"),
+            ("@binding(4294967296)", "", "does not fit in u32"),
+            ("@binding(1.5)", "", "not an integer"),
+            ("@binding(-1)", "", "must be non-negative"),
+            ("@binding(missing)", "", "not a module-scope const"),
+            ("@binding(SLOT)", "override SLOT: u32 = 1;", "is an override"),
+            ("@binding(A)", "const A = B; const B = A;", "defined in terms of itself"),
+            ("@binding(4/(2-2))", "", "division by zero"),
+            ("@binding(1<<2)", "", "not supported"),
+            ("@binding(f(1))", "", "only integer literals"),
+            ("@binding()", "", "exactly one argument"),
+            ("@binding(1, 2)", "", "exactly one argument"),
+        ]
+        for testCase in cases {
+            let source = """
+            \(testCase.prelude)
+            @group(0) \(testCase.attribute) var<uniform> u: vec4f;
+            @fragment fn fs() -> @location(0) vec4f { return u; }
+            """
+            XCTAssertThrowsError(try WGSLShaderModule(source: source), testCase.attribute) { error in
+                let error = error as? WGPUError
+                let message = error?.message ?? ""
+                XCTAssertTrue(message.contains(testCase.attribute), "names the attribute: \(message)")
+                XCTAssertTrue(message.contains(testCase.reason), "says why (\(testCase.reason)): \(message)")
+                XCTAssertEqual(error?.line, 2, message)
+            }
+        }
+
+        // The other integer attributes go through the same check.
+        for (source, reason) in [
+            ("struct S { @align(3) a: f32 };", "positive power of two"),
+            ("struct S { @size(0) a: f32 };", "must be positive"),
+            ("@fragment fn fs() -> @location(oops) vec4f { return vec4f(); }", "not a module-scope const"),
+        ] {
+            XCTAssertThrowsError(try WGSLShaderModule(source: source), source) { error in
+                let message = (error as? WGPUError)?.message ?? ""
+                XCTAssertTrue(message.contains(reason), "says why (\(reason)): \(message)")
+            }
+        }
+    }
+
+    func test_aSelfReferentialArrayLengthIsAnErrorNotAHang() throws {
+        for source in [
+            """
+            const A = B + 1;
+            const B = A;
+            var<private> xs: array<f32, A>;
+            @fragment fn fs() -> @location(0) vec4f { return vec4f(xs[0]); }
+            """,
+            """
+            @fragment fn fs() -> @location(0) vec4f {
+                const n = n + 1;
+                var xs: array<f32, n>;
+                return vec4f(xs[0]);
+            }
+            """,
+        ] {
+            let module = try WGSLShaderModule(source: source)
+            let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["fs"]))
+            XCTAssertThrowsError(try module.translateToMSL(entryPoints: ["fs"], bindings: bindings)) { error in
+                let message = (error as? WGPUError)?.message ?? ""
+                XCTAssertTrue(message.contains("defined in terms of itself"), message)
+            }
+        }
+    }
+
+    func test_aDeeplyNestedConstantExpressionIsAnErrorNotAStackOverflow() throws {
+        // The JS thread's stack is small — evaluation depth is bounded instead of trusting the shader.
+        let terms = Array(repeating: "1", count: 1000).joined(separator: "+")
+        let chain = (1..<1000).map { "const C\($0) = C\($0 - 1);" }.joined(separator: "\n")
+        for source in [
+            "@group(0) @binding(\(terms)) var<uniform> u: vec4f;",
+            "const C0 = 0;\n\(chain)\n@group(0) @binding(C999) var<uniform> u: vec4f;",
+        ] {
+            XCTAssertThrowsError(try WGSLShaderModule(source: source)) { error in
+                let message = (error as? WGPUError)?.message ?? ""
+                XCTAssertTrue(message.contains("nested too deeply"), String(message.suffix(200)))
+            }
+        }
+
+        // The same, as an array length (an override-expression).
+        let module = try WGSLShaderModule(source: """
+        var<private> xs: array<f32, \(terms)>;
+        @fragment fn fs() -> @location(0) vec4f { return vec4f(xs[0]); }
+        """)
+        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["fs"]))
+        XCTAssertThrowsError(try module.translateToMSL(entryPoints: ["fs"], bindings: bindings)) { error in
+            let message = (error as? WGPUError)?.message ?? ""
+            XCTAssertTrue(message.contains("nested too deeply"), String(message.suffix(200)))
+        }
+
+        // A realistic depth still resolves.
+        let shallow = Array(repeating: "1", count: 100).joined(separator: "+")
+        let shallowModule = try WGSLShaderModule(source: """
+        @group(0) @binding(\(shallow)) var<uniform> u: vec4f;
+        @fragment fn fs() -> @location(0) vec4f { return u; }
+        """)
+        XCTAssertEqual(shallowModule.reflection.resource(named: "u")?.binding, 100)
+    }
+
+    func test_integerConversionsAreConstExpressions() throws {
+        let source = """
+        const SLOT = u32(3);
+        @group(0) @binding(SLOT) var<uniform> tint: vec4f;
+        @group(i32(0)) @binding(i32(SLOT) + 1) var<storage, read_write> out: array<f32>;
+        var<private> weights: array<f32, u32(4)>;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            weights[0] = tint.x;
+            out[0] = weights[0];
+        }
+        """
+        let module = try WGSLShaderModule(source: source)
+        XCTAssertEqual(module.reflection.resource(named: "tint")?.binding, 3)
+        XCTAssertEqual(module.reflection.resource(named: "out")?.binding, 4)
+
+        let msl = try translate(source, entryPoints: ["main"])
+        XCTAssertTrue(msl.contains("array<float, 4>"), msl)
+
+        // The conversion keeps its range check.
+        for (attribute, reason) in [("@binding(u32(-1))", "does not fit in u32"),
+                                    ("@binding(i32(0x80000000))", "does not fit in i32"),
+                                    ("@binding(u32(1, 2))", "only integer literals")] {
+            let broken = "@group(0) \(attribute) var<uniform> u: vec4f;"
+            XCTAssertThrowsError(try WGSLShaderModule(source: broken), attribute) { error in
+                let message = (error as? WGPUError)?.message ?? ""
+                XCTAssertTrue(message.contains(reason), "says why (\(reason)): \(message)")
+            }
+        }
+    }
+
+    func test_aNonPositiveOverrideArrayLengthIsRejected() throws {
+        // A negative pipeline constant used to be read digit by digit — -3 became `array<float, 3>`.
+        let source = """
+        override N: u32 = 64;
+        override bias: i32 = 0;
+        @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+        var<workgroup> buf: array<f32, N>;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            buf[0] = f32(10 - bias);
+            out[0] = buf[0];
+        }
+        """
+        let module = try WGSLShaderModule(source: source)
+        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["main"]))
+        for value in [-3.0, 0.0] {
+            XCTAssertThrowsError(
+                try module.translateToMSL(entryPoints: ["main"], bindings: bindings, constants: ["N": value]),
+                "N = \(value)"
+            ) { error in
+                let message = (error as? WGPUError)?.message ?? ""
+                XCTAssertTrue(message.contains("an array length must be positive"), message)
+            }
+        }
+
+        // A negative constant elsewhere is planted as a negation (WGSL has no negative literals).
+        let msl = try module.translateToMSL(
+            entryPoints: ["main"], bindings: bindings, constants: ["N": 8, "bias": -3]
+        )
+        XCTAssertTrue(msl.contains("array<float, 8>"), msl)
+        XCTAssertTrue(msl.contains("-3"), msl)
+        MetalCompilerHarness.assertCompiles(msl)
+    }
+
+    // MARK: - @workgroup_size
+
+    func test_workgroupSizeArgumentsAreEvaluatedAsExpressions() throws {
+        // Each argument used to be read as `Int(text) ?? 1` — every one of these dispatched 1 thread.
+        let source = """
+        const BLOCK = 8u;
+        @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+
+        @compute @workgroup_size(64u)
+        fn suffixed(@builtin(global_invocation_id) id: vec3u) { out[id.x] = 1u; }
+
+        @compute @workgroup_size(0x10, BLOCK, 2)
+        fn hexAndConst(@builtin(global_invocation_id) id: vec3u) { out[id.x] = 2u; }
+
+        @compute @workgroup_size(BLOCK * 2, (1i), u32(4))
+        fn expressions(@builtin(global_invocation_id) id: vec3u) { out[id.x] = 3u; }
+        """
+        let module = try WGSLShaderModule(source: source)
+        let expected = ["suffixed": [64, 1, 1], "hexAndConst": [16, 8, 2], "expressions": [16, 1, 4]]
+        for (entry, size) in expected.sorted(by: { $0.key < $1.key }) {
+            let evaluated = try XCTUnwrap(module.workgroupSize(of: entry), entry)
+            XCTAssertEqual([evaluated.x, evaluated.y, evaluated.z], size, entry)
+            let reflected = try XCTUnwrap(module.reflection.entryPoint(named: entry)?.workgroupSize, entry)
+            XCTAssertEqual([reflected.x, reflected.y, reflected.z], size, entry)
+            _ = try translate(source, entryPoints: [entry])
+        }
+    }
+
+    func test_anOverrideWorkgroupSizeTakesThePipelineConstants() throws {
+        // webgpu-samples' gameOfLife: `@workgroup_size(blockSize, blockSize)`.
+        let source = """
+        override blockSize: u32 = 8u;
+        override depth: u32;
+        @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+
+        @compute @workgroup_size(blockSize, blockSize)
+        fn main(@builtin(global_invocation_id) id: vec3u) { out[id.x] = blockSize; }
+
+        @compute @workgroup_size(4, 1, depth)
+        fn deep(@builtin(global_invocation_id) id: vec3u) { out[id.x] = depth; }
+        """
+        let module = try WGSLShaderModule(source: source)
+
+        // The default, then a supplied value.
+        let byDefault = try XCTUnwrap(module.workgroupSize(of: "main"))
+        XCTAssertEqual([byDefault.x, byDefault.y, byDefault.z], [8, 8, 1])
+        XCTAssertEqual(module.reflection.entryPoint(named: "main")?.workgroupSize?.x, 8)
+        let supplied = try XCTUnwrap(module.workgroupSize(of: "main", constants: ["blockSize": 4, "depth": 1]))
+        XCTAssertEqual([supplied.x, supplied.y, supplied.z], [4, 4, 1])
+
+        // No default: unknown until the pipeline supplies it — a clear error, never 1.
+        XCTAssertNil(module.reflection.entryPoint(named: "deep")?.workgroupSize)
+        XCTAssertThrowsError(try module.workgroupSize(of: "deep")) { error in
+            let message = (error as? WGPUError)?.message ?? ""
+            XCTAssertTrue(message.contains("override 'depth' has no value"), message)
+            XCTAssertTrue(message.contains("@workgroup_size(4, 1, depth)"), message)
+        }
+        let deep = try XCTUnwrap(module.workgroupSize(of: "deep", constants: ["depth": 16]))
+        XCTAssertEqual([deep.x, deep.y, deep.z], [4, 1, 16])
+
+        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["main"]))
+        let msl = try module.translateToMSL(
+            entryPoints: ["main"], bindings: bindings, constants: ["blockSize": 4, "depth": 1]
+        )
+        MetalCompilerHarness.assertCompiles(msl)
+    }
+
+    func test_workgroupMemoryZeroInitStridesByTheEvaluatedSize() throws {
+        // The zero-init loop strides by the thread count. Too large a stride leaves slots never zeroed,
+        // so it must be the size the pipeline dispatches — constants applied.
+        let source = """
+        override blockSize: u32 = 8u;
+        const ROWS = 0x2;
+        @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+        var<workgroup> tile: array<f32, 256>;
+
+        @compute @workgroup_size(blockSize, ROWS)
+        fn main(@builtin(local_invocation_index) index: u32) {
+            tile[index] = f32(index);
+            workgroupBarrier();
+            out[index] = tile[255u - index];
+        }
+        """
+        let module = try WGSLShaderModule(source: source)
+        let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: ["main"]))
+        for (constants, stride) in [([String: Double](), 16), (["blockSize": 32], 64), (["blockSize": 1], 2)] {
+            let msl = try module.translateToMSL(entryPoints: ["main"], bindings: bindings, constants: constants)
+            XCTAssertTrue(msl.contains("wgpu_zi += \(stride)u"), "\(constants) → stride \(stride):\n\(msl)")
+            let size = try XCTUnwrap(module.workgroupSize(of: "main", constants: constants))
+            XCTAssertEqual(size.x * size.y * size.z, stride, "the dispatch and the zero-init agree")
+            MetalCompilerHarness.assertCompiles(msl)
+        }
+    }
+
+    func test_aWorkgroupSizeThatIsNotAPositiveIntegerIsAShaderCreationError() {
+        let cases: [(attribute: String, prelude: String, reason: String)] = [
+            ("@workgroup_size(0)", "", "must be at least 1"),
+            ("@workgroup_size(8, -1)", "", "must be at least 1"),
+            ("@workgroup_size(4, 4, ZERO)", "const ZERO = 0u;", "must be at least 1"),
+            ("@workgroup_size(1.5)", "", "not an integer"),
+            ("@workgroup_size(0x)", "", "not a valid integer literal"),
+            ("@workgroup_size(missing)", "", "not a module-scope const"),
+            ("@workgroup_size()", "", "one to three arguments"),
+            ("@workgroup_size(1, 1, 1, 1)", "", "one to three arguments"),
+            ("@workgroup_size(1<<2)", "", "not supported"),
+        ]
+        for testCase in cases {
+            let source = """
+            \(testCase.prelude)
+            @compute \(testCase.attribute) fn main() {}
+            """
+            XCTAssertThrowsError(try WGSLShaderModule(source: source), testCase.attribute) { error in
+                let error = error as? WGPUError
+                let message = error?.message ?? ""
+                XCTAssertTrue(message.contains(testCase.attribute), "names the attribute: \(message)")
+                XCTAssertTrue(message.contains(testCase.reason), "says why (\(testCase.reason)): \(message)")
+                XCTAssertEqual(error?.line, 2, message)
+            }
+        }
+
+        // A compute entry point must declare one — dispatching 1 thread silently is what this replaces.
+        XCTAssertThrowsError(try WGSLShaderModule(source: "@compute fn main() {}")) { error in
+            let message = (error as? WGPUError)?.message ?? ""
+            XCTAssertTrue(message.contains("@compute — compute entry point 'main' has no @workgroup_size"), message)
+        }
+
+        // An override argument is left to pipeline creation, even when its default is 0.
+        XCTAssertNoThrow(try WGSLShaderModule(source: """
+        override size: u32 = 0u;
+        @compute @workgroup_size(size) fn main() {}
+        """))
+    }
+
+    func test_aWorkgroupSizeOutsideTheLimitsIsAPipelineCreationError() throws {
+        let module = try WGSLShaderModule(source: """
+        override wx: i32 = 64;
+        override wy: u32 = 1u;
+        @compute @workgroup_size(wx, wy) fn byOverride() {}
+        @compute @workgroup_size(512) fn wide() {}
+        @compute @workgroup_size(1, 1, 65) fn deep() {}
+        @compute @workgroup_size(16, 32) fn many() {}
+        @compute @workgroup_size(1024) fn large() {}
+        """)
+        func assertRejected(
+            _ entry: String, constants: [String: Double] = [:], limits: WGSLWorkgroupLimits = .specDefaults,
+            _ reason: String, line: UInt = #line
+        ) {
+            XCTAssertThrowsError(
+                try module.workgroupSize(of: entry, constants: constants, limits: limits), entry, line: line
+            ) { error in
+                let error = error as? WGPUError
+                XCTAssertEqual(error?.kind, .validation, line: line)
+                XCTAssertTrue(error?.message.contains(reason) == true, "\(reason): \(error?.message ?? "")", line: line)
+            }
+        }
+
+        // The spec's default limits: 256 × 256 × 64, 256 invocations.
+        assertRejected("wide", "512 exceeds maxComputeWorkgroupSizeX (256)")
+        assertRejected("deep", "65 exceeds maxComputeWorkgroupSizeZ (64)")
+        assertRejected("many", "512 invocations exceed maxComputeInvocationsPerWorkgroup (256)")
+        assertRejected("byOverride", constants: ["wy": 300], "300 exceeds maxComputeWorkgroupSizeY (256)")
+        assertRejected("byOverride", constants: ["wx": 0], "must be at least 1")
+        assertRejected("byOverride", constants: ["wx": -2], "must be at least 1")
+        assertRejected("byOverride", constants: ["wx": 2.5], "not an integer")
+
+        // A device that advertises more lets more through — the backend passes its own limits.
+        let generous = WGSLWorkgroupLimits(maxSizeX: 1024, maxSizeY: 1024, maxSizeZ: 1024, maxInvocations: 1024)
+        let large = try XCTUnwrap(module.workgroupSize(of: "large", limits: generous))
+        XCTAssertEqual([large.x, large.y, large.z], [1024, 1, 1])
+        assertRejected("large", "1024 exceeds maxComputeWorkgroupSizeX (256)")
+        let fits = try XCTUnwrap(module.workgroupSize(of: "byOverride", constants: ["wx": 16, "wy": 16]))
+        XCTAssertEqual([fits.x, fits.y, fits.z], [16, 16, 1])
+    }
+
+    func test_anOverflowingWorkgroupSizeIsAnErrorInTranslationToo() throws {
+        // `translateToMSL` applies no device limits — the zero-init stride must not trap on overflow.
+        let module = try WGSLShaderModule(source: """
+        var<workgroup> tile: array<u32, 4>;
+        @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+        @compute @workgroup_size(4294967295, 4294967295, 4294967295)
+        fn huge(@builtin(local_invocation_index) index: u32) { out[index] = tile[index % 4u]; }
+        @compute @workgroup_size(65536, 65536)
+        fn wide(@builtin(local_invocation_index) index: u32) { out[index] = tile[index % 4u]; }
+        """)
+        for entry in ["huge", "wide"] {
+            let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: [entry]))
+            XCTAssertThrowsError(try module.translateToMSL(entryPoints: [entry], bindings: bindings), entry) { error in
+                let error = error as? WGPUError
+                XCTAssertEqual(error?.kind, .validation, entry)
+                XCTAssertTrue(error?.message.contains("does not fit in u32") == true, error?.message ?? "")
+            }
+            XCTAssertThrowsError(try module.workgroupSize(of: entry), entry)
+        }
+    }
+
     // MARK: - External textures
 
     func test_anExternalTextureTranslatesToEdgeClampedSampling() throws {

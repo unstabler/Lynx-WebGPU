@@ -100,8 +100,8 @@ enum WGSLLayout {
         for member in structure.members {
             var memberAlign = align(of: member.type, module: module, uniform: uniform)
             var memberSize = size(of: member.type, module: module, uniform: uniform)
-            if let explicit = member.attributes.first(named: "align")?.firstInt { memberAlign = explicit }
-            if let explicit = member.attributes.first(named: "size")?.firstInt { memberSize = max(memberSize, explicit) }
+            if let explicit = member.attributes.first(named: "align")?.integerValue { memberAlign = explicit }
+            if let explicit = member.attributes.first(named: "size")?.integerValue { memberSize = max(memberSize, explicit) }
 
             offset = roundUp(memberAlign, offset)
             members.append(MemberPlacement(
@@ -138,89 +138,19 @@ enum WGSLLayout {
         return nil
     }
 
-    /// Computes a value that must be known at compile time, such as an array length. Only integer literals and module constants are supported.
-    static func constantValue(_ expression: WGSLExpression, module: WGSLModule) -> Int? {
-        switch expression {
-        case .intLiteral(let text):
-            return Int(text.filter(\.isNumber))
-        case .paren(let inner):
-            return constantValue(inner, module: module)
-        case .identifier(let name):
-            if let constant = module.constants.first(where: { $0.name == name }),
-               let value = constant.value {
-                return constantValue(value, module: module)
-            }
-            // A `const` declared inside a function is a compile-time constant too (`var a: array<T, maxLayers>;`).
-            return uniqueLocalConstant(named: name, module: module)
-        case .binary(let op, let left, let right):
-            guard let l = constantValue(left, module: module), let r = constantValue(right, module: module) else {
-                return nil
-            }
-            switch op {
-            case "+": return l + r
-            case "-": return l - r
-            case "*": return l * r
-            case "/": return r == 0 ? nil : l / r
-            default: return nil
-            }
-        default:
-            return nil
-        }
-    }
-
-    /// The value of a function-local `const` declared under this name anywhere in the module.
+    /// Computes a value that must be known at compile time, such as an array length.
     ///
-    /// Being local, it is visible only inside its function in principle, but there is no function
-    /// context when settling an array size. So it is used **only when the module settles on one
-    /// value** — if the same name holds different values per function we cannot tell which, so we
-    /// give up and raise the error as before.
-    private static func uniqueLocalConstant(named name: String, module: WGSLModule) -> Int? {
-        var found: Int?
-        for function in module.functions {
-            for expression in localConstants(named: name, in: function.body) {
-                guard let value = constantValue(expression, module: module) else { return nil }
-                if let found, found != value { return nil }
-                found = value
-            }
-        }
-        return found
+    /// An array length is an override-expression and may sit inside a function, so overrides and
+    /// function-local `const`s resolve too. nil when it cannot be computed (`WGSLConstantEvaluator`
+    /// says why).
+    static func constantValue(_ expression: WGSLExpression, module: WGSLModule) -> Int? {
+        try? arrayLength(expression, module: module)
     }
 
-    private static func localConstants(named name: String, in statements: [WGSLStatement]) -> [WGSLExpression] {
-        var values: [WGSLExpression] = []
-        for statement in statements {
-            if case .constDeclaration(let declared, _, let value) = statement, declared == name {
-                values.append(value)
-            }
-            for block in nestedBlocks(of: statement) {
-                values.append(contentsOf: localConstants(named: name, in: block))
-            }
-        }
-        return values
-    }
-
-    /// Walks nested blocks only (so a local `const` is found wherever it sits).
-    private static func nestedBlocks(of statement: WGSLStatement) -> [[WGSLStatement]] {
-        switch statement {
-        case .ifStatement(_, let then, let elseBranch):
-            switch elseBranch {
-            case .block(let statements)?: return [then, statements]
-            case .chained(let nested)?: return [then, [nested]]
-            case nil: return [then]
-            }
-        case .forStatement(let initializer, _, _, let body):
-            return initializer.map { [[$0], body] } ?? [body]
-        case .whileStatement(_, let body):
-            return [body]
-        case .loopStatement(let body, let continuing):
-            return continuing.map { [body, $0] } ?? [body]
-        case .switchStatement(_, let cases):
-            return cases.map(\.body)
-        case .block(let statements):
-            return [statements]
-        default:
-            return []
-        }
+    /// `constantValue` that keeps the reason it failed.
+    static func arrayLength(_ expression: WGSLExpression, module: WGSLModule) throws -> Int {
+        var evaluator = WGSLConstantEvaluator(module: module, allowsOverrides: true, allowsFunctionConstants: true)
+        return try evaluator.evaluate(expression)
     }
 
     /// Names of structs used in the uniform address space — their layout rules are stricter than storage.
