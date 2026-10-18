@@ -447,14 +447,21 @@ public struct WGPURenderPipelineInfo {
     /// Used when rejecting in a `depthReadOnly`/`stencilReadOnly` pass.
     public let writesDepth: Bool?
     public let writesStencil: Bool?
+    /// The spec's **minimum buffer binding size** of each buffer variable the pipeline's entry
+    /// points use, by group then binding. Checked against an explicit layout's `minBindingSize` at
+    /// pipeline creation and against the bound ranges (`minBindingSize: 0` entries) at draw time.
+    /// A binding missing from the table is not checked (a shader the backend cannot reflect).
+    public let minimumBindingSizes: [Int: [Int: Int]]?
 
     public init(requiredGroups: Set<Int>? = nil, layoutGroupCount: Int? = nil,
-                requiredVertexSlots: Set<Int>? = nil, writesDepth: Bool? = nil, writesStencil: Bool? = nil) {
+                requiredVertexSlots: Set<Int>? = nil, writesDepth: Bool? = nil, writesStencil: Bool? = nil,
+                minimumBindingSizes: [Int: [Int: Int]]? = nil) {
         self.requiredGroups = requiredGroups
         self.layoutGroupCount = layoutGroupCount
         self.requiredVertexSlots = requiredVertexSlots
         self.writesDepth = writesDepth
         self.writesStencil = writesStencil
+        self.minimumBindingSizes = minimumBindingSizes
     }
 }
 
@@ -462,10 +469,14 @@ public struct WGPUComputePipelineInfo {
     public let requiredGroups: Set<Int>?
     /// See `WGPURenderPipelineInfo.layoutGroupCount`.
     public let layoutGroupCount: Int?
+    /// Same as `WGPURenderPipelineInfo.minimumBindingSizes` (checked at dispatch).
+    public let minimumBindingSizes: [Int: [Int: Int]]?
 
-    public init(requiredGroups: Set<Int>? = nil, layoutGroupCount: Int? = nil) {
+    public init(requiredGroups: Set<Int>? = nil, layoutGroupCount: Int? = nil,
+                minimumBindingSizes: [Int: [Int: Int]]? = nil) {
         self.requiredGroups = requiredGroups
         self.layoutGroupCount = layoutGroupCount
+        self.minimumBindingSizes = minimumBindingSizes
     }
 }
 

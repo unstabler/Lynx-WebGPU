@@ -388,9 +388,10 @@ struct MSLEmitter {
                 return .vector(size: size, element: element)
             }
             if callee == "array" {
-                let element = typeArguments.first ?? arguments.first.flatMap(inferredType(of:))
-                guard let element else { return nil }
-                return .array(element: element, count: .intLiteral(String(arguments.count)))
+                return arrayConstructorType(typeArguments: typeArguments, argumentCount: arguments.count)
+                    ?? arguments.first.flatMap(inferredType(of:)).map {
+                        WGSLType.array(element: $0, count: .intLiteral(String(arguments.count)))
+                    }
             }
             return nil
         default:
@@ -929,23 +930,19 @@ struct MSLEmitter {
                 line("\(text);")
             }
 
-        case .ifStatement(let condition, let then, let elseBranch):
-            line("if (\(try expression(condition)))")
-            line("{")
-            try scoped { emitter in try emitter.statements(then) }
-            line("}")
-            switch elseBranch {
-            case .block(let statements)?:
+        case .ifStatement(let clauses, let elseBody):
+            // The chain stays flat in MSL too: `if … else if … else …`, one loop iteration per arm.
+            for (index, clause) in clauses.enumerated() {
+                line("\(index == 0 ? "if" : "else if") (\(try expression(clause.condition)))")
+                line("{")
+                try scoped { emitter in try emitter.statements(clause.body) }
+                line("}")
+            }
+            if let elseBody {
                 line("else")
                 line("{")
-                try scoped { emitter in try emitter.statements(statements) }
+                try scoped { emitter in try emitter.statements(elseBody) }
                 line("}")
-            case .chained(let nested)?:
-                // `else if` — attach the nested if after the else.
-                line("else")
-                try scoped { emitter in try emitter.emitStatement(nested) }
-            case nil:
-                break
             }
 
         case .forStatement(let initializer, let condition, let update, let body):
@@ -1161,13 +1158,9 @@ struct MSLEmitter {
                 return true
             case .block(let inner), .whileStatement(_, let inner), .forStatement(_, _, _, let inner):
                 if containsContinue(inner) { return true }
-            case .ifStatement(_, let then, let elseBranch):
-                if containsContinue(then) { return true }
-                switch elseBranch {
-                case .block(let inner)?: if containsContinue(inner) { return true }
-                case .chained(let nested)?: if containsContinue([nested]) { return true }
-                case nil: break
-                }
+            case .ifStatement(let clauses, let elseBody):
+                for clause in clauses where containsContinue(clause.body) { return true }
+                if let elseBody, containsContinue(elseBody) { return true }
             case .switchStatement(_, let cases):
                 for switchCase in cases where containsContinue(switchCase.body) { return true }
             default:
@@ -1387,13 +1380,17 @@ struct MSLEmitter {
         }
         if callee == "array" {
             // With the element type omitted, guess it from the first argument's constructor name (`array(vec2f(…), …)`).
-            let element = typeArguments.first ?? arguments.first.flatMap(inferredType(of:))
-            guard let element, let elementType = try? MSLTypeMapping.type(element, module: module) else {
+            let arrayType = arrayConstructorType(typeArguments: typeArguments, argumentCount: emitted.count)
+                ?? arguments.first.flatMap(inferredType(of:)).map {
+                    WGSLType.array(element: $0, count: .intLiteral(String(emitted.count)))
+                }
+            guard let arrayType else {
                 throw WGPUError.unsupported(
                     "WGSL: cannot determine the element type of an array(…) constructor — spell it out as `array<T, N>(…)`"
                 )
             }
-            return "array<\(elementType), \(emitted.count)>{\(emitted.joined(separator: ", "))}"
+            // An empty brace list is value-initialization — the zero value `array<T, N>()` asks for.
+            return "\(try MSLTypeMapping.type(arrayType, module: module)){\(emitted.joined(separator: ", "))}"
         }
         // WGSL defines f32 → i32/u32 conversion as **saturating** (a C++ cast is UB out of range).
         // Only a single argument is a conversion; a constructor listing components already passed each argument through its own.
@@ -1429,6 +1426,17 @@ struct MSLEmitter {
             : "\(arity.lowerBound) to \(arity.upperBound)"
         let noun = arity.upperBound == 1 ? "argument" : "arguments"
         throw WGPUError.validation("WGSL: \(callee)() expects \(expected) \(noun), got \(count)")
+    }
+
+    /// The type an `array<T, N>(…)` / `array<T>(…)` constructor builds — the parser keeps the written
+    /// array type as the sole type argument. Its length is the declared one (the zero-argument form
+    /// has nothing else to go by); when there is none, or it cannot be computed here, the argument count.
+    private func arrayConstructorType(typeArguments: [WGSLType], argumentCount: Int) -> WGSLType? {
+        guard case .array(let element, let count)? = typeArguments.first else { return nil }
+        if let count, argumentCount == 0 || WGSLLayout.constantValue(count, module: module) != nil {
+            return .array(element: element, count: count)
+        }
+        return .array(element: element, count: .intLiteral(String(argumentCount)))
     }
 
     /// The saturating conversion helper name, when this is an integer-producing constructor (`i32`, `u32`, `vec3i`, `vec2<u32>`, …).
@@ -1499,6 +1507,17 @@ struct MSLEmitter {
             }
         }
 
+        /// The optional trailing `offset` (a const-expression `vec2<i32>` / `vec3<i32>`). Metal takes it
+        /// as the **last** argument, after any LOD option — dropping it silently samples the wrong texel.
+        /// WGSL allows it only on 2d, 2d_array and 3d textures (depth ones included), never on cubes.
+        func appendOffset(to parameters: inout [String]) throws {
+            guard !rest.isEmpty else { return }
+            guard rest.count == 1, ["2d", "2d_array", "3d"].contains(dimension) else {
+                throw WGPUError.validation("WGSL: too many arguments to \(callee)() for a \(dimension) texture")
+            }
+            parameters.append("\(dimension == "3d" ? "int3" : "int2")(\(rest.removeFirst()))")
+        }
+
         switch callee {
         case "textureSample", "textureSampleBias", "textureSampleLevel", "textureSampleGrad":
             guard rest.count >= 2 else {
@@ -1519,10 +1538,17 @@ struct MSLEmitter {
                 guard rest.count >= 2 else { throw WGPUError.validation("WGSL: textureSampleGrad has no derivatives") }
                 let dx = rest.removeFirst()
                 let dy = rest.removeFirst()
-                parameters.append("gradient2d(\(dx), \(dy))")
+                let gradient: String
+                switch dimension {
+                case "3d": gradient = "gradient3d"
+                case "cube", "cube_array": gradient = "gradientcube"
+                default: gradient = "gradient2d"
+                }
+                parameters.append("\(gradient)(\(dx), \(dy))")
             default:
                 break
             }
+            try appendOffset(to: &parameters)
             return "\(receiver).sample(\(parameters.joined(separator: ", ")))"
 
         case "textureSampleCompare", "textureSampleCompareLevel":
@@ -1534,6 +1560,10 @@ struct MSLEmitter {
             var parameters = [sampler, coordinates]
             if isArrayed, rest.count >= 2 { parameters.append(rest.removeFirst()) }
             parameters.append(rest.removeFirst())
+            // `…CompareLevel` samples mip level 0 — spelled out, because Metal's option-less overload
+            // takes an implicit LOD (fragment-only) and the offset must follow the LOD option.
+            if callee == "textureSampleCompareLevel" { parameters.append("level(0)") }
+            try appendOffset(to: &parameters)
             return "\(receiver).sample_compare(\(parameters.joined(separator: ", ")))"
 
         case "textureLoad":

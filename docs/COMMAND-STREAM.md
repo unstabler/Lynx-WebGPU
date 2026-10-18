@@ -189,6 +189,12 @@ Metal은 배치의 큐 쓰기를 **별도 커맨드 버퍼**(스테이징 + blit
 **`entries[]` (바인드 그룹)** — `binding` · `resource:{…}`, 안에 셋 중 하나:
 `{buffer, offset?, size?}` · `{sampler}` · `{textureView}`.
 
+`minBindingSize`는 엔진이 검사한다 (네이티브 검증 백엔드면 백엔드가): 바인드 그룹 생성 시 바인딩된 범위 ≥
+`minBindingSize`, 명시적 레이아웃 파이프라인 생성 시 0이 아닌 `minBindingSize` ≥ 셰이더 최소 크기, 그리고
+`minBindingSize: 0` 항목은 draw/dispatch 때 셰이더 최소 크기와 비교한다. 셰이더 최소 크기는 백엔드가
+`WGPURenderPipelineInfo`/`WGPUComputePipelineInfo.minimumBindingSizes`(그룹 → 바인딩 → 바이트)로 넘긴다 —
+nil이면 그 검사는 백엔드 몫이다. `getBindGroupLayout`이 돌려주는 자동 레이아웃은 이 값을 `minBindingSize`에 싣는다.
+
 **`vertex`** — `module` · `entryPoint`(생략 시 그 스테이지의 유일한 진입점) · `buffers[]` · `constants{}`.
 `buffers[]` 항목은 `arrayStride` · `stepMode`(`"vertex"`) · `attributes[{format, offset(0), shaderLocation}]`.
 
@@ -248,7 +254,7 @@ Metal은 둘 다 느슨해서, 안 막으면 브라우저·Dawn에서만 거부�
 |---|---|
 | `beginRenderPass` | `colorAttachments[]` · `depthStencilAttachment` · `occlusionQuerySet` · `timestampWrites` · `label` |
 | `setPipeline` | `pipeline` (렌더/컴퓨트 공용 — 열린 패스가 어느 쪽인지 정한다) |
-| `setBindGroup` | `index` · `bindGroup` · `dynamicOffsets[]` |
+| `setBindGroup` | `index` · `bindGroup` · `dynamicOffsets[]` — 개수는 레이아웃의 `hasDynamicOffset` 항목 수와 같아야 하고(바인딩 번호 순), 각 값은 `minUniformBufferOffsetAlignment`/`minStorageBufferOffsetAlignment`의 배수, `offset + 동적 오프셋 + size ≤ 버퍼 크기` (size 생략 시 버퍼 끝까지라 0만 된다 — Dawn과 같은 규칙). 어긋나면 이 명령에서 검증 오류 |
 | `setVertexBuffer` | `slot` · `buffer` · `offset`(0) |
 | `setIndexBuffer` | `buffer` · `format`(`"uint16"`\|`"uint32"`) · `offset`(0) |
 | `setViewport` | `x`(0) · `y`(0) · `width` · `height` · `minDepth`(0) · `maxDepth`(1) |

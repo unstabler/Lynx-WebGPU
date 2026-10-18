@@ -7,8 +7,13 @@ public struct WGSLResourceInfo: Equatable {
     public let group: Int
     public let binding: Int
     public let slotKind: WGPUMetalSlotKind
-    /// The bind group layout entry a `layout: "auto"` pipeline uses.
+    /// The bind group layout entry a `layout: "auto"` pipeline uses. A buffer entry's
+    /// `minBindingSize` is `minimumBindingSize` — the spec's default pipeline layout says so.
     public let bindingLayout: WGPUBindingLayout
+    /// For a uniform/storage buffer, the WebGPU spec's **minimum buffer binding size**: `SizeOf` of
+    /// the store type under WGSL layout rules, a runtime-sized array counting as one element. A bound
+    /// range smaller than this lets the shader read or write past it. Nil for other resources.
+    public let minimumBindingSize: Int?
 }
 
 /// One entry point.
@@ -56,6 +61,17 @@ public struct WGSLShaderReflection {
             .sorted { ($0.group, $0.binding) < ($1.group, $1.binding) }
     }
 
+    /// The minimum buffer binding size of every buffer the given entry points use, by group then
+    /// binding — what the engine checks bound ranges against at pipeline creation and draw/dispatch.
+    public func minimumBindingSizes(usedBy entryPointNames: [String]) -> [Int: [Int: Int]] {
+        var sizes: [Int: [Int: Int]] = [:]
+        for resource in resources(usedBy: entryPointNames) {
+            guard let size = resource.minimumBindingSize else { continue }
+            sizes[resource.group, default: [:]][resource.binding] = size
+        }
+        return sizes
+    }
+
     /// Builds visibility by unioning the stages of the entry points that use the resource.
     public func visibility(of resourceName: String) -> WGPUShaderStage {
         var visibility: WGPUShaderStage = []
@@ -87,13 +103,19 @@ enum WGSLReflectionBuilder {
 
         let resources: [WGSLResourceInfo] = module.globals.compactMap { global in
             guard let group = global.group, let binding = global.binding,
-                  let layout = bindingLayout(for: global) else { return nil }
+                  var layout = bindingLayout(for: global) else { return nil }
+            let minimumSize = minimumBindingSize(of: global, in: module)
+            if case .buffer(var buffer) = layout, let minimumSize {
+                buffer.minBindingSize = minimumSize
+                layout = .buffer(buffer)
+            }
             return WGSLResourceInfo(
                 name: global.name,
                 group: group,
                 binding: binding,
                 slotKind: layout.metalSlotKind,
-                bindingLayout: layout
+                bindingLayout: layout,
+                minimumBindingSize: minimumSize
             )
         }.sorted { ($0.group, $0.binding) < ($1.group, $1.binding) }
 
@@ -294,14 +316,8 @@ enum WGSLReflectionBuilder {
         switch statement {
         case .block(let inner):
             return [inner]
-        case .ifStatement(_, let then, let elseBranch):
-            var blocks = [then]
-            switch elseBranch {
-            case .block(let inner)?: blocks.append(inner)
-            case .chained(let nested)?: blocks.append([nested])
-            case nil: break
-            }
-            return blocks
+        case .ifStatement(let clauses, let elseBody):
+            return clauses.map(\.body) + (elseBody.map { [$0] } ?? [])
         case .forStatement(_, _, _, let body), .whileStatement(_, let body):
             return [body]
         case .loopStatement(let body, let continuing):
@@ -400,18 +416,12 @@ enum WGSLReflectionBuilder {
             collect(value, locals: locals, identifiers: &identifiers, calls: &calls)
         case .increment(let expression), .decrement(let expression), .expressionStatement(let expression):
             collect(expression, locals: locals, identifiers: &identifiers, calls: &calls)
-        case .ifStatement(let condition, let then, let elseBranch):
-            collect(condition, locals: locals, identifiers: &identifiers, calls: &calls)
-            collect(then, locals: locals, identifiers: &identifiers, calls: &calls)
-            switch elseBranch {
-            case .block(let statements)?:
-                collect(statements, locals: locals, identifiers: &identifiers, calls: &calls)
-            case .chained(let statement)?:
-                var branchLocals = locals
-                collect(statement, locals: &branchLocals, identifiers: &identifiers, calls: &calls)
-            case nil:
-                break
+        case .ifStatement(let clauses, let elseBody):
+            for clause in clauses {
+                collect(clause.condition, locals: locals, identifiers: &identifiers, calls: &calls)
+                collect(clause.body, locals: locals, identifiers: &identifiers, calls: &calls)
             }
+            if let elseBody { collect(elseBody, locals: locals, identifiers: &identifiers, calls: &calls) }
         case .forStatement(let initializer, let condition, let update, let body):
             // A declaration in a for header scopes over the condition, the increment and the body.
             var headerLocals = locals
@@ -472,6 +482,18 @@ enum WGSLReflectionBuilder {
     }
 
     // MARK: - Deriving binding layouts
+
+    /// The spec's "minimum buffer binding size" of a buffer variable: `SizeOf(T)` with any
+    /// runtime-sized `array<E>` counted as `array<E, 1>` (`WGSLLayout` already sizes it that way).
+    ///
+    /// WGSL's `SizeOf` does not depend on the address space — the uniform rules only *constrain* a
+    /// valid layout — so this is measured by the general rules even for `var<uniform>`. (The
+    /// calculator's uniform mode also rounds a struct's tail to 16, which would reject a 4-byte
+    /// binding of `struct { t: f32 }` that the spec — and Dawn — accept.)
+    static func minimumBindingSize(of global: WGSLGlobalVariable, in module: WGSLModule) -> Int? {
+        guard global.addressSpace == "uniform" || global.addressSpace == "storage" else { return nil }
+        return WGSLLayout.size(of: global.type, module: module, uniform: false)
+    }
 
     static func bindingLayout(for global: WGSLGlobalVariable) -> WGPUBindingLayout? {
         switch global.type {

@@ -98,8 +98,10 @@
 | `textureSample(t, s, uv)` | `t.sample(s, uv)` |
 | `textureSampleLevel(t, s, uv, lod)` | `t.sample(s, uv, level(lod))` |
 | `textureSampleBias(t, s, uv, b)` | `t.sample(s, uv, bias(b))` |
-| `textureSampleGrad(t, s, uv, dx, dy)` | `t.sample(s, uv, gradient2d(dx, dy))` |
+| `textureSampleGrad(t, s, uv, dx, dy)` | `t.sample(s, uv, gradient2d(dx, dy))` (3d는 `gradient3d`, 큐브는 `gradientcube`) |
 | `textureSampleCompare(t, s, uv, ref)` | `t.sample_compare(s, uv, ref)` |
+| `textureSampleCompareLevel(t, s, uv, ref)` | `t.sample_compare(s, uv, ref, level(0))` — 정점·컴퓨트 셰이더에서도 된다 |
+| 위 샘플 함수의 끝 인자 `offset` | 맨 뒤(LOD 옵션 다음)에 `int2(offset)` / 3d는 `int3(offset)`. 큐브에 주면 오류 |
 | `textureLoad(t, coord, level)` | `t.read(uint2(coord), level)` |
 | `textureStore(t, coord, v)` | `t.write(v, uint2(coord))` |
 | `textureDimensions(t)` | `uint2(t.get_width(), t.get_height())` |
@@ -218,6 +220,8 @@ struct alignas(16) Light {
 - 멤버 오프셋은 WGSL 명세(`AlignOf`/`SizeOf`/`RoundUp`)대로 계산한다. `@align(n)`/`@size(n)`을 존중한다.
 - uniform 주소 공간에서 쓰이는 구조체는 정렬/배열 스트라이드가 16으로 올라간다.
 - vec3 멤버 뒤 12~15바이트 구간을 다른 멤버가 쓰면 `packed_floatN`, 아니면 `floatN` + `char` 패딩.
+- 별칭(`alias M = mat4x4f;`, `alias I2 = I1; alias I1 = Inner;`)은 가리키는 타입 그대로 배치한다 —
+  몇 단을 거치든 끝까지 따라간다.
 
 **따라서 JS는 WGSL 규칙대로 버퍼를 채우면 된다.** 브라우저에서 쓰던 유니폼 패킹 코드가 그대로 동작한다.
 
@@ -305,6 +309,9 @@ WGSL에는 값이 정해져 있는데 MSL(C++)에서는 **정의되지 않은 �
 | `workgroupUniformLoad` | 미지원 |
 | `break if cond;` | `continuing` 블록 전용 구문. `if (cond) { break; }`로 바꿔 쓸 것 |
 | `continuing` + `continue` 조합 | `continue`가 `continuing` 블록을 건너뛰게 되어 의미가 달라진다. `for`로 바꿀 것 |
+| 재귀 타입 (`struct S { a: array<S, 2> }`, 별칭·다른 구조체를 거친 순환 포함) | WGSL이 금지한다(크기가 무한). **셰이더 모듈 생성 시** 선언 줄 번호와 순환 경로(`S → A → S`)를 담은 검증 오류 |
+| 타입·식·문장 중첩 128단 초과 (`((((…))))`, `array<array<…>>`, `{ { … } }`. `else if` 사슬의 길이는 중첩이 아니라 세지 않는다) | 파서가 재귀 하강이라 스택을 다 쓰지 않도록 묶는다 (Tint 파서와 같은 한도). 줄 번호를 단 검증 오류. 한도 안의 셰이더는 호출 스레드의 스택과 무관하게 번역된다 — 파싱·방출은 16MB 스택의 전용 스레드에서 돈다 (`WGSLDeepStack`) |
+| 합성 타입 중첩 255단 초과 | 배치 계산·방출이 타입을 재귀로 걷으므로 깊이를 묶는다 (Tint와 같은 한도. 명세 보장치는 15) |
 
 암묵적 제약:
 - **성분 타입이 생략되고 인자가 전부 정수 상수식인 벡터 생성자**(`vec2(4, 1)`, `vec3(1)`)는

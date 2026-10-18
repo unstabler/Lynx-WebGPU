@@ -208,12 +208,8 @@ struct WGSLConstantEvaluator {
     /// Walks nested blocks only (so a local `const` is found wherever it sits).
     private static func nestedBlocks(of statement: WGSLStatement) -> [[WGSLStatement]] {
         switch statement {
-        case .ifStatement(_, let then, let elseBranch):
-            switch elseBranch {
-            case .block(let statements)?: return [then, statements]
-            case .chained(let nested)?: return [then, [nested]]
-            case nil: return [then]
-            }
+        case .ifStatement(let clauses, let elseBody):
+            return clauses.map(\.body) + (elseBody.map { [$0] } ?? [])
         case .forStatement(let initializer, _, _, let body):
             return initializer.map { [[$0], body] } ?? [body]
         case .whileStatement(_, let body):

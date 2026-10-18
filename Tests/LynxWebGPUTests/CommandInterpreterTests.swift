@@ -1284,6 +1284,150 @@ final class CommandInterpreterTests: XCTestCase {
         }
     }
 
+    // MARK: - minBindingSize
+
+    /// Binding 0 needs 64 bytes (a uniform mat4x4f struct), binding 1 one 16-byte element.
+    private let minimumSizeShader = """
+    struct Params { m: mat4x4f }
+    struct Item { a: vec4f }
+    @group(0) @binding(0) var<uniform> params: Params;
+    @group(0) @binding(1) var<storage, read_write> items: array<Item>;
+
+    @compute @workgroup_size(1)
+    fn main() { items[0].a = params.m[0]; }
+    """
+
+    private func minimumSizeLayout(min0: Int) -> [String: Any] {
+        ["op": "createBindGroupLayout", "id": 2, "entries": [
+            ["binding": 0, "visibility": 4, "buffer": ["type": "uniform", "minBindingSize": min0]],
+            ["binding": 1, "visibility": 4, "buffer": ["type": "storage"]],
+        ]]
+    }
+
+    /// createBindGroup checks the bound range against the layout's minBindingSize — and an auto
+    /// layout carries the shader's minimum, so an undersized group fails right there.
+    func test_aBindGroupSmallerThanTheLayoutMinBindingSizeIsRejected() {
+        let explicit = harness.execute([
+            ["op": "createBuffer", "id": 1, "size": 32, "usage": TestUsage.uniform | TestUsage.storage],
+            minimumSizeLayout(min0: 64),
+            ["op": "createBindGroup", "id": 3, "layout": 2, "entries": [
+                ["binding": 0, "resource": ["buffer": 1]],
+                ["binding": 1, "resource": ["buffer": 1]],
+            ]],
+        ])
+        XCTAssertEqual(errors(explicit).first?["path"] as? String, "commands[2].entries[0]")
+        XCTAssertTrue(((errors(explicit).first?["message"] as? String) ?? "").contains("minBindingSize 64"))
+
+        let auto = harness.execute([
+            ["op": "createShaderModule", "id": 10, "code": minimumSizeShader],
+            ["op": "createComputePipeline", "id": 11, "layout": "auto", "compute": ["module": 10]],
+            ["op": "getBindGroupLayout", "id": 12, "pipeline": 11, "index": 0],
+            ["op": "createBindGroup", "id": 13, "layout": 12, "entries": [
+                ["binding": 0, "resource": ["buffer": 1]],
+                ["binding": 1, "resource": ["buffer": 1]],
+            ]],
+        ])
+        XCTAssertEqual(errors(auto).count, 1, "\(errors(auto))")
+        XCTAssertTrue(((errors(auto).first?["message"] as? String) ?? "").contains("minBindingSize 64"))
+    }
+
+    /// An explicit layout whose non-zero minBindingSize is below the shader's is rejected at pipeline creation.
+    func test_aPipelineLayoutMinBindingSizeBelowTheShaderIsRejected() {
+        let result = harness.execute([
+            ["op": "createShaderModule", "id": 1, "code": minimumSizeShader],
+            minimumSizeLayout(min0: 32),
+            ["op": "createPipelineLayout", "id": 3, "bindGroupLayouts": [2]],
+            ["op": "createComputePipeline", "id": 4, "layout": 3, "compute": ["module": 1]],
+        ])
+        XCTAssertEqual(errors(result).first?["path"] as? String, "commands[3].layout")
+        XCTAssertTrue(((errors(result).first?["message"] as? String) ?? "").contains("minimum binding size 64"))
+    }
+
+    /// A `minBindingSize: 0` entry is checked at the dispatch, against the pipeline's shader — after
+    /// the dynamic offset when the entry has no explicit size.
+    func test_aZeroMinBindingSizeEntryIsCheckedAtDispatch() {
+        let setup: [[String: Any]] = [
+            ["op": "createShaderModule", "id": 1, "code": minimumSizeShader],
+            minimumSizeLayout(min0: 0),
+            ["op": "createPipelineLayout", "id": 3, "bindGroupLayouts": [2]],
+            ["op": "createComputePipeline", "id": 4, "layout": 3, "compute": ["module": 1]],
+            ["op": "createBuffer", "id": 5, "size": 256, "usage": TestUsage.uniform],
+            ["op": "createBuffer", "id": 8, "size": 256, "usage": TestUsage.storage],
+            ["op": "createBindGroup", "id": 6, "layout": 2, "entries": [
+                ["binding": 0, "resource": ["buffer": 5, "size": 16]],
+                ["binding": 1, "resource": ["buffer": 8]],
+            ]],
+            ["op": "createBindGroup", "id": 7, "layout": 2, "entries": [
+                ["binding": 0, "resource": ["buffer": 5, "size": 64]],
+                ["binding": 1, "resource": ["buffer": 8, "size": 16]],
+            ]],
+        ]
+        func dispatch(_ group: Int) -> [[String: Any]] {
+            [
+                ["op": "beginComputePass"],
+                ["op": "setPipeline", "pipeline": 4],
+                ["op": "setBindGroup", "index": 0, "bindGroup": group],
+                ["op": "dispatchWorkgroups", "x": 1],
+                ["op": "endPass"],
+            ]
+        }
+        let rejected = harness.execute(setup + dispatch(6))
+        XCTAssertEqual(errors(rejected).count, 1, "\(errors(rejected))")
+        XCTAssertEqual(errors(rejected).first?["path"] as? String, "commands[\(setup.count + 3)].dispatchWorkgroups")
+        XCTAssertTrue(((errors(rejected).first?["message"] as? String) ?? "").contains("needs at least 64"))
+
+        let accepted = harness.execute(dispatch(7))
+        XCTAssertTrue(errors(accepted).isEmpty, "\(errors(accepted))")
+    }
+
+    // MARK: - Dynamic offsets
+
+    /// setBindGroup checks its dynamic offsets — unchecked, Metal's setBuffer bound past the buffer's end.
+    func test_setBindGroupRejectsBadDynamicOffsets() {
+        let setup: [[String: Any]] = [
+            ["op": "createShaderModule", "id": 1, "code": """
+            @group(0) @binding(0) var<uniform> u: vec4f;
+            @group(0) @binding(1) var<storage, read_write> o: array<vec4f>;
+            @compute @workgroup_size(1) fn main() { o[0] = u; }
+            """],
+            ["op": "createBindGroupLayout", "id": 2, "entries": [
+                ["binding": 0, "visibility": 4, "buffer": ["type": "uniform", "hasDynamicOffset": true]],
+                ["binding": 1, "visibility": 4, "buffer": ["type": "storage"]],
+            ]],
+            ["op": "createPipelineLayout", "id": 3, "bindGroupLayouts": [2]],
+            ["op": "createComputePipeline", "id": 4, "layout": 3, "compute": ["module": 1]],
+            ["op": "createBuffer", "id": 5, "size": 256, "usage": TestUsage.uniform],
+            ["op": "createBuffer", "id": 6, "size": 16, "usage": TestUsage.storage],
+            ["op": "createBindGroup", "id": 7, "layout": 2, "entries": [
+                ["binding": 0, "resource": ["buffer": 5, "size": 64]],
+                ["binding": 1, "resource": ["buffer": 6]],
+            ]],
+        ]
+        func dispatch(_ offsets: [Int]) -> [[String: Any]] {
+            [
+                ["op": "beginComputePass"],
+                ["op": "setPipeline", "pipeline": 4],
+                ["op": "setBindGroup", "index": 0, "bindGroup": 7, "dynamicOffsets": offsets],
+                ["op": "dispatchWorkgroups", "x": 1],
+                ["op": "endPass"],
+            ]
+        }
+        XCTAssertTrue(errors(harness.execute(setup)).isEmpty)
+
+        let pastTheEnd = harness.execute(dispatch([512]))
+        XCTAssertEqual(errors(pastTheEnd).first?["path"] as? String, "commands[2].dynamicOffsets[0]")
+        XCTAssertTrue(((errors(pastTheEnd).first?["message"] as? String) ?? "").contains("exceeds the buffer"))
+
+        let unaligned = harness.execute(dispatch([4]))
+        XCTAssertTrue(((errors(unaligned).first?["message"] as? String) ?? "").contains("minUniformBufferOffsetAlignment"))
+
+        let missing = harness.execute(dispatch([]))
+        XCTAssertEqual(errors(missing).first?["path"] as? String, "commands[2].dynamicOffsets")
+
+        XCTAssertFalse(errors(harness.execute(dispatch([256]))).isEmpty, "256 + 64 bytes run past a 256-byte buffer")
+        XCTAssertTrue(errors(harness.execute(dispatch([0]))).isEmpty)
+    }
+
     /// The spec fixes each limit's **default (the minimum guarantee)**. Reporting lower makes code that
     /// works in a browser rejected only here, with the app unable to tell why.
     func test_limitsAreNotBelowTheSpecDefaults() throws {
