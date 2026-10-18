@@ -153,4 +153,11 @@ public final class LynxWebGPUContext: WebGPURuntime {
 
     /// Test observation hook — the upload staging pool.
     var stagingPool: WGPUStagingPool { backend.stagingPool }
+
+    /// Test hook — turning it off drives the `.storeAndMultisampleResolve` emulation (the iOS
+    /// simulator's path) on a device that has the combined action.
+    var supportsStoreAndMultisampleResolve: Bool {
+        get { backend.supportsStoreAndMultisampleResolve }
+        set { backend.supportsStoreAndMultisampleResolve = newValue }
+    }
 }

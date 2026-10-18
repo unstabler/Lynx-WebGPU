@@ -462,7 +462,16 @@ encoder.popDebugGroup()                                      // popDebugGroup
 device.queue.submit([encoder.finish()])   // ← 여기서 한 번에 네이티브로 넘어간다
 ```
 
-- `beginRenderPass`는 멀티샘플 `resolveTarget`을 지원한다 (store op이 `multisampleResolve`로 바뀐다).
+- `beginRenderPass`는 멀티샘플 `resolveTarget`을 지원한다. 명세대로 `storeOp`은 멀티샘플 뷰 자체에 걸리고
+  리졸브는 그와 별개로 일어난다 — `"store"`면 Metal `storeAndMultisampleResolve`(샘플을 남겨 다음 패스가
+  `loadOp: "load"`로 이어 그릴 수 있다), `"discard"`면 `multisampleResolve`다.
+  `storeOp`의 기본값은 `"store"`라서, TBDR GPU(Apple)에서는 **패스마다 MSAA 텍스처 전체가 메모리에
+  다시 쓰인다** — 샘플을 다시 읽지 않으면 MSAA 뷰에 `storeOp: "discard"`를 줄 것 (리졸브 결과는 그대로 남는다).
+  결합 동작은 Apple GPU 패밀리 3 이상(또는 Mac 2)에만 있어 **iOS 시뮬레이터(패밀리 2로 보고)에서는
+  에뮬레이션한다** — 패스는 `store`만 하고, 패스가 끝날 때 드로우 없는 패스가 `load` + `multisampleResolve`로
+  리졸브한다 (Dawn의 `EmulateStoreAndMSAAResolve`와 같다). 패스가 하나 더 든다. Metal은 `multisampleResolve`
+  뒤의 멀티샘플 내용을 형식상 정의하지 않지만, 드로우 없는 패스는 실제로 그것을 다시 쓰지 않아(Dawn의 같은
+  에뮬레이션도 이에 기댄다) 저장된 샘플이 남는다 — 보장이 아니라 관찰된 동작이다.
 - 복사 명령은 패스 **밖에서만** 쓸 수 있다.
 - **디버그 마커는 Xcode GPU 캡처에 구간 이름으로 뜬다** (Metal `pushDebugGroup`/`insertDebugSignpost`).
   없으면 캡처가 이름 없는 드로우 나열이라 어느 패스가 무엇인지 알 수 없다. 스코프는 두 층이다 —

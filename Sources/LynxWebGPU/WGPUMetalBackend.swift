@@ -58,11 +58,20 @@ public final class WGPUMetalBackend: WGPUBackend {
     private var acquiredDrawables: [String: WGPUDrawable] = [:]
     /// The last committed command buffer — used when `readBuffer` waits on GPU completion.
     private(set) var lastCommittedBuffer: MTLCommandBuffer?
+    /// Whether `.storeAndMultisampleResolve` can be used. Settable only so tests can drive the
+    /// emulation path on a device that has the combined action.
+    var supportsStoreAndMultisampleResolve: Bool
+    /// `storeOp: "store"` resolves the open render pass still owes when the combined store action is
+    /// missing — `endPass` resolves them in a draw-less pass (multisample texture, resolve texture).
+    private var pendingResolves: [(texture: MTLTexture, resolve: MTLTexture)] = []
+    /// Failures found while encoding that cannot throw (`endPass`) — handed over by `collectBatchDiagnostics`.
+    private var batchDiagnostics: [WGPUError] = []
 
     public init(device: MTLDevice, queue: MTLCommandQueue) {
         self.device = device
         self.queue = queue
         self.stagingPool = WGPUStagingPool(device: device)
+        self.supportsStoreAndMultisampleResolve = WGPUDeviceCapability.supportsStoreAndMultisampleResolve(device)
     }
 
     // MARK: - Capabilities
@@ -114,9 +123,14 @@ public final class WGPUMetalBackend: WGPUBackend {
         blitEncoder = nil
         currentRenderPipeline = nil
         currentComputePipeline = nil
+        pendingResolves.removeAll()
+        batchDiagnostics.removeAll()
     }
 
-    public func collectBatchDiagnostics() -> [WGPUError] { [] }
+    public func collectBatchDiagnostics() -> [WGPUError] {
+        defer { batchDiagnostics.removeAll() }
+        return batchDiagnostics
+    }
 
     public var hasPendingWork: Bool { commandBuffer != nil }
 
@@ -186,12 +200,39 @@ public final class WGPUMetalBackend: WGPUBackend {
     public func endPass() {
         renderEncoder?.endEncoding()
         renderEncoder = nil
+        encodePendingResolves()
         computeEncoder?.endEncoding()
         computeEncoder = nil
         blitEncoder?.endEncoding()
         blitEncoder = nil
         currentRenderPipeline = nil
         currentComputePipeline = nil
+    }
+
+    /// Emulates `.storeAndMultisampleResolve` where the device lacks it: the pass stored its samples,
+    /// and a draw-less pass loads them and resolves (Dawn's `EmulateStoreAndMSAAResolve` does the same).
+    /// Formally Metal leaves the attachment undefined after `.multisampleResolve`; in practice (and in
+    /// Dawn's identical emulation) a draw-less pass does not write it back, so the stored samples survive.
+    private func encodePendingResolves() {
+        guard !pendingResolves.isEmpty else { return }
+        let resolves = pendingResolves
+        pendingResolves.removeAll()
+        let passDescriptor = MTLRenderPassDescriptor()
+        for (index, pair) in resolves.enumerated() {
+            let target = passDescriptor.colorAttachments[index]!
+            target.texture = pair.texture
+            target.resolveTexture = pair.resolve
+            target.loadAction = .load
+            target.storeAction = .multisampleResolve
+        }
+        // `endPass` cannot throw — the pass that owes this resolve already created the command buffer,
+        // so a failure is reported through `collectBatchDiagnostics` instead of dropped silently.
+        guard let encoder = commandBuffer?.makeRenderCommandEncoder(descriptor: passDescriptor) else {
+            batchDiagnostics.append(.backend("emulated store+resolve encoder creation failed"))
+            return
+        }
+        encoder.label = "webgpu.emulatedStoreAndResolve"
+        encoder.endEncoding()
     }
 
     /// The pass-scope target for debug groups and markers — blit is excluded as an internal encoder
@@ -518,6 +559,7 @@ public final class WGPUMetalBackend: WGPUBackend {
 
     public func beginRenderPass(_ pass: WGPUResolvedRenderPass<WGPUMetalBackend>) throws {
         let passDescriptor = MTLRenderPassDescriptor()
+        var emulatedResolves: [(texture: MTLTexture, resolve: MTLTexture)] = []
 
         for (index, attachment) in pass.colorAttachments.enumerated() {
             let target = passDescriptor.colorAttachments[index]!
@@ -531,8 +573,15 @@ public final class WGPUMetalBackend: WGPUBackend {
                 alpha: attachment.clearValue.alpha
             )
             if let resolve = attachment.resolveTarget {
-                target.resolveTexture = resolve.texture
-                target.storeAction = .multisampleResolve
+                target.storeAction = WGPUMetalMapping.resolvingStoreAction(
+                    attachment.storeOp, combinedSupported: supportsStoreAndMultisampleResolve
+                )
+                if target.storeAction == .store {
+                    // No combined action — keep the samples now, resolve when the pass ends.
+                    emulatedResolves.append((attachment.view.texture, resolve.texture))
+                } else {
+                    target.resolveTexture = resolve.texture
+                }
             }
         }
 
@@ -580,6 +629,8 @@ public final class WGPUMetalBackend: WGPUBackend {
         renderEncoder = encoder
         currentRenderPipeline = nil
         currentComputePipeline = nil
+        // Only a pass that actually opened owes its resolves to `endPass`.
+        pendingResolves = emulatedResolves
     }
 
     public func beginComputePass(_ pass: WGPUResolvedComputePass<WGPUMetalBackend>) throws {

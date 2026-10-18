@@ -334,6 +334,19 @@ enum WGPUMetalMapping {
         op == .store ? .store : .dontCare
     }
 
+    /// The store action of a color attachment that has a `resolveTarget`.
+    ///
+    /// In WebGPU `storeOp` governs the **multisample view itself** and the resolve happens on top of it
+    /// regardless — so `"store"` + resolve must keep the samples for a later `loadOp: "load"` pass.
+    /// Metal's `.multisampleResolve` alone leaves them undefined; `.storeAndMultisampleResolve` keeps
+    /// both, but only where the device has it (`WGPUDeviceCapability.supportsStoreAndMultisampleResolve`).
+    /// Without it the pass only `.store`s and the backend resolves in a draw-less pass right after
+    /// (the same emulation Dawn uses) — `combinedSupported: false` returns `.store` for that case.
+    static func resolvingStoreAction(_ op: WGPUStoreOp, combinedSupported: Bool) -> MTLStoreAction {
+        guard op == .store else { return .multisampleResolve }
+        return combinedSupported ? .storeAndMultisampleResolve : .store
+    }
+
     static func viewType(_ dimension: WGPUTextureViewDimension) -> MTLTextureType {
         switch dimension {
         case .oneD: return .type1D
@@ -358,6 +371,17 @@ public enum WGPUDeviceCapability {
     /// support it**, but **the iOS simulator reports family 2** and drops out — calling it on an
     /// unsupported device kills the process with `MTLValidateFeatureSupport ... failed assertion`.
     public static func supportsIndirectArguments(_ device: MTLDevice) -> Bool {
+        device.supportsFamily(.apple3) || device.supportsFamily(.mac2)
+    }
+
+    /// Whether the combined `.storeAndMultisampleResolve` store action is available — a resolving
+    /// attachment with `storeOp: "store"` needs it to keep its samples.
+    ///
+    /// Metal feature set table ("combined MSAA store and resolve action"): **Apple family 3 or above**,
+    /// or Mac family 2 — the same tier as indirect arguments, so again **the iOS simulator drops out**
+    /// and an unsupported device dies on a validation assertion. The backend emulates it there
+    /// (`WGPUMetalBackend.endPass`), as Dawn does.
+    public static func supportsStoreAndMultisampleResolve(_ device: MTLDevice) -> Bool {
         device.supportsFamily(.apple3) || device.supportsFamily(.mac2)
     }
 

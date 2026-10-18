@@ -68,6 +68,29 @@ final class MetalMappingTests: XCTestCase {
         }
     }
 
+    /// With a `resolveTarget`, `storeOp` still governs the multisample view — `"store"` must keep the
+    /// samples **and** resolve. Plain `.multisampleResolve` there left a later `loadOp: "load"` pass
+    /// reading undefined samples. Without the combined action (the iOS simulator) `"store"` only
+    /// stores — the backend resolves in a follow-up pass — and must never ask for the combined action.
+    func test_aResolvingStoreActionHonoursStoreOp() {
+        let expected: [Bool: [WGPUStoreOp: MTLStoreAction]] = [
+            true: [.store: .storeAndMultisampleResolve, .discard: .multisampleResolve],
+            false: [.store: .store, .discard: .multisampleResolve],
+        ]
+        for (combinedSupported, table) in expected {
+            for op in WGPUStoreOp.allCases {
+                guard let want = table[op] else {
+                    XCTFail("the new store op '\(op.rawValue)' has no resolving Metal counterpart in this table")
+                    continue
+                }
+                XCTAssertEqual(
+                    WGPUMetalMapping.resolvingStoreAction(op, combinedSupported: combinedSupported), want,
+                    "\(op.rawValue), combined action supported: \(combinedSupported)"
+                )
+            }
+        }
+    }
+
     func test_everyCompareFunctionMapsToMetal() {
         let expected: [WGPUCompareFunction: MTLCompareFunction] = [
             .never: .never,
