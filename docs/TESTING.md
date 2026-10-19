@@ -21,7 +21,7 @@ GPU 코드는 "돌려 보고 눈으로 확인"에 기대기 쉽다. 이 저장�
 ## 2. 실행
 
 ```zsh
-swift test                                      # 전체 (374개, 약 8초)
+swift test                                      # 전체 (486개, 약 25초 — 셰이더 테스트가 Metal 컴파일러를 부른다)
 swift test --filter LynxWebGPUCoreTests         # 디스크립터/핸들
 swift test --filter LynxWebGPUShaderTests       # 트랜스파일러 (+ Metal 컴파일 검증)
 swift test --filter LynxWebGPUTests             # GPU 렌더 + 해석기
@@ -99,7 +99,7 @@ Dawn은 `COPY_DST` 없는 버퍼라 큐 쓰기로는 통과할 수 없다)·
 
 `ConformanceTests`가 기본 런타임을 스위트에 걸고, **스위트가 실제로 걸러 내는지도 함께 잰다** —
 응답·페이로드·콜백을 일부러 망가뜨린 런타임(`MisbehavingRuntime`)을 걸어 실패가 나오는지 본다.
-항상 통과하는 적합성 스위트는 "29/29"이라는 문장이 아무것도 보증하지 못하게 만든다.
+항상 통과하는 적합성 스위트는 "31/31"이라는 문장이 아무것도 보증하지 못하게 만든다.
 
 ### 스위트를 거는 자리 셋 — 백엔드 × 플랫폼
 
@@ -124,6 +124,10 @@ mise exec -- tuist generate --no-open   # 스킴: WebGPUDemo · WebGPUCheck · D
 arch -arm64 xcodebuild -workspace LynxWebGPUDemo.xcworkspace -scheme WebGPUCheck \
   -destination 'platform=iOS Simulator,name=iPhone 17,OS=26.2' -derivedDataPath .derivedData-cli test
 ```
+
+기준선 (2026-10-19, 시뮬레이터): **적합성 30/31 통과 · 1 건너뜀 · 0 실패.** 건너뜀은 Dawn과 같은
+`indirect-draw-equivalence`다 (시뮬레이터는 간접 인자를 지원하지 않아 런타임이 기능을 광고하지 않는다).
+macOS의 `swift test`에서는 같은 스위트가 31/31이다.
 
 ### 외부 주입 검증 픽스처
 
@@ -151,7 +155,7 @@ arch -arm64 xcodebuild -workspace LynxWebGPUDemo.xcworkspace \
   -derivedDataPath .derivedData-cli test
 ```
 
-기준선 (2026-08-09, 시뮬레이터): **적합성 28/29 통과 · 1 건너뜀 · 0 실패.** 건너뜀은
+기준선 (2026-10-19, 시뮬레이터): **적합성 30/31 통과 · 1 건너뜀 · 0 실패.** 건너뜀은
 `indirect-draw-equivalence` — 시뮬레이터의 간접 드로우가 Metal 단언으로 죽는 경로라
 런타임이 기능을 광고하지 않는다 (실기기에서는 광고해도 된다). 렌더 번들 동치성은
 Metal 백엔드의 엔진 record/replay와 달리 **진짜 Dawn 렌더 번들**로 통과한다.
@@ -325,7 +329,7 @@ try XCTSkipUnless(harness.supports(.indirectArguments), "this device does not su
 - 비동기 경로(`readBuffer`)는 `XCTestExpectation`으로 검증한다.
 - 테스트 더블은 손으로 만든다 (모킹 라이브러리 없음).
 
-## 6. 커버리지 대상 (Swift 374 + JS 150 — 테스트 **케이스** 수다)
+## 6. 커버리지 대상 (Swift 486 + JS 150 — 테스트 **케이스** 수다)
 
 | 영역 | 파일 | 주요 케이스 |
 |---|---|---|
@@ -333,18 +337,25 @@ try XCTSkipUnless(harness.supports(.indirectArguments), "this device does not su
 | 호스트 페이로드 | `WGPUPayloadTests` + `HostPayloadTests` | 실체화한 페이로드가 **원본을 비워도** 같은 값을 읽는지, **중첩 컨테이너까지** 옮겨졌는지(실체화를 건너뛰면 원본을 그대로 본다는 대조군), 구조·잎 타입 보존, **`Data`는 참조로만 옮김**(프레임마다 딥카피 금지), 빈 컨테이너 통과, **ObjC 트리로 들어온 페이로드가 프레임을 그려 내는지** |
 | 디스크립터 | `WGPUDescriptorTests` | 크기 유추, 범위 검증, 명세 기본값, auto/명시 레이아웃, 블렌드 기본값 |
 | 핸들 레지스트리 | `WGPUObjectRegistryTests` | 등록/조회/해제, 타입 불일치 진단, **증식 경고 임계(4096 → 두 배씩)**, **살아 있는 핸들 덮어쓰기 감지**(해제 뒤 재사용은 겹침이 아니다) |
+| 커맨드 디코딩 | `WGPUCommandDecodeTests` | **51개 op 전수 디코딩과 op 이름 왕복**, 알 수 없는 op은 경로 달린 `unsupported`, 깨진 filter의 `pushErrorScope`도 케이스는 만들어짐, 번들의 커맨드 리더 보존, **정수 EnforceRange**(동적 오프셋·그 밖의 op 전반), `dispatchWorkgroups`의 0 유지·생략 시 1·음수 거부, `unmapBuffer`의 write-back 필드(offset+data · data 없음 · 깨진 data 거부) |
+| 오류 스코프 스택 · 배치 응답 | `WGPUErrorScopeStackTests` | 빈 스택 pop은 unmatched, 필터 매칭/비매칭, 안쪽 우선, 잡은 첫 오류 하나만, placeholder는 깊이만, 네 오류 종류 → 세 필터, discardAll, pop 응답 모양, **깨끗한 배치의 필수 키 셋**, 잡힌 오류는 `errorScopes`로만, pop 순서 유지, `canvases`의 크기, 지연 오류 큐 drain과 스레드 안전 |
+| 프레임 회계 | `WGPUFrameCoordinatorTests` | in-flight 한도 도달 시 차단·완료로 해제, 커밋보다 많은 완료에도 음수 금지, 미추적 캔버스는 항상 ready, 포화 캔버스 하나가 전체를 막음, 잊힌 캔버스 해제, 한도 변경(0 이하는 1로), 동시 통지의 일관성, `present:false`는 프레임 중간 제출, 빈 present 배치가 틱을 닫음 |
+| 프레임 틱 게이트 | `WGPUFrameTickGateTests` | 두 번째 틱은 ack를 기다림, 매 틱 ack면 건너뜀 없음, 잃어버린 ack는 타임아웃으로 만료(루프를 죽이지 않음), 늦은 ack는 한 번만 염, reset, 대기 없는 ack는 무동작 |
 | 픽셀 되읽기 해석 | `WGPUPixelReadbackTests` | half→float(서브노멀·Inf·NaN), **1.0 초과·음수 보존**, BGRA 순서, 없는 채널 기본값, 행 패딩, 팩된/정수 포맷 거부 |
 | JS↔Swift 상수 | `JSConstantParityTests` | `JS/webgpu.js`의 사용 플래그·스테이지·컬러마스크가 Swift OptionSet과 같은 값인지 |
 | in-flight 프레임 | `SurfaceInFlightTests` | 카운터 계약(3에서 포화·완료로 해제), 컨텍스트 집계, 해석기 커밋/완료 통지(표면당 1회), CAMetalLayer 헤드리스 왕복 |
 | 프레임 경계 | `JS/tests/frame-boundary.test.mjs` | present는 **틱의 끝**에 한 번(명세 "updating the rendering") · 마무리 배치는 명령이 없어도 나감 · 작업 없는 틱은 브리지 미통과 · 루프 밖 submit은 그 자리에서 present · 콜백이 던져도 present는 나가고 오류는 안 삼킴 · **티커 참조 계수**(남의 stop에 안 끌려감) · `getCurrentTexture`는 만료 전까지 **같은 텍스처**(present·configure·리사이즈에서 만료, 설정 전엔 `InvalidStateError`) |
 | JS 클라이언트 | `JS/tests` (node:test) | **바이너리 경로(ArrayBuffer 타입·뷰 오프셋 반영·불필요한 복사 없음·양방향)**, 캔버스 크기 캐시(프레임당 왕복 1회·리사이즈 반영), GC 자동 해제(중복 방지·프레임 스코프 제외), objects 전달, **짝 없는 pop의 `OperationError` reject**, **알 수 없는 filter의 동기 `TypeError`**, **브리지 호출 실패 시 대기 스코프 정리**, **번들 `finish()` 재호출 거부·리소스 retain**, **`device.features`(요청한 것만·미지원 요구 거부)·영원히 pending인 `device.lost`**, **flush의 `present` 표시(submit=프레임 / popErrorScope·mapAsync=내부)**, **기록 시점 스냅샷(호출 뒤 copySize·origin·clearValue 재사용/리셋이 스트림에 안 샘)**, **비동기 파이프라인 생성(스코프 두 겹을 한 배치에·`GPUPipelineError` reason 매핑·실패 핸들 회수)**, **`uncapturederror`(GPUError 하위 클래스 매핑·`onError`와 병행·리스너 예외 격리·스코프에 잡힌 오류는 제외)**, **명세 읽기 전용 속성**(GPUTexture 7종·기본값·`textureBindingViewDimension` 유도, `GPUBuffer.mapState` 3상태), **`installAnimationFrame`(틱 경계·예약 비면 링크 해제·기존 rAF 미침범)**, **`copyBufferToBuffer` 오버로드 4형태·`clearBuffer` 인자 전달**, **캔버스 컨텍스트 동일성**(같은 id면 같은 객체 — 갈리면 설정 상태가 핸들마다 달라진다), **디버그 마커가 인코더 4종에 다 있는지**(클래스 계층이 갈려 한쪽만 넣기 쉽다), **`getCompilationInfo`(먼저 flush·실패해도 안 던짐)**, **`getMappedRange` 부분 매핑**(**버퍼 오프셋** 기준·쓴 내용 되돌리기·정렬/겹침/범위 거부·4의 배수 아닌 매핑 전체 읽기), **`mapAsync(GPUMapMode.WRITE)`**(`unmap()`이 `offset`+`data`를 싣는지·mode/usage 불일치와 정렬 위반은 네이티브 전에 reject) |
 | WGSL 트랜스파일 | `WGSLTranspilerTests` | 삼각형(정점속성+유니폼+헬퍼), 리소스 스레딩, 리플렉션, vec3 배치(**정수 vec3의 `packed_int3`/`packed_uint3` 포함**), 컴퓨트/스토리지, 텍스처/샘플러/스토리지텍스처, 제어흐름, workgroup 변수, 오류 보고, 바인딩 배정, **MSL 예약어 맹글링**, **부동소수 `%`**, **벡터 성분 추론**, **추상 정수 벡터(문맥으로 굳는 `vec3(1)`)**, **파이프라인 상수**, **확장 선언**, **`arrayLength()` 크기 표**, **외부 텍스처**, **함수 지역 `const` 배열 크기**, **전역 섀도잉**(가려진 전역은 주입 안 함 — 매개변수·지역·전이 전달, 주입과 겹친 지역 선언 리네임, 중첩 블록 복원), **도달 가능성**(안 부르는 함수 미방출·전이적 도달·진입점별로 다름) |
+| 셰이더 안전성 | `ShaderSafetyTests` (방출 + Metal 컴파일) | 고정 배열·벡터 성분·행렬 열 인덱스 클램프(읽기·쓰기·복합 대입), 런타임 배열의 버퍼 크기 클램프(단독·`let` 포인터·별칭 구조체·구조체 포인터), **포인터 매개변수를 거친 인덱스 거부**, 원소 0개 바인딩의 쓰기 폐기, 지역 섀도잉은 표에 안 묶임, 0 나눗셈 필터, 시프트 마스킹, float→int 포화, workgroup 변수·atomic 0 초기화와 배리어, discard 뒤 스토리지 쓰기 마스킹, 무한 루프의 탈출 조건, **내장 함수 인자 개수 검사**(부족·초과·경계값 통과) |
 | 외부 코퍼스 | `SampleCorpusTests` | 공식 webgpu-samples 셰이더 통과율 리포트 (§7, 기본 스킵) |
 | GPU 렌더 | `RenderPipelineTests` | 삼각형, 유니폼(**정수 vec3 배치를 GPU가 읽은 값으로** — `packed_int3`/`packed_uint3`가 12바이트로 서지 않으면 뒤 필드가 밀린다), 인덱스 드로우, 알파 블렌딩, 컴퓨트+readback, 텍스처 샘플링, **`arrayLength()`가 바인딩된 크기를 돌려주는지**, **가장자리 클램프 샘플링**, 깊이 테스트, **rgba16float 표면이 SDR 범위 밖 값을 보존하는지**, **전역 섀도잉의 스코프 해석이 런타임 값까지 옳은지** |
+| 셰이더 안전성 (GPU 값) | `ShaderSafetyRenderTests` | 범위 밖 읽기는 마지막 원소로·쓰기는 버퍼 안으로 클램프(직접·`let` 포인터·별칭 구조체 멤버), 배열 시작보다 작은 바인딩은 `minBindingSize`로 바인드 그룹 생성에서 거부, workgroup 메모리 0 시작, discard된 프래그먼트의 스토리지 미기록, 0 나눗셈의 명세 동작 |
 | 오프스크린 되읽기 | `OffscreenReadbackTests` | 포맷별 행 간격·길이(1~16B/픽셀), **depth/stencil 거부**, configure 전 거부 |
 | 커맨드 해석기 | `CommandInterpreterTests` | 알 수 없는 명령, 없는 핸들, 오류 누적, 패스 상태, 캔버스 진단, 셰이더 실패 시 MSL 첨부, 드로어블 핸들 수명, **프레임 경계가 배치가 아니라 present인지**, 복사/읽기, 범위 검증, reset, 어댑터 정보, **큐 쓰기의 큐 타임라인 순서(앞선 제출 뒤·같은 배치 인코더 작업 앞·열린 패스 안에서도 수락)**, **배열 레이어 업로드**, **버퍼 매핑 상태(매핑 중 큐 작업 거부·중복 매핑 거부·unmap 후 복귀)**, **`MAP_WRITE` 쓰기 매핑의 write-back**(unmap → copy → 읽기 왕복·부분 매핑·매핑 밖/읽기 매핑의 `data` 거부), **`MAP_READ`/`MAP_WRITE` usage 조합**, **파이프라인 없는 간접 드로우/디스패치의 op별 메시지**, **`present: false` 내부 제출은 커맨드 버퍼가 있어도 드로어블·프레임 핸들을 유지**, **진입점 해석(생략 시 그 스테이지의 유일한 것·후보 둘 이상이면 거부·스테이지 불일치 거부)**, **limits 명세 적합성(전 항목 존재·명세 기본값 이상·정렬은 256 이하)**, **빈 배치의 present**(틱의 마무리 — 드로어블이 없으면 무동작), **한 프레임의 여러 제출이 드로어블 뷰를 공유**, **`clearBuffer`(구간·size 생략·COPY_DST/4의 배수/범위 검증)**, **`copyBufferToBuffer`(size 생략 = 남은 전부·범위/음수 거부·0바이트 no-op)**, **디버그 마커**(패스 안팎 스코프·짝 없는 pop·열린 채 끝난 그룹을 프로세스를 죽이지 않고 오류로), **셰이더 진단**(파싱 실패해도 모듈은 생성·줄 번호가 숫자로·깨진 모듈로 만든 파이프라인이 원인을 다시 알리는지·MSL 모듈은 비어 있고 유효), **마커만 있는 배치**, **명세 `GPUAdapterInfo`**(모르는 자리는 빈 문자열) |
 | 블록 압축 포맷 | `WGPUCompressedFormatTests` (GPU 불필요) + `CompressedTextureTests` | 블록 크기를 이름에서 읽는지(ASTC 전수), 블록당 바이트 8/16, **올림으로 세는 행 계산**, 손으로 인코딩한 BC1·ASTC 블록을 올려 **픽셀 단언**, 렌더 타깃/블록 경계 거부, `adapter.features`가 실제 기기 능력과 일치 |
 | 외부 이미지 | `ExternalImageTests` | PNG 디코딩(채널 순서·상하 방향·flipY·premultiply·resize), 깨진 데이터 거부, `copyExternalImageToTexture`(전체·부분·copySize 생략), **복사 시점 `flipY`**(디코딩 시점과 다른 층 — 둘 다 켜면 제자리, 부분 복사에서는 영역 안에서만), 4바이트 아닌 포맷과 압축 텍스처 거부, `destroy` 후 참조 |
+| 애셋 제공자 | `AssetProviderTests` | 이름 등록·해제·파일보다 우선, 절대 경로·file URL, 없는 파일은 backend 오류, 허용 디렉토리 안/밖·상위로 오르는 경로·접두사만 같은 형제 디렉토리 차단, 번들 이름·하위 디렉토리, 번들 이름의 상위 경로·빈 이름 거부, 기본 제공자의 https 거부와 교체 제공자의 허용/차단, 오류 종류가 JS 페이로드까지 유지, 이름 없는 요청은 제공자 전에 거부 |
 | 스테이징 풀 | `StagingPoolTests` | 크기 클래스 반올림, 같은 인스턴스 재사용, 최적합 선택, 총량 상한, 프레임 반복 시 풀 크기 불변 |
 | 하네스 자신 | `RenderHarnessTests` | **동치성 단언이 다름을 실제로 잡는지**(§4-2), 동기 리드백의 실패 보고 |
 | Metal 매핑 | `MetalMappingTests` | 스텐실 연산·비교 함수 **전수**(CaseIterable), 네 연산이 제 슬롯에 들어가는지, 마스크, **모든 텍스처 포맷의 Metal 대응**(케이스를 늘리고 매핑을 빠뜨리면 걸린다)·**역방향도 전수**(캔버스에 쓰이는 몇 개만 있던 자리)·접히는 깊이 포맷의 이름 선택·팩된 32비트 픽셀 크기. GPU 불필요 |

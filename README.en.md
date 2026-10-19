@@ -140,7 +140,7 @@ The measurement harness ships in the repo, so the numbers can be re-taken anytim
 
 ## Verification
 
-374 Swift + 150 JS tests run in seconds — no simulator, no device.
+486 Swift + 150 JS tests run in under half a minute — no simulator, no device.
 
 - Transpiler tests push the generated MSL through the **actual Metal compiler**.
 - Render tests draw into offscreen textures and **assert pixel values** (triangle, uniforms, indexed draw,
@@ -159,8 +159,8 @@ The measurement harness ships in the repo, so the numbers can be re-taken anytim
   `docs/COMMAND-STREAM.md` §5-1-1).
 - **The conformance suite (`LynxWebGPUConformance`, 31 checks) survives a runtime swap** — it only uses the
   command stream, `readCanvasPixels`, `readBuffer` and `adapterInfo`, so a backend built outside this repo
-  proves itself with the same checks. Beyond the default Metal runtime at 29/29, a backend on top of real
-  Dawn passes the same suite 28/29 (+1 simulator skip) ([docs/TESTING.md](docs/TESTING.md) §2-1).
+  proves itself with the same checks. Beyond the default Metal runtime at 31/31, a backend on top of real
+  Dawn passes the same suite 30/31 (+1 simulator skip) ([docs/TESTING.md](docs/TESTING.md) §2-1).
   **Both backends also run the same suite on the iOS simulator** (schemes `WebGPUCheck` and `DawnCheck`) —
   `swift test` is macOS, a different driver and GPU family, and iOS is where this actually ships.
 - The JS shim is verified with node's built-in runner — binary-path types and bytes are asserted, and a mock
