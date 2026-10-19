@@ -85,6 +85,11 @@ struct WGSLConstantEvaluator {
 
     /// Names currently being resolved — `const A = B; const B = A;` must stop, not recurse forever.
     private var resolving: Set<String> = []
+    /// Names already settled — a `const` is evaluated **once** however many times it is referenced.
+    /// Without this the walk is exponential in a chain like `const x1 = x0 + x0; const x2 = x1 + x1; …`:
+    /// twenty such lines took minutes and hung `createShaderModule` on the JS thread, well inside the
+    /// depth limit. Only successes are stored, so a cycle or an unresolvable name still throws.
+    private var settled: [String: Int] = [:]
     /// Current recursion depth — operator nesting and const-name chains both count. Shader text is
     /// untrusted and the JS thread's stack is small, so `1+1+…` with thousands of terms must fail
     /// cleanly instead of overflowing the stack.
@@ -147,11 +152,13 @@ struct WGSLConstantEvaluator {
     }
 
     private mutating func resolve(_ name: String) throws -> Int {
+        if let value = settled[name] { return value }
         guard resolving.insert(name).inserted else {
             throw Failure(reason: "'\(name)' is defined in terms of itself")
         }
         defer { resolving.remove(name) }
 
+        let value: Int
         if let constant = module.constants.first(where: { $0.name == name }) {
             if constant.isOverride, !allowsOverrides {
                 throw Failure(
@@ -159,16 +166,19 @@ struct WGSLConstantEvaluator {
                     referencesOverride: true
                 )
             }
-            guard let value = constant.value else {
+            guard let initializer = constant.value else {
                 throw Failure(reason: "override '\(name)' has no value (no default and none supplied)")
             }
-            return try evaluate(value)
+            value = try evaluate(initializer)
+        } else {
+            guard allowsFunctionConstants else {
+                throw Failure(reason: "'\(name)' is not a module-scope const")
+            }
+            // A `const` declared inside a function is a compile-time constant too (`var a: array<T, maxLayers>;`).
+            value = try uniqueLocalConstant(named: name)
         }
-        guard allowsFunctionConstants else {
-            throw Failure(reason: "'\(name)' is not a module-scope const")
-        }
-        // A `const` declared inside a function is a compile-time constant too (`var a: array<T, maxLayers>;`).
-        return try uniqueLocalConstant(named: name)
+        settled[name] = value
+        return value
     }
 
     /// The value of a function-local `const` declared under this name anywhere in the module.

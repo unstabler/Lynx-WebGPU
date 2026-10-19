@@ -2059,6 +2059,32 @@ final class WGSLTranspilerTests: XCTestCase {
         MetalCompilerHarness.assertCompiles(msl)
     }
 
+    func test_aConstReferencedManyTimesIsEvaluatedOnce() throws {
+        // `const xN = (x(N-1) + x(N-1)) / 2u` references the previous name twice, so evaluated naively the
+        // walk doubles per line: 26 lines are 2^26 visits (a minute or more), memoized they are 26. The
+        // chain is far below the depth limit, so only the cost tells the two apart — hence the clock.
+        // Twenty such lines hung `createShaderModule` on the JS thread.
+        var chain = "const x0 = 1u;\n"
+        for index in 1...26 { chain += "const x\(index) = (x\(index - 1) + x\(index - 1)) / 2u;\n" }
+        let source = chain + """
+        @group(0) @binding(x26) var<storage, read_write> out: array<u32, x26>;
+        @compute @workgroup_size(x26) fn main() { out[0] = x26; }
+        """
+        let started = Date()
+        let module = try WGSLShaderModule(source: source)
+        let auto = module.autoBindGroupLayouts(entryPoints: ["main"])
+        let size = try XCTUnwrap(module.workgroupSize(of: "main"))
+        let bindings = try WGSLBindingAssigner.assign(groups: auto)
+        let msl = try module.translateToMSL(entryPoints: ["main"], bindings: bindings)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3, "the const chain was re-evaluated per reference")
+        XCTAssertEqual(auto[0].first?.binding, 1)
+        XCTAssertEqual([size.x, size.y, size.z], [1, 1, 1])
+        // The MSL is deliberately not pushed through the Metal compiler here: an untyped module-scope
+        // `const` is emitted as a `#define`, so this chain expands exponentially in Metal's preprocessor
+        // (18 levels take 2.4 s, 26 levels about 25 minutes) — a separate problem from the evaluator's.
+        XCTAssertTrue(msl.contains("#define x26 (wgpu_div((x25 + x25), 2u))"), msl)
+    }
+
     // MARK: - @workgroup_size
 
     func test_workgroupSizeArgumentsAreEvaluatedAsExpressions() throws {
