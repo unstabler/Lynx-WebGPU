@@ -126,6 +126,7 @@ WGSL에서는 평범한 식별자가 MSL(C++14 + Metal 확장)에서는 예약�
 |---|---|
 | 진입점·함수 이름 중 `main` | `wgpu_fn_main` |
 | 그 외 예약어 충돌 (변수·매개변수·구조체·멤버·상수) | `wgpu_id_<이름>` |
+| `metal` 네임스페이스의 이름 (`bias` `level` `coord` `address` `component` `mesh` 같은 샘플러 옵션·좌표 구조체) | `wgpu_id_<이름>` — 프렐류드의 `using namespace metal;` 때문에 모듈 스코프 `const`/`override`가 이 이름이면 모든 사용처가 "ambiguous"로 컴파일에 실패했다. 내장 함수 이름(`min` `length` …)은 호출이 그대로 통과해야 하므로 여기 넣지 않는다 |
 | `wgpu_`로 시작하는 사용자 식별자 (종류 무관) | `wgpu_id_<이름>` |
 
 JS에서는 원래 이름(`entryPoint: 'main'`)을 그대로 쓴다. 런타임이

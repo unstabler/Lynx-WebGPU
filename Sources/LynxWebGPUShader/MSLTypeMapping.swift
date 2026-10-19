@@ -151,6 +151,15 @@ enum MSLTypeMapping {
         "goto", "do", "typeid", "and", "or", "not", "xor", "compl", "bitand", "bitor",
         // MSL scalar/vector type names
         "half", "uchar", "ushort", "size_t", "ptrdiff_t",
+        // Names declared in the `metal` namespace — sampler options and sampling-coordinate structs.
+        // The prelude's `using namespace metal;` makes a module-scope `constant int bias` ambiguous
+        // with `metal::bias` at every use ("reference to 'bias' is ambiguous"). A function-local name
+        // hides the namespace instead, but the rename is applied to every kind alike — the mapping must
+        // stay one-to-one. WGSL builtin functions (`min`, `length`, …) are deliberately **not** here:
+        // calls to builtins pass through `identifier(_:)` too and must keep their MSL spelling.
+        "bias", "level", "gradient2d", "gradient3d", "gradientcube", "min_lod_clamp", "component",
+        "coord", "address", "filter", "mag_filter", "min_filter", "mip_filter", "compare_func",
+        "border_color", "lod_clamp", "mesh", "fast", "precise", "quad", "simd",
     ]
 
     /// Names unusable as function names (`main` is not a C++ keyword but Metal rejects it).

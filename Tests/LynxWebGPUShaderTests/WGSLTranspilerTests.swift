@@ -974,6 +974,37 @@ final class WGSLTranspilerTests: XCTestCase {
         // A mismatch between declaration and use is caught by the Metal compile (the translate helper verifies it).
     }
 
+    func test_identifiersNamedLikeMetalNamespaceMembersAreRenamed() throws {
+        // `bias`, `level`, `coord`, … are structs and enums in the `metal` namespace. They are not MSL
+        // keywords, so they declared fine — but with the prelude's `using namespace metal;` every use of a
+        // module-scope `constant int bias` was "reference to 'bias' is ambiguous". Locals hide the
+        // namespace and compiled, which is why only an `override`/`const` exposed it.
+        let source = """
+        override bias: i32 = 2;
+        const level = 3u;
+        struct Sample { coord: vec2f, component: f32 }
+        @group(0) @binding(0) var<uniform> address: Sample;
+
+        fn lod(mesh: f32) -> f32 { return mesh + f32(level); }
+
+        @fragment
+        fn fs_main() -> @location(0) vec4f {
+            let compare_func = address.coord.x + address.component;
+            return vec4f(lod(compare_func) - f32(bias), 0.0, 0.0, 1.0);
+        }
+        """
+        let msl = try translate(source, entryPoints: ["fs_main"])
+        for name in ["bias", "level", "coord", "component", "address", "mesh", "compare_func"] {
+            XCTAssertTrue(msl.contains("wgpu_id_\(name)"), "'\(name)' was not renamed:\n\(msl)")
+        }
+        // A builtin with a colliding *spelling* is not a user identifier — its call must stay as written.
+        let builtin = try translate("""
+        @fragment fn fs_main() -> @location(0) vec4f { return vec4f(length(vec2f(3.0, 4.0)), 0.0, 0.0, 1.0); }
+        """, entryPoints: ["fs_main"])
+        XCTAssertTrue(builtin.contains("length(float2("), builtin)
+        XCTAssertFalse(builtin.contains("wgpu_id_length"), builtin)
+    }
+
     /// The `wgpu_` namespace belongs to the emitter (prelude helpers, padding members, entry point
     /// wrappers, …). User identifiers spelled into it move to `wgpu_id_<name>` at declaration and every
     /// use, the same as MSL reserved words — otherwise they redeclare an internal name or, worse,
