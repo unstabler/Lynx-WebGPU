@@ -615,6 +615,9 @@ final class RenderPipelineTests: XCTestCase {
         ] + dispatch(0) + dispatch(2, 0) + dispatch(2, 1, 0))
         XCTAssertEqual(try harness.readBufferSync(handle: 2, as: Float.self, size: 32), initial)
 
+        // `readBuffer` is mapAsync: the buffer stays mapped (and barred from queue work) until unmap.
+        harness.executeExpectingSuccess([["op": "unmapBuffer", "buffer": 2]])
+
         // Past the advertised `maxComputeWorkgroupsPerDimension` is a validation error, not a launch.
         let tooLarge = harness.execute(dispatch(65536))
         XCTAssertEqual(tooLarge["ok"] as? Bool, false)
@@ -625,7 +628,7 @@ final class RenderPipelineTests: XCTestCase {
         XCTAssertEqual(try harness.readBufferSync(handle: 2, as: Float.self, size: 32), initial)
 
         // The control: one workgroup marks exactly its four invocations.
-        harness.executeExpectingSuccess(dispatch(1))
+        harness.executeExpectingSuccess([["op": "unmapBuffer", "buffer": 2]] + dispatch(1))
         XCTAssertEqual(
             try harness.readBufferSync(handle: 2, as: Float.self, size: 32), [7, 7, 7, 7, 5, 6, 7, 8]
         )
