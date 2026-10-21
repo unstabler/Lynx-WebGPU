@@ -318,6 +318,77 @@ final class ExternalImageTests: XCTestCase {
         XCTAssertTrue(harness.describeErrors(result).contains("exceeds the image"), harness.describeErrors(result))
     }
 
+    /// Runs one `copyExternalImageToTexture` into a fresh 4x4 texture and expects a validation error
+    /// containing `needle` — never a crash, never a pixel read outside the decoded image.
+    private func assertCopyRejected(
+        source: [String: Any], destination: [String: Any] = [:], copySize: [String: Any]?,
+        containing needle: String, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        var copy: [String: Any] = [
+            "op": "copyExternalImageToTexture",
+            "source": source.merging(["source": 40]) { $1 },
+            "destination": destination.merging(["texture": 2]) { $1 },
+        ]
+        if let copySize { copy["copySize"] = copySize }
+        let result = harness.execute([
+            ["op": "createTexture", "id": 2, "size": ["width": 4, "height": 4],
+             "format": "rgba8unorm", "usage": TestUsage.textureBinding | TestUsage.textureCopyDst],
+            copy,
+            ["op": "destroy", "id": 2],
+        ])
+        let errors = harness.describeErrors(result)
+        XCTAssertEqual(result["ok"] as? Bool, false, "\(copy)", file: file, line: line)
+        XCTAssertTrue(errors.contains("[validation]"), errors, file: file, line: line)
+        XCTAssertTrue(errors.contains(needle), errors, file: file, line: line)
+    }
+
+    /// A negative source origin used to slip past the `origin + size <= image` check and `memcpy`
+    /// from **before** the decoded pixels — an out-of-bounds heap read uploaded into the texture.
+    func test_rejectsANegativeSourceOrigin() throws {
+        let png = try makePNG(width: 4, height: 4, top: (255, 0, 0, 255), bottom: (0, 0, 255, 255))
+        try decode(handle: 40, data: png)
+
+        let size: [String: Any] = ["width": 2, "height": 2]
+        assertCopyRejected(source: ["origin": ["x": -1, "y": 0]], copySize: size, containing: "must not be negative")
+        assertCopyRejected(source: ["origin": ["x": 0, "y": -2]], copySize: size, containing: "must not be negative")
+        assertCopyRejected(source: ["origin": ["x": -4, "y": -4]], copySize: nil, containing: "must not be negative")
+    }
+
+    /// The largest integer a JS number carries exactly (`Number.MAX_SAFE_INTEGER`). Anything past it
+    /// is already rejected by `WGPUValueReader`, so this is the largest value a copy can actually see.
+    private static let maxSafeInteger = (1 << 53) - 1
+
+    /// Values that would overflow `origin + size` or `rowBytes * height` are a validation error, not a trap.
+    func test_hugeOrNegativeCopyValuesAreAValidationErrorNotATrap() throws {
+        let png = try makePNG(width: 4, height: 4, top: (255, 0, 0, 255), bottom: (0, 0, 255, 255))
+        try decode(handle: 40, data: png)
+
+        assertCopyRejected(source: ["origin": ["x": 1, "y": 0]], copySize: ["width": Self.maxSafeInteger, "height": 1],
+                           containing: "exceeds the image")
+        assertCopyRejected(source: ["origin": ["x": Self.maxSafeInteger, "y": Self.maxSafeInteger]], copySize: ["width": 1, "height": 1],
+                           containing: "exceeds the image")
+        assertCopyRejected(source: ["origin": ["x": Self.maxSafeInteger, "y": 0]], copySize: nil, containing: "exceeds the image")
+        assertCopyRejected(source: [:], copySize: ["width": 2, "height": Self.maxSafeInteger], containing: "exceeds the image")
+        assertCopyRejected(source: [:], copySize: ["width": -1, "height": 2], containing: "must not be negative")
+        assertCopyRejected(source: [:], copySize: ["width": 2, "height": 2, "depthOrArrayLayers": 2],
+                           containing: "single layer")
+    }
+
+    /// The destination end is checked before it reaches the unsigned Metal blit arguments.
+    func test_rejectsADestinationOutsideTheTexture() throws {
+        let png = try makePNG(width: 4, height: 4, top: (255, 0, 0, 255), bottom: (0, 0, 255, 255))
+        try decode(handle: 40, data: png)
+
+        let size: [String: Any] = ["width": 2, "height": 2]
+        assertCopyRejected(source: [:], destination: ["origin": ["x": -1, "y": 0]], copySize: size,
+                           containing: "destination origin must not be negative")
+        assertCopyRejected(source: [:], destination: ["origin": ["x": 3, "y": 0]], copySize: size,
+                           containing: "exceeds the destination texture")
+        assertCopyRejected(source: [:], destination: ["origin": ["x": 0, "y": Self.maxSafeInteger]], copySize: size,
+                           containing: "exceeds the destination texture")
+        assertCopyRejected(source: [:], destination: ["mipLevel": 1], copySize: size, containing: "mipLevel")
+    }
+
     /// It cannot upload into a compressed texture — the GPU has no block encoder.
     func test_cannotUploadIntoACompressedTexture() throws {
         try XCTSkipUnless(

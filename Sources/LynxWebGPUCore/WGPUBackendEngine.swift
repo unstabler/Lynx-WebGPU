@@ -45,6 +45,13 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     private var currentComputePipeline: WGPUEngineComputePipeline<B>?
     private var boundGroups: [Int: (group: WGPUEngineBindGroup<B>, offsets: [Int])] = [:]
     private var dirtyGroups: Set<Int> = []
+    /// Dynamic offset alignments, read once from the limits the backend advertises (the spec default,
+    /// 256, for one it does not list).
+    private lazy var dynamicOffsetAlignments: (uniform: Int, storage: Int) = {
+        let limits = backend.adapterInfo()["limits"] as? [String: Any] ?? [:]
+        func alignment(_ key: String) -> Int { max((limits[key] as? Int) ?? 256, 1) }
+        return (alignment("minUniformBufferOffsetAlignment"), alignment("minStorageBufferOffsetAlignment"))
+    }()
     private var indexBinding: (buffer: WGPUEngineBuffer<B>, offset: Int, format: WGPUIndexFormat, stride: Int)?
     /// Vertex buffer bindings per slot. **They do not go straight to the backend**; they gather here
     /// and go down right before a draw. That is what lets `resetPassBindings()` genuinely invalidate
@@ -88,6 +95,23 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     /// (`WGPUBackendCapabilities.validatesNatively`).
     private let specValidation: Bool
 
+    /// Whether a draw/dispatch that does no work (a 0 vertex/index/instance/workgroup count) stops at
+    /// the engine once its state is validated. The spec makes such a call valid and a no-op, but Metal
+    /// asserts on an empty grid (`dispatchThreadgroups`) — Dawn's own Metal backend drops zero-count
+    /// draws and dispatches before the encoder for the same reason — so the backend never sees one.
+    /// A backend that validates natively (Dawn) is a complete WebGPU implementation:
+    /// it receives the call so **its** state validation still runs, and skips the work itself.
+    private var skipsEmptyWork: Bool { specValidation }
+
+    /// `GPUSupportedLimits.maxComputeWorkgroupsPerDimension` as the backend advertises it (the device
+    /// is created with the adapter's limits). Read once — `adapterInfo()` builds a whole dictionary.
+    /// Falls back to the spec's default limit when the backend reports none.
+    private lazy var maxComputeWorkgroupsPerDimension: Int = {
+        let limits = backend.adapterInfo()["limits"] as? [String: Any]
+        let value = limits?["maxComputeWorkgroupsPerDimension"]
+        return (value as? Int) ?? (value as? NSNumber)?.intValue ?? 65535
+    }()
+
     public init(backend: B, frameCoordinator: WGPUFrameCoordinator = WGPUFrameCoordinator()) {
         self.backend = backend
         self.frameCoordinator = frameCoordinator
@@ -126,6 +150,9 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         // Flush the previous batch's GPU execution failures first — an open error scope catches them.
         for failure in gpuFailures.drain() { record(failure) }
         backend.beginBatch()
+        // What the backend's validator raised between batches (a resize, a readback, …) — filed with
+        // the scopes open now, before this batch's first push/pop can move them.
+        recordImmediateDiagnostics()
 
         for (index, command) in commands.enumerated() {
             do {
@@ -142,14 +169,28 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             } catch {
                 record(.backend(error.localizedDescription, path: "commands[\(index)]"))
             }
+            // Per command, not per batch: a native validator's error must meet the scopes **as they
+            // were when this command ran**. Collected only at batch end, a `push → create → pop` in
+            // one batch (the shim's `createRenderPipelineAsync`) resolves its scope clean while the
+            // error leaks to the batch result (`WGPUBackend.drainImmediateDiagnostics`).
+            recordImmediateDiagnostics()
         }
 
         // No commands but present means **the tick's closing batch** (the end of a frame-loop callback).
         finish(WGPUFrameBoundary(requestedPresent: present, commandCount: commands.count))
 
-        // Per-batch backend diagnostics (Dawn's device scope, …) — collected after submit so this
-        // batch's GPU validation errors are included too.
+        // Diagnostics that only surface late (Dawn: encoder errors raised at Finish, pumped callbacks)
+        // — collected after submit so this batch's GPU validation errors are included too. They meet
+        // the scopes open at the end of the batch: no command-level moment is left to attribute them to.
         for diagnostic in backend.collectBatchDiagnostics() { record(diagnostic) }
+
+        // A cascading echo ("[Invalid X] is invalid due to a previous error") repeats a root error
+        // downstream. When a root error is in this result too, the echoes are dropped from it — an
+        // overlay showing the last error would otherwise always show the echo and hide the cause.
+        // Scopes are not filtered: using an invalid object is a real validation error in the spec.
+        if errors.contains(where: { !backend.isCascadingEcho($0) }) {
+            errors.removeAll(where: backend.isCascadingEcho)
+        }
 
         return WGPUBatchResult(
             commandCount: commands.count,
@@ -167,6 +208,12 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     private func record(_ error: WGPUError) {
         if errorScopes.capture(error) { return }
         errors.append(error)
+    }
+
+    /// Files what the backend's own validator has already raised (`drainImmediateDiagnostics`) with
+    /// the scopes open **now**.
+    private func recordImmediateDiagnostics() {
+        for diagnostic in backend.drainImmediateDiagnostics() { record(diagnostic) }
     }
 
     private func resetBatchState() {
@@ -463,13 +510,19 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         }
     }
 
-    /// Copies and uploads only outside a pass — they are command-encoder-level commands (and the JS
+    /// Encoder copies only outside a pass — they are command-encoder-level commands (and the JS
     /// shim only sends them that way). On a natively-validating backend the backend's validator
-    /// catches it (encoder copies — at Dawn's Finish).
+    /// catches it (at Dawn's Finish).
+    ///
+    /// **Queue uploads (`writeBuffer`/`writeTexture`/`copyExternalImageToTexture`) must not call
+    /// this.** They are `GPUQueue` operations, legal at any moment — including while a pass encoder is
+    /// still recording (`queue.writeBuffer(u); pass.setBindGroup(…); pass.draw()` per object is the
+    /// everyday loop). Their ordering is the backend's job: they take effect on the queue timeline
+    /// before the batch's encoder work (`WGPUBackend.writeBuffer`).
     private func requireNoOpenPass() throws {
         guard specValidation else { return }
         guard passState == nil else {
-            throw WGPUError.validation("copy and upload commands cannot be used inside a render/compute pass")
+            throw WGPUError.validation("copy commands cannot be used inside a render/compute pass")
         }
     }
 
@@ -484,15 +537,58 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         // (The JS shim folds this flag on the client and sends initialData instead — this path
         //  belongs to native users building the command stream directly.)
         object.isMapped = command.descriptor.mappedAtCreation
+        // It is a write mapping of the whole buffer — `unmapBuffer` may carry its contents.
+        object.writeMappedRange = command.descriptor.mappedAtCreation ? 0..<command.descriptor.size : nil
         registry.insert(object, at: command.id)
     }
 
+    /// `unmap()`. A write mapping's bytes come back in `data` (the JS mapping is a copy) and are stored
+    /// **while the buffer is still mapped**, then the mapping is released.
+    ///
+    /// `unmap` cannot fail in the spec, so the mapping is released **even when the write-back is
+    /// rejected** — otherwise one bad command would leave the buffer unavailable to queue work forever.
     private func unmapBuffer(_ command: WGPUUnmapBufferCommand) throws {
         let object = try registry.lookup(
             command.buffer, as: WGPUEngineBuffer<B>.self, kind: "GPUBuffer"
         )
-        object.isMapped = false
-        backend.unmapBuffer(object.raw)
+        let writable = object.isMapped ? object.writeMappedRange : nil
+        defer {
+            object.isMapped = false
+            object.writeMappedRange = nil
+            object.mapGeneration += 1   // a still-pending mapping's completion is stale from here on
+            backend.unmapBuffer(object.raw)
+        }
+        guard let data = command.data else { return }
+        guard let range = writable else {
+            throw WGPUError.validation(
+                "unmapBuffer data needs a buffer mapped for writing "
+                    + "(mapAsync(GPUMapMode.WRITE) or mappedAtCreation)",
+                path: command.fieldPath("data")
+            )
+        }
+        // Checked whatever the backend: the write-back is a CPU copy into the mapping (Dawn) — the same
+        // CPU path protection a natively validating backend keeps.
+        let offset = command.offset ?? range.lowerBound
+        guard offset >= range.lowerBound, offset <= range.upperBound,
+              data.count <= range.upperBound - offset else {
+            throw WGPUError.validation(
+                "unmapBuffer data is outside the mapped range — offset \(offset) + \(data.count)B, "
+                    + "mapped \(range.lowerBound)~\(range.upperBound)",
+                path: command.fieldPath("offset")
+            )
+        }
+        // The getMappedRange alignment — a range JS can obtain always satisfies it.
+        guard offset % 8 == 0, data.count % 4 == 0 else {
+            throw WGPUError.validation(
+                "unmapBuffer's offset must be a multiple of 8 and its data a multiple of 4 bytes "
+                    + "(got \(offset), \(data.count)B)",
+                path: command.fieldPath("offset")
+            )
+        }
+        // No open-pass gate: `unmap()` is legal at any time, and the write-back rides the queue's upload
+        // path (Metal's upload command buffer, Dawn's mapped memory) like writeBuffer does inside a pass.
+        guard !data.isEmpty else { return }
+        try backend.writeMappedBuffer(object.raw, offset: offset, data: data)
     }
 
     private func writeBuffer(_ command: WGPUWriteBufferCommand) throws {
@@ -522,7 +618,6 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             }
         }
         guard !data.isEmpty else { return }   // a zero-size write is a no-op
-        try requireNoOpenPass()
         try backend.writeBuffer(target.raw, offset: offset, data: data)
     }
 
@@ -537,7 +632,9 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
                 raw: raw,
                 format: command.descriptor.format,
                 size: command.descriptor.size,
-                sampleCount: command.descriptor.sampleCount
+                sampleCount: command.descriptor.sampleCount,
+                mipLevelCount: command.descriptor.mipLevelCount,
+                dimension: command.descriptor.dimension
             ),
             at: command.id
         )
@@ -643,7 +740,6 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
                 throw WGPUError.validation("writeTexture data is too short (\(data.count)B, at least \(required)B needed)")
             }
         }
-        try requireNoOpenPass()
         try backend.writeTexture(
             target.raw, data: data, origin: command.origin, size: size,
             mipLevel: command.mipLevel, bytesPerRow: bytesPerRow, rowsPerImage: rowsPerImage
@@ -677,18 +773,56 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             )
         }
 
+        // The source checks run **regardless of `specValidation`**: the crop below is a `memcpy` out of
+        // engine-owned memory (the decoded pixels), which no native validator ever sees. A negative
+        // origin used to pass the bound check and read before the pixel buffer (an out-of-bounds read
+        // uploaded into the texture). JS can send any integer, so signs are checked first and bounds
+        // are compared by subtraction — nothing here can overflow.
         let sourceOrigin = command.source.origin
+        guard sourceOrigin.x >= 0, sourceOrigin.y >= 0 else {
+            throw WGPUError.validation(
+                "the source origin of copyExternalImageToTexture must not be negative "
+                + "(\(sourceOrigin.x), \(sourceOrigin.y))",
+                path: command.source.fieldPath("origin")
+            )
+        }
+        if let copySize = command.copySize {
+            guard copySize.width >= 0, copySize.height >= 0, copySize.depthOrArrayLayers >= 0 else {
+                throw WGPUError.validation(
+                    "copyExternalImageToTexture copySize must not be negative "
+                    + "(\(copySize.width)x\(copySize.height)x\(copySize.depthOrArrayLayers))",
+                    path: command.fieldPath("copySize")
+                )
+            }
+            guard copySize.depthOrArrayLayers <= 1 else {
+                throw WGPUError.validation(
+                    "an image has a single layer — copySize.depthOrArrayLayers must be at most 1 "
+                    + "(got \(copySize.depthOrArrayLayers))",
+                    path: command.fieldPath("copySize")
+                )
+            }
+        }
+        guard sourceOrigin.x <= bitmap.width, sourceOrigin.y <= bitmap.height else {
+            throw WGPUError.validation(
+                "the copy region exceeds the image — the origin (\(sourceOrigin.x), \(sourceOrigin.y)) "
+                + "lies outside \(bitmap.width)x\(bitmap.height)",
+                path: command.source.fieldPath("origin")
+            )
+        }
         // An omitted copy size means **the whole remainder of the image** — that needs the image size, so it is filled here.
         let size = command.copySize
             ?? WGPUExtent3D(width: bitmap.width - sourceOrigin.x, height: bitmap.height - sourceOrigin.y)
-        guard size.width > 0, size.height > 0 else { return }   // no-op
-        guard sourceOrigin.x + size.width <= bitmap.width,
-              sourceOrigin.y + size.height <= bitmap.height else {
+        guard size.width <= bitmap.width - sourceOrigin.x,
+              size.height <= bitmap.height - sourceOrigin.y else {
             throw WGPUError.validation(
                 "the copy region exceeds the image — (\(sourceOrigin.x), \(sourceOrigin.y)) + "
                 + "\(size.width)x\(size.height) > \(bitmap.width)x\(bitmap.height)"
             )
         }
+        if specValidation {
+            try validateExternalImageDestination(command.destination, texture: target, size: size)
+        }
+        guard size.width > 0, size.height > 0, size.depthOrArrayLayers > 0 else { return }   // no-op
 
         // Spec `GPUCopyExternalImageSourceInfo.flipY` — flips top to bottom **at copy time**.
         // (`createImageBitmap`'s flipY happens at decode time and is separate. Web libraries use this
@@ -711,7 +845,6 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             }
         }
 
-        try requireNoOpenPass()
         try backend.writeTexture(
             target.raw, data: slice,
             origin: command.destination.origin,
@@ -719,6 +852,56 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             mipLevel: command.destination.mipLevel,
             bytesPerRow: rowBytes, rowsPerImage: size.height
         )
+    }
+
+    /// The destination end of `copyExternalImageToTexture` (the spec's "validating
+    /// GPUTexelCopyTextureInfo" and "validating texture copy range", for this op only).
+    ///
+    /// A negative origin or an out-of-range mip level would cross into unsigned Metal blit arguments
+    /// and die on an assertion — or write outside the texture. Backends that validate natively
+    /// reject these themselves, so this runs only under `specValidation`. `size` is already known
+    /// to be non-negative and at most one layer deep.
+    private func validateExternalImageDestination(
+        _ destination: WGPUTexelCopyTextureInfo,
+        texture: WGPUEngineTexture<B>,
+        size: WGPUExtent3D
+    ) throws {
+        guard texture.sampleCount == 1 else {
+            throw WGPUError.validation(
+                "copyExternalImageToTexture cannot target a multisampled texture (sampleCount \(texture.sampleCount))",
+                path: destination.fieldPath("texture")
+            )
+        }
+        let mipLevel = destination.mipLevel
+        guard mipLevel >= 0, mipLevel < texture.mipLevelCount else {
+            throw WGPUError.validation(
+                "mipLevel must be between 0 and \(texture.mipLevelCount - 1) (got \(mipLevel))",
+                path: destination.fieldPath("mipLevel")
+            )
+        }
+        let origin = destination.origin
+        guard origin.x >= 0, origin.y >= 0, origin.z >= 0 else {
+            throw WGPUError.validation(
+                "the destination origin must not be negative (\(origin.x), \(origin.y), \(origin.z))",
+                path: destination.fieldPath("origin")
+            )
+        }
+        let levelWidth = max(texture.size.width >> mipLevel, 1)
+        let levelHeight = max(texture.size.height >> mipLevel, 1)
+        let levelDepth = texture.dimension == .threeD
+            ? max(texture.size.depthOrArrayLayers >> mipLevel, 1)
+            : texture.size.depthOrArrayLayers
+        // Compared by subtraction: every operand is non-negative here, so nothing can overflow.
+        guard size.width <= levelWidth - origin.x,
+              size.height <= levelHeight - origin.y,
+              size.depthOrArrayLayers <= levelDepth - origin.z else {
+            throw WGPUError.validation(
+                "the copy region exceeds the destination texture — (\(origin.x), \(origin.y), \(origin.z)) + "
+                + "\(size.width)x\(size.height)x\(size.depthOrArrayLayers) > "
+                + "\(levelWidth)x\(levelHeight)x\(levelDepth) @ level \(mipLevel)",
+                path: destination.fieldPath("origin")
+            )
+        }
     }
 
     /// Block alignment for compressed texture copies (the spec's "validating texel copy range").
@@ -843,7 +1026,7 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             )
         }
         let raw = try backend.makePipelineLayout(groups.map(\.raw))
-        registry.insert(WGPUEnginePipelineLayout<B>(raw: raw), at: command.id)
+        registry.insert(WGPUEnginePipelineLayout<B>(raw: raw, groupEntries: groups.map(\.entries)), at: command.id)
     }
 
     private func createBindGroup(_ command: WGPUCreateCommand<WGPUBindGroupDescriptor>) throws {
@@ -852,7 +1035,8 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             path: command.fieldPath("layout")
         )
         var buffers: [WGPUEngineBuffer<B>] = []
-        let entries: [WGPUResolvedBindGroupEntry<B>] = try command.descriptor.entries.map { entry in
+        var bufferBindings: [WGPUEngineBufferBinding] = []
+        let entries: [WGPUResolvedBindGroupEntry<B>] = try command.descriptor.entries.enumerated().map { index, entry in
             // Check matching when the layout's entries are known. A natively-validating backend and a
             // derived layout (entries unknown) are left to backend validation — it knows visibility itself.
             let layoutEntry: WGPUBindGroupLayoutEntry?
@@ -869,9 +1053,26 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             case .buffer(let handle, let offset, let size):
                 let object = try registry.lookup(handle, as: WGPUEngineBuffer<B>.self, kind: "GPUBuffer")
                 buffers.append(object)
-                resource = .buffer(
-                    object.raw, offset: offset, boundSize: size ?? max(object.size - offset, 0)
-                )
+                let boundSize = size ?? max(object.size - offset, 0)
+                if case .buffer(let bufferLayout)? = layoutEntry?.layout {
+                    // The spec checks every buffer binding against its layout's `minBindingSize` here.
+                    // (`layout: "auto"` layouts carry the shader's minimum, so they are caught here too.)
+                    guard boundSize >= bufferLayout.minBindingSize else {
+                        throw WGPUError.validation(
+                            "binding \(entry.binding): the bound range is \(boundSize) bytes, smaller than "
+                                + "the layout's minBindingSize \(bufferLayout.minBindingSize)",
+                            path: command.fieldPath("entries[\(index)]")
+                        )
+                    }
+                    // Remembered for the draw-time check of `minBindingSize: 0` entries.
+                    bufferBindings.append(WGPUEngineBufferBinding(
+                        binding: entry.binding, type: bufferLayout.type,
+                        bufferSize: object.size, offset: offset, size: size,
+                        hasDynamicOffset: bufferLayout.hasDynamicOffset,
+                        prevalidatedSize: bufferLayout.minBindingSize != 0
+                    ))
+                }
+                resource = .buffer(object.raw, offset: offset, boundSize: boundSize)
             case .sampler(let handle):
                 let object = try registry.lookup(handle, as: WGPUEngineSampler<B>.self, kind: "GPUSampler")
                 resource = .sampler(object.raw)
@@ -886,7 +1087,14 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             )
         }
         let raw = try backend.makeBindGroup(layout: layout.raw, entries: entries)
-        registry.insert(WGPUEngineBindGroup<B>(raw: raw, buffers: buffers), at: command.id)
+        // Binding metadata is only complete when every entry was matched against a known layout.
+        let entriesKnown = specValidation && layout.entries != nil
+        registry.insert(
+            WGPUEngineBindGroup<B>(
+                raw: raw, buffers: buffers, bufferBindings: entriesKnown ? bufferBindings : nil
+            ),
+            at: command.id
+        )
     }
 
     private func createQuerySet(_ command: WGPUCreateCommand<WGPUQuerySetDescriptor>) throws {
@@ -974,6 +1182,9 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             layout: layout,
             fieldPath: { command.fieldPath($0) }
         )
+        try validateMinimumBindingSizes(
+            creation.info.minimumBindingSizes, layout: descriptor.layout, path: command.fieldPath("layout")
+        )
         registry.insert(
             WGPUEngineRenderPipeline<B>(raw: creation.pipeline, info: creation.info), at: command.id
         )
@@ -989,9 +1200,39 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         let creation = try backend.makeComputePipeline(
             descriptor, module: module.raw, layout: layout, fieldPath: { command.fieldPath($0) }
         )
+        try validateMinimumBindingSizes(
+            creation.info.minimumBindingSizes, layout: descriptor.layout, path: command.fieldPath("layout")
+        )
         registry.insert(
             WGPUEngineComputePipeline<B>(raw: creation.pipeline, info: creation.info), at: command.id
         )
+    }
+
+    /// The spec's "validating shader binding": an explicit layout's buffer entry with a non-zero
+    /// `minBindingSize` must be at least the shader variable's minimum binding size — otherwise
+    /// every bind group made for that layout passes its own check yet is too small for this shader.
+    /// (A zero entry is checked at each draw/dispatch instead, and `"auto"` derives the value from
+    /// the shader itself.) Nil sizes mean the backend validates natively.
+    private func validateMinimumBindingSizes(
+        _ sizes: [Int: [Int: Int]]?, layout reference: WGPUPipelineLayoutRef, path: String?
+    ) throws {
+        guard specValidation, let sizes, case .explicit(let handle) = reference else { return }
+        let layout = try registry.lookup(handle, as: WGPUEnginePipelineLayout<B>.self, kind: "GPUPipelineLayout")
+        for (groupIndex, bindings) in sizes.sorted(by: { $0.key < $1.key }) {
+            guard groupIndex >= 0, groupIndex < layout.groupEntries.count,
+                  let entries = layout.groupEntries[groupIndex] else { continue }
+            for (binding, required) in bindings.sorted(by: { $0.key < $1.key }) {
+                guard let entry = entries.first(where: { $0.binding == binding }),
+                      case .buffer(let buffer) = entry.layout,
+                      buffer.minBindingSize != 0, buffer.minBindingSize < required else { continue }
+                throw WGPUError.validation(
+                    "@group(\(groupIndex)) @binding(\(binding)): the layout's minBindingSize "
+                        + "\(buffer.minBindingSize) is smaller than the shader variable's minimum binding "
+                        + "size \(required)",
+                    path: path
+                )
+            }
+        }
     }
 
     private func resolvePipelineLayout(_ reference: WGPUPipelineLayoutRef) throws -> WGPUResolvedPipelineLayout<B> {
@@ -1037,8 +1278,11 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
                     + "(check that <webgpu-canvas canvas-id=\"…\"> is attached on screen)"
             )
         }
-        try backend.configureSurface(entry.raw, configuration: configuration)
+        // Recorded before the backend call: a configure can take effect and still throw (Dawn drops an
+        // unsupported usage bit, configures with the rest, then reports it), and the batch's `canvases`
+        // must still report the canvas.
         touchedCanvases[configuration.canvasId] = entry.raw
+        try backend.configureSurface(entry.raw, configuration: configuration)
     }
 
     private func getCurrentTexture(_ command: WGPUGetCurrentTextureCommand) throws {
@@ -1273,8 +1517,53 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             command.bindGroup, as: WGPUEngineBindGroup<B>.self, kind: "GPUBindGroup",
             path: command.fieldPath("bindGroup")
         )
+        if specValidation, let bindings = group.bufferBindings {
+            try validateDynamicOffsets(command, bindings: bindings)
+        }
         boundGroups[command.index] = (group, command.dynamicOffsets)
         dirtyGroups.insert(command.index)
+    }
+
+    /// The spec's `setBindGroup` checks on dynamic offsets — one per `hasDynamicOffset` entry, in
+    /// binding order; each a multiple of the advertised `min{Uniform,Storage}BufferOffsetAlignment`;
+    /// and the shifted range inside the buffer. The range is Dawn's stricter form — offset + dynamic
+    /// offset + **the binding's size** (to the buffer's end when `size` was omitted, so such an entry
+    /// only takes 0) — the same rule a page meets on Dawn. Unchecked, Metal binds past the buffer's end.
+    private func validateDynamicOffsets(
+        _ command: WGPUSetBindGroupCommand, bindings: [WGPUEngineBufferBinding]
+    ) throws {
+        let dynamic = bindings.filter(\.hasDynamicOffset)
+        let offsets = command.dynamicOffsets
+        guard offsets.count == dynamic.count else {
+            throw WGPUError.validation(
+                "setBindGroup got \(offsets.count) dynamic offsets, but the bind group's layout has "
+                    + "\(dynamic.count) entries with hasDynamicOffset",
+                path: command.fieldPath("dynamicOffsets")
+            )
+        }
+        for (index, (binding, dynamicOffset)) in zip(dynamic, offsets).enumerated() {
+            let path = command.fieldPath("dynamicOffsets[\(index)]")
+            let (limit, alignment) = binding.type == .uniform
+                ? ("minUniformBufferOffsetAlignment", dynamicOffsetAlignments.uniform)
+                : ("minStorageBufferOffsetAlignment", dynamicOffsetAlignments.storage)
+            guard dynamicOffset >= 0, dynamicOffset % alignment == 0 else {
+                throw WGPUError.validation(
+                    "dynamic offset \(dynamicOffset) for binding \(binding.binding) must be a non-negative "
+                        + "multiple of \(limit) (\(alignment))",
+                    path: path
+                )
+            }
+            let size = binding.size ?? max(binding.bufferSize - binding.offset, 0)
+            let (shifted, overflowA) = binding.offset.addingReportingOverflow(dynamicOffset)
+            let (end, overflowB) = shifted.addingReportingOverflow(size)
+            guard !overflowA, !overflowB, end <= binding.bufferSize else {
+                throw WGPUError.validation(
+                    "binding \(binding.binding): offset \(binding.offset) + dynamic offset \(dynamicOffset) + "
+                        + "size \(size) exceeds the buffer's \(binding.bufferSize) bytes",
+                    path: path
+                )
+            }
+        }
     }
 
     /// Returns pipeline, bind group and vertex/index buffer bindings to "unspecified".
@@ -1304,16 +1593,22 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     /// why its message is generic.
     private func applyDrawState() throws {
         let requiredGroups: Set<Int>?
+        let layoutGroupCount: Int?
+        let minimumBindingSizes: [Int: [Int: Int]]?
         if passState == .render {
             guard let pipeline = currentRenderPipeline else {
                 throw WGPUError.validation("setPipeline is required before draw")
             }
             requiredGroups = pipeline.info.requiredGroups
+            layoutGroupCount = pipeline.info.layoutGroupCount
+            minimumBindingSizes = pipeline.info.minimumBindingSizes
         } else {
             guard let pipeline = currentComputePipeline else {
                 throw WGPUError.validation("setPipeline is required before dispatch")
             }
             requiredGroups = pipeline.info.requiredGroups
+            layoutGroupCount = pipeline.info.layoutGroupCount
+            minimumBindingSizes = pipeline.info.minimumBindingSizes
         }
 
         // Every group the layout requires must be bound. Without this check a draw silently uses
@@ -1329,6 +1624,10 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             }
         }
 
+        if specValidation, let minimumBindingSizes {
+            try validateBoundSizes(against: minimumBindingSizes)
+        }
+
         // If a buffer held by a bind group is mapped, this draw is queue work too, so it is rejected.
         // (A group pins its buffers at creation, so a buffer mapped afterwards is caught here.)
         for (_, bound) in boundGroups {
@@ -1339,13 +1638,57 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             }
         }
 
-        for groupIndex in dirtyGroups.sorted() {
-            guard let bound = boundGroups[groupIndex] else { continue }
+        // Groups bound beyond the current layout are held back. The spec ignores them (draw validity
+        // looks only at the layout's own indices), but a backend that maps groups through the layout
+        // has nowhere to put them — Metal throws "the pipeline layout has no @group(N)" — so a pass
+        // that switched from a 2-group pipeline to a 1-group one would fail every later draw. A held
+        // group **stays dirty**, so a later pipeline whose layout reaches it gets it then.
+        // Every index inside the layout still goes down, empty slots included, so a non-empty group
+        // bound at an empty slot is still rejected by the backend as incompatible. Without
+        // `layoutGroupCount` the layout's length is unknown and "beyond" falls back to "above the
+        // highest required index" (`requiredGroups` omits empty groups, so a trailing empty slot is
+        // then treated as beyond). A group turns clean only once the backend accepted it — after a
+        // throw the failed group (and those after it) stay pending, so each later draw sees the same
+        // invalid state until setBindGroup/setPipeline fixes it.
+        // (Nil metadata: the backend validates natively and tolerates extras, so all go down.)
+        let appliedGroupLimit = layoutGroupCount ?? requiredGroups.map { ($0.max() ?? -1) + 1 } ?? Int.max
+        for groupIndex in dirtyGroups.sorted() where groupIndex < appliedGroupLimit {
+            guard let bound = boundGroups[groupIndex] else {
+                dirtyGroups.remove(groupIndex)
+                continue
+            }
             try backend.applyBindGroup(bound.group.raw, at: groupIndex, dynamicOffsets: bound.offsets)
+            dirtyGroups.remove(groupIndex)
         }
-        dirtyGroups.removeAll()
 
         try applyVertexBuffers()
+    }
+
+    /// The spec's draw/dispatch-time half of `minBindingSize`: a buffer entry whose layout said `0`
+    /// was not size-checked at creation, so its effective size (after the dynamic offset, when the
+    /// entry has no explicit `size`) must cover the pipeline's shader variable now. Without it a
+    /// 4-byte binding feeds a shader that reads a 64-byte struct, and Metal reads past the range.
+    private func validateBoundSizes(against minimumSizes: [Int: [Int: Int]]) throws {
+        for (groupIndex, required) in minimumSizes.sorted(by: { $0.key < $1.key }) {
+            guard let bound = boundGroups[groupIndex] else { continue }
+            var dynamicIndex = 0
+            for binding in bound.group.bufferBindings ?? [] {
+                var dynamicOffset = 0
+                if binding.hasDynamicOffset {
+                    if dynamicIndex < bound.offsets.count { dynamicOffset = bound.offsets[dynamicIndex] }
+                    dynamicIndex += 1
+                }
+                guard !binding.prevalidatedSize, let minimum = required[binding.binding] else { continue }
+                let size = binding.effectiveSize(dynamicOffset: dynamicOffset)
+                guard size >= minimum else {
+                    throw WGPUError.validation(
+                        "@group(\(groupIndex)) @binding(\(binding.binding)): the bound buffer range is \(size) "
+                            + "bytes, but the shader variable needs at least \(minimum) (its minimum binding "
+                            + "size — give the layout entry a minBindingSize, or bind a larger range)"
+                    )
+                }
+            }
+        }
     }
 
     /// Right before a draw, checks the vertex buffers the pipeline requires are present and sends them down.
@@ -1417,6 +1760,8 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             throw WGPUError.validation("setPipeline is required before draw")
         }
         try applyDrawState()
+        // Validated like any draw, but nothing to rasterize — see `skipsEmptyWork`.
+        if skipsEmptyWork, command.vertexCount == 0 || command.instanceCount == 0 { return }
         try backend.draw(command)
     }
 
@@ -1429,6 +1774,7 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             throw WGPUError.validation("setIndexBuffer is required before drawIndexed")
         }
         try applyDrawState()
+        if skipsEmptyWork, command.indexCount == 0 || command.instanceCount == 0 { return }
         try backend.drawIndexed(command, index: resolvedIndexBinding(indexBinding))
     }
 
@@ -1502,10 +1848,25 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
 
     private func dispatchWorkgroups(_ command: WGPUDispatchWorkgroupsCommand) throws {
         try requireComputePass()
+        // The per-dimension cap is checked **before** `applyDrawState()`, like the indirect arguments —
+        // a rejected command must not have changed encoder state.
+        if specValidation {
+            let limit = maxComputeWorkgroupsPerDimension
+            for (key, count) in [("x", command.x), ("y", command.y), ("z", command.z)] where count > limit {
+                throw WGPUError.validation(
+                    "a workgroup count must not exceed maxComputeWorkgroupsPerDimension "
+                        + "(\(limit)) — got \(count)",
+                    path: command.fieldPath(key)
+                )
+            }
+        }
         guard currentComputePipeline != nil else {
             throw WGPUError.validation("setPipeline is required before dispatchWorkgroups")
         }
+        // A zero-sized grid is valid and dispatches nothing, but **the state is still validated** —
+        // a missing bind group is an error whether or not any workgroup runs.
         try applyDrawState()
+        if skipsEmptyWork, command.isEmpty { return }
         try backend.dispatchWorkgroups(command)
     }
 
@@ -1931,6 +2292,10 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     ///
     /// While reading, this buffer is "unavailable" — if a write from the next frame overlaps the same
     /// memory, which frame's values JS receives is not guaranteed (`WGPUEngineBuffer.isMapped`).
+    ///
+    /// A `MAP_WRITE` buffer is mapped **for writing** instead (`mapAsync(GPUMapMode.WRITE)` — the
+    /// backend's `mapBufferForWrite`): the result is its current contents, and `unmapBuffer`'s `data`
+    /// writes the mapping back.
     public func readBuffer(
         handle: Int,
         offset: Int = 0,
@@ -1959,40 +2324,70 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             ])
             return
         }
-        target.isMapped = true
+
+        // On failure we do not set up the mapping — a failed mapAsync leaves the buffer unmapped in the spec too.
+        func reject(_ message: String) {
+            executionLock.unlock()
+            completion(["ok": false, "errors": [WGPUError.validation(message).payload]])
+        }
 
         let length = size ?? (target.size - offset)
         guard offset >= 0, length >= 0, offset + length <= target.size else {
-            // On failure we do not set up the mapping — a failed mapAsync leaves the buffer unmapped in the spec too.
-            target.isMapped = false
-            executionLock.unlock()
-            completion([
-                "ok": false,
-                "errors": [WGPUError.validation(
-                    "readBuffer out of range — offset \(offset) + \(length)B > buffer size \(target.size)B"
-                ).payload],
-            ])
+            reject("readBuffer out of range — offset \(offset) + \(length)B > buffer size \(target.size)B")
             return
         }
+        // A MAP_WRITE buffer cannot also be MAP_READ (spec), so its only mapping is a write mapping —
+        // its contents come back at unmap (`unmapBuffer`'s `data`). The JS shim rejects a READ on it.
+        let forWrite = target.usage.contains(.mapWrite)
+        if forWrite {
+            guard offset % 8 == 0, length % 4 == 0 else {
+                reject(
+                    "mapAsync(GPUMapMode.WRITE)'s offset must be a multiple of 8 and its size a multiple of 4 "
+                        + "(got \(offset), \(length)B)"
+                )
+                return
+            }
+            target.writeMappedRange = offset..<(offset + length)
+        }
+        target.isMapped = true
+        target.mapGeneration += 1
+        let generation = target.mapGeneration
 
         // Waiting on previously submitted GPU work is the backend's job. Completion arrives on an
         // arbitrary thread, so the wrapper retakes the lock — safe even when it arrives synchronously
         // during registration, because the lock is recursive.
         noteReadbackStarted()
-        backend.readBuffer(target.raw, offset: offset, length: length) { [weak self] result in
+        let deliver: (Result<Data, WGPUError>) -> Void = { [weak self] result in
             guard let self else { return }
             self.executionLock.lock()
             defer { self.executionLock.unlock() }
             self.noteReadbackFinished()
+            // A mapping unmapped while pending is over: its completion may arrive after a newer mapping
+            // began, so it must leave that one's state alone, and it reports failure whatever the backend
+            // returned (the spec rejects it with an AbortError) — on every backend alike.
+            guard target.mapGeneration == generation else {
+                let error: WGPUError
+                if case .failure(let failure) = result { error = failure } else {
+                    error = .backend("mapAsync was aborted by unmap() before it completed")
+                }
+                completion(["ok": false, "errors": [error.payload]])
+                return
+            }
             switch result {
             case .failure(let error):
                 target.isMapped = false
+                target.writeMappedRange = nil
                 completion(["ok": false, "errors": [error.payload]])
             case .success(let data):
                 // Carry `Data` straight through — Lynx turns `NSData` into a JS `ArrayBuffer`.
                 // base64 would add 33% inflation plus a decoding loop on the JS side.
                 completion(["ok": true, "data": data, "byteLength": data.count])
             }
+        }
+        if forWrite {
+            backend.mapBufferForWrite(target.raw, offset: offset, length: length, deliver: deliver)
+        } else {
+            backend.readBuffer(target.raw, offset: offset, length: length, deliver: deliver)
         }
         executionLock.unlock()
     }

@@ -95,3 +95,41 @@ test('a mapping that is not a multiple of 4 can still be read whole', async () =
 
   assert.equal(buffer.getMappedRange().byteLength, 3);
 });
+
+test('offsets are buffer offsets, not offsets into a partial mapping', async () => {
+  // Native hands back just the mapped range [16, 32) of a 64-byte buffer.
+  const backing = new Uint8Array(16);
+  backing.forEach((_, index) => { backing[index] = 16 + index; });
+  installNativeMock({ readBufferResult: { ok: true, data: backing.buffer } });
+  const device = await makeDevice();
+  const buffer = device.createBuffer({ size: 64, usage: 0x0001 });
+  await buffer.mapAsync(1 /* READ */, 16, 16);
+
+  assert.throws(() => buffer.getMappedRange(0, 16), /exceeds the mapping/, 'the range before the mapping');
+  assert.throws(() => buffer.getMappedRange(24, 16), /exceeds the mapping/, 'the range past the mapping');
+  const tail = new Uint8Array(buffer.getMappedRange(24, 8));
+  assert.deepEqual(Array.from(tail), [24, 25, 26, 27, 28, 29, 30, 31]);
+  const head = new Uint8Array(buffer.getMappedRange(16, 8));
+  assert.deepEqual(Array.from(head), [16, 17, 18, 19, 20, 21, 22, 23]);
+});
+
+test('the whole partial mapping comes back as the mapping itself', async () => {
+  const backing = new ArrayBuffer(16);
+  installNativeMock({ readBufferResult: { ok: true, data: backing } });
+  const device = await makeDevice();
+  const buffer = device.createBuffer({ size: 64, usage: 0x0001 });
+  const mapped = await buffer.mapAsync(1 /* READ */, 16, 16);
+
+  assert.equal(buffer.getMappedRange(16, 16), mapped);
+});
+
+test('an omitted size runs to the end of the buffer, not of a partial mapping (spec)', async () => {
+  installNativeMock({ readBufferResult: { ok: true, data: new ArrayBuffer(16) } });
+  const device = await makeDevice();
+  const buffer = device.createBuffer({ size: 64, usage: 0x0001 });
+  await buffer.mapAsync(1 /* READ */, 16, 16);
+
+  // [16, 64) is past the mapping [16, 32) — a browser rejects it, so this does too.
+  assert.throws(() => buffer.getMappedRange(16), /exceeds the mapping/);
+  assert.throws(() => buffer.getMappedRange(), /exceeds the mapping/);
+});

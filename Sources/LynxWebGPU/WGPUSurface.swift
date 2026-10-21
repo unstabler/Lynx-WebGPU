@@ -117,12 +117,13 @@ public final class WGPUMetalLayerSurface: WGPUSurface {
         // the moment main is waiting on the Lynx runtime, so it is handed over **asynchronously**.
         // The requested format therefore applies from the next frame — `getCurrentTexture` reports the
         // actual drawable texture's format rather than the cached configuration (with bgra8unorm as the
-        // default they usually agree from the first frame anyway).
+        // default they usually agree from the first frame anyway). `framebufferOnly` lands the same way.
+        let framebufferOnly = Self.isFramebufferOnly(configuration.usage)
         let apply = { [layer] in
             layer.device = device
             layer.pixelFormat = pixelFormat
             layer.isOpaque = configuration.alphaMode == .opaque
-            layer.framebufferOnly = !configuration.usage.contains(.copySrc)
+            layer.framebufferOnly = framebufferOnly
 
             // EDR — with `extended`, values above 1.0 go out as headroom brighter than SDR white.
             // The color space must move to extended **linear** at the same time. Setting only one of
@@ -144,6 +145,18 @@ public final class WGPUMetalLayerSurface: WGPUSurface {
         } else {
             DispatchQueue.main.async(execute: apply)
         }
+    }
+
+    /// Whether drawables for this canvas usage can be framebuffer-only.
+    ///
+    /// Only a canvas that is **nothing but a render attachment** qualifies. Any other usage reaches the
+    /// drawable texture outside a render pass — a blit for `COPY_SRC`/`COPY_DST`, a shader read for
+    /// `TEXTURE_BINDING`, a shader write for `STORAGE_BINDING` — and Metal rejects all of those on a
+    /// framebuffer-only texture (a validation assertion that kills a debug process). The first drawables
+    /// after a JS-thread configure can still be framebuffer-only — `WGPUMetalBackend` refuses those uses
+    /// per op (`ensureNotFramebufferOnly`).
+    static func isFramebufferOnly(_ usage: WGPUTextureUsage) -> Bool {
+        usage.isSubset(of: .renderAttachment)
     }
 
     public func nextDrawable() -> WGPUDrawable? {
@@ -171,6 +184,7 @@ public final class WGPUOffscreenSurface: WGPUSurface {
     public private(set) var texture: MTLTexture?
     public private(set) var size: CGSize
     private var format: WGPUTextureFormat = .rgba8unorm
+    private var usage: WGPUTextureUsage = .renderAttachment
     private let device: MTLDevice
 
     public init(identifier: String = "offscreen", size: CGSize, device: MTLDevice) {
@@ -184,6 +198,7 @@ public final class WGPUOffscreenSurface: WGPUSurface {
 
     public func configure(_ configuration: WGPUCanvasConfiguration, device: MTLDevice) throws {
         format = configuration.format
+        usage = configuration.usage
         try remakeTexture()
     }
 
@@ -204,7 +219,9 @@ public final class WGPUOffscreenSurface: WGPUSurface {
             height: Int(size.height),
             mipmapped: false
         )
-        descriptor.usage = [.renderTarget, .shaderRead]
+        // The canvas usage decides the rest (`STORAGE_BINDING` needs `.shaderWrite`). Render target
+        // and shader read stay regardless — the harness always draws into and reads back this texture.
+        descriptor.usage = WGPUMetalMapping.textureUsage(usage).union([.renderTarget, .shaderRead])
         descriptor.storageMode = .private
         guard let texture = device.makeTexture(descriptor: descriptor) else {
             throw WGPUError.outOfMemory("offscreen surface texture creation failed")

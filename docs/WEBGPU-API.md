@@ -71,6 +71,15 @@ context.unconfigure()        // 다시 configure하기 전까지 그릴 수 없�
 
 - `configure`는 `CAMetalLayer` 설정을 메인 스레드에 **비동기**로 반영한다. `getPreferredCanvasFormat()`
   (= `bgra8unorm`)을 쓰면 엘리먼트 기본값과 같아 첫 프레임부터 일치한다.
+- `usage` 기본값은 `RENDER_ATTACHMENT`다. 그 밖의 플래그(`COPY_SRC` · `COPY_DST` ·
+  `TEXTURE_BINDING` · `STORAGE_BINDING`)가 **하나라도** 있으면 드로어블을 framebuffer-only로
+  만들지 않는다 — 렌더 패스 밖 접근(블릿·셰이더 읽기/쓰기)을 Metal이 막기 때문이다.
+  framebuffer-only 쪽이 빠르므로 필요한 플래그만 켤 것. 이 설정도 포맷처럼 **비동기**로 반영되므로,
+  `configure`로 플래그를 켠 직후 프레임의 드로어블은 아직 framebuffer-only일 수 있다. 그 프레임에도
+  렌더 패스는 정상이고, framebuffer-only로는 안 되는 사용(복사·`writeTexture`·바인드 그룹에 묶기)만
+  Metal 단언으로 죽는 대신 **그 op 하나가 검증 오류**가 된다 — 프레임은 그대로 present되고, 설정이
+  반영된 뒤 프레임부터 정상이다. Dawn 백엔드는 같은 `usage`를 표면 설정에 넘기되, 표면이 지원하지
+  않는 비트는 검증 오류로 알리고 뺀다.
 - `getSize()`는 **제출 응답의 `canvases`로 갱신되는 캐시**를 읽는다. 동기 네이티브 조회는
   캐시가 빌 때(= `configure` 직후) 한 번뿐이므로 프레임 안에서 불러도 왕복이 없다.
 - `unconfigure()`는 포맷을 바꿔 재구성하는 코드(HDR 토글 등)가 밟는 자리다. 이후
@@ -123,7 +132,26 @@ device.queue.writeBuffer(buffer, 0, float32Array)      // writeBuffer
 const bytes = await staging.mapAsync(GPUMapMode.READ)  // readBuffer (콜백형 네이티브 호출)
 const part  = staging.getMappedRange(8, 16)            // 부분만 (offset 8의 배수, size 4의 배수)
 staging.unmap()
+
+// (4) 매핑해서 쓰기 — MAP_WRITE 버퍼. 쓴 내용은 unmap()에서 네이티브로 간다
+const upload = device.createBuffer({ size: 64, usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC })
+await upload.mapAsync(GPUMapMode.WRITE, 16, 32)         // 버퍼의 현재 내용으로 시작한다 (명세)
+new Float32Array(upload.getMappedRange(16, 32)).set(values)  // offset은 **버퍼** 오프셋
+upload.unmap()                                        // unmapBuffer {offset: 16, data}
+encoder.copyBufferToBuffer(upload, 16, target, 0, 32)
 ```
+
+**`mapAsync`의 `mode`** — `READ`·`WRITE` 중 정확히 하나. 생략하면 `READ`다 (이 구현의 줄임).
+`WRITE`는 `MAP_WRITE` usage가 있어야 하고 offset 8의 배수·size 4의 배수·버퍼 범위 안이어야 한다.
+`MAP_WRITE` 버퍼를 `READ`로 열 수는 없다 (명세는 `MAP_READ`를 요구하는데 `MAP_READ | MAP_WRITE`는
+금지다). 어긋나면 네이티브를 부르지 않고 `OperationError`로 reject한다. `READ`는 `MAP_READ`를
+**요구하지 않는다** — `STORAGE|COPY_SRC` 결과 버퍼를 바로 읽는 이 구현의 기존 리드백 경로를 깨지
+않으려는 것이다 (브라우저로 옮길 코드는 아래의 2단 스테이징을 쓸 것).
+
+**`getMappedRange`의 offset은 버퍼 오프셋이다** (매핑 시작 기준이 아니다 — 명세). `mapAsync(m, 16, 16)`
+뒤에는 `getMappedRange(16, 16)`이 맞고 `getMappedRange(0, 16)`은 매핑 밖이라 `OperationError`다.
+`size`를 생략하면 **버퍼 끝까지**이므로, 끝에 닿지 않는 부분 매핑에서는 `size`를 줘야 한다.
+`mapAsync`가 resolve하는 `ArrayBuffer`는 매핑 구간 전체다 (이 구현의 확장).
 
 `usage` 플래그: `MAP_READ` `MAP_WRITE` `COPY_SRC` `COPY_DST` `INDEX` `VERTEX` `UNIFORM` `STORAGE`
 `INDIRECT` `QUERY_RESOLVE`.
@@ -154,6 +182,13 @@ texture.dimension · format · usage · textureBindingViewDimension
 > 정렬 요구는 **명시한 값에만** 적용한다 — 매핑 크기가 곧 네이티브 버퍼 크기라 3바이트짜리도
 > 정상인데, 생략한 `size`까지 4의 배수를 요구하면 그런 버퍼를 아예 못 읽는다.
 
+> **쓰기 매핑은 `unmap()`에서 바이트를 싣고 간다.** 매핑이 JS 사본이라 그렇다 — `unmap()`이
+> `unmapBuffer`에 매핑 구간 전체(`offset` + `data`)를 실어 보내고, 엔진이 매핑이 아직 걸린 채로
+> 백엔드의 `writeMappedBuffer`로 쓴 다음 매핑을 푼다. `writeBuffer`를 거치지 않는 이유는
+> `MAP_WRITE` 버퍼에 `COPY_DST`가 없어서다 (명세상 둘은 같이 못 붙는다 — Dawn은 그런 큐 쓰기를
+> 거부한다). Metal은 큐 순서를 타는 스테이징 blit으로, Dawn은 진짜 `MapAsync(Write)`로 매핑해
+> 두고 매핑 구간에 memcpy한 뒤 `Unmap`한다.
+
 > **매핑 중인 버퍼는 큐 작업에 쓸 수 없다.** `mapAsync`는 명세대로 버퍼를 "unavailable"로
 > 만들고, `unmap()`을 부를 때까지 쓰기·복사·resolve·드로우 바인딩을 전부 거부한다.
 > 이 구현은 스테이징 없이 `.storageModeShared` 버퍼를 직접 읽으므로, 이 상태가 없으면
@@ -163,6 +198,14 @@ texture.dimension · format · usage · textureBindingViewDimension
 > `writeBuffer`는 스테이징 버퍼 + blit으로 큐에 **순서를 태워** 올라간다. 직접 memcpy 하면
 > 직전 프레임 GPU 작업과 경쟁하기 때문이다. 스테이징 버퍼는 네이티브가 풀로 재사용하므로
 > (프레임 완료 시 회수, 총량 상한) 매 프레임 불러도 할당이 쌓이지 않는다.
+>
+> 큐 작업이라 **패스 인코더가 열려 있어도 부를 수 있다** — `queue.writeBuffer(u); pass.setBindGroup(…);
+> pass.draw()`를 객체마다 반복하는 루프가 그대로 된다. 효과는 **호출 시점에 큐 타임라인에 들어가**
+> 그 뒤에 제출되는 커맨드 버퍼 전체보다 앞선다 — 쓰기 **전에** 기록했더라도 쓰기 **뒤에** 제출한
+> 드로우는 새 값을 본다 (브라우저·Dawn과 같다). 그래서 한 프레임에 같은 유니폼을 여러 번 덮어쓰면
+> 모든 드로우가 **마지막 값**을 본다 — 객체마다 다른 값이 필요하면 오프셋을 나누거나
+> 동적 오프셋을 쓴다. Metal 백엔드는 배치의 큐 쓰기를 별도 커맨드 버퍼에 모아 그 배치의 인코더
+> 작업보다 먼저 커밋한다 (`docs/COMMAND-STREAM.md` §3-5).
 
 ### 텍스처 · 샘플러
 
@@ -177,8 +220,9 @@ const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' 
 ```
 
 > `writeTexture`도 `writeBuffer`처럼 스테이징 + blit으로 큐에 **순서를 태워** 올라간다 —
-> 호출마다 GPU 완주를 기다리지 않으므로 동적 텍스처를 매 프레임 갱신할 수 있고, 같은 배치에서
-> 앞선 렌더 패스가 그린 내용과의 순서도 스트림 그대로 보존된다. 배열 텍스처는
+> 호출마다 GPU 완주를 기다리지 않으므로 동적 텍스처를 매 프레임 갱신할 수 있고, 앞서 제출한
+> 렌더 패스가 그린 내용 **뒤에**, 다음 `submit`의 명령 **앞에** 적용된다 (`writeBuffer`와 같은
+> 큐 타임라인 순서 — 패스가 열려 있어도 받는다). 배열 텍스처는
 > `depthOrArrayLayers`만큼 슬라이스별로 복사된다.
 
 지원 포맷: 8/16/32비트 컬러 전 계열(`r8unorm` … `rgba32float`), `bgra8unorm(-srgb)`,
@@ -266,6 +310,11 @@ bitmap.close()   // 네이티브 픽셀을 놓아 준다
   디코딩 결과가 RGBA8이므로, 그 밖은 조용히 어긋나느니 검증 오류로 거부한다.
   압축 텍스처도 같은 이유로 안 된다 — GPU에는 블록 인코더가 없다.
 - `copySize`를 생략하면 `origin`부터 이미지 끝까지다.
+- 범위는 명세대로 검사한다 — 음수 `origin`·`copySize`, 이미지를 벗어나는 영역,
+  `depthOrArrayLayers > 1`은 검증 오류다. **원본 쪽 검사는 백엔드와 무관하게 늘 돈다**
+  (잘라내기가 엔진 메모리에서 `memcpy`로 일어나므로 네이티브 검증기가 볼 수 없다).
+  대상 쪽(`mipLevel` 범위, 음수 `origin`, 해당 밉 레벨을 벗어나는 영역, 멀티샘플 텍스처)은
+  자체 검증 백엔드(Metal)에서 엔진이, Dawn에서는 네이티브 검증이 거부한다.
 
 > `rgb9e5ufloat`는 채널마다 가수 9비트 + 공통 지수 5비트를 쓰는 공유 지수 HDR 포맷이다 —
 > `rgba16float`의 **절반 크기로 같은 동적 범위**를 담으므로 읽기 전용 HDR 소스(환경맵 등)에 맞다.
@@ -324,7 +373,24 @@ const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] 
 ```
 
 `hasDynamicOffset: true`인 바인딩은 `pass.setBindGroup(0, group, [offset])`로 오프셋을 준다.
-오프셋은 **바인딩 번호 오름차순**으로 소비된다.
+오프셋은 **바인딩 번호 오름차순**으로 소비된다. `setBindGroup`이 그 자리에서 검사한다 — 개수가
+동적 항목 수와 같은지, 각 오프셋이 `minUniformBufferOffsetAlignment`/`minStorageBufferOffsetAlignment`
+(256)의 배수인지, `offset + 동적 오프셋 + size`가 버퍼 안인지. **동적 바인딩에는 `size`를 줄 것** —
+생략하면 버퍼 끝까지라 오프셋 0만 들어간다 (Dawn과 같은 규칙).
+
+**`minBindingSize`는 명세대로 세 군데서 잰다** — 셰이더 변수의 *최소 바인딩 크기*(저장 타입의 WGSL
+`SizeOf`, 런타임 크기 배열은 원소 하나로 친다)보다 작은 범위가 셰이더에 닿지 않게 하는 장치다:
+
+| 시점 | 검사 |
+|---|---|
+| `createBindGroup` | 바인딩된 범위(`size`, 없으면 버퍼 끝까지)가 레이아웃 항목의 `minBindingSize` 이상 |
+| `createRenderPipeline` / `createComputePipeline` (명시적 레이아웃) | 0이 아닌 `minBindingSize`가 셰이더의 최소 크기 이상 |
+| draw / dispatch | `minBindingSize: 0` 항목은 그 파이프라인 셰이더의 최소 크기 이상 (`size`가 없으면 동적 오프셋을 뺀 뒤) |
+
+`layout: 'auto'`는 각 버퍼 항목의 `minBindingSize`를 **셰이더의 최소 크기로 채운다** (명세의 기본
+파이프라인 레이아웃 — 스테이지가 다르게 선언하면 큰 쪽). 그래서 자동 레이아웃에서는 작은 버퍼가
+`createBindGroup`에서 바로 걸린다. 예: `struct { m: mat4x4f }` 유니폼에 32바이트 버퍼 → 오류.
+(Dawn 백엔드는 이 검사를 네이티브 검증기에 맡긴다.)
 
 ## 5. 파이프라인
 
@@ -369,7 +435,9 @@ const compute = device.createComputePipeline({                // createComputePi
 - `vertex` / `fragment` / `compute` 각각 `constants: { name: value }` 로 셰이더의 `override` 값을 준다
   (`docs/WGSL.md` §2-2). 같은 셰이더라도 상수가 다르면 별도로 컴파일·캐시된다.
 - 정점 버퍼 슬롯은 **최대 8개**, `arrayStride: 0`은 미지원.
-- 컴퓨트 워크그룹 크기는 WGSL의 `@workgroup_size`에서 리플렉션으로 가져온다 (MSL 모듈은 (1,1,1)).
+- 컴퓨트 워크그룹 크기는 WGSL의 `@workgroup_size`를 **파이프라인의 `constants`를 적용한 뒤 계산**해
+  threadsPerThreadgroup으로 쓴다 (MSL 모듈은 (1,1,1)). 어댑터가 알리는 `maxComputeWorkgroupSizeX/Y/Z` ·
+  `maxComputeInvocationsPerWorkgroup`을 넘으면 파이프라인 생성 validation 오류다 (`docs/WGSL.md` §2-2).
 
 ### 비동기 생성 — 실패를 그 자리에서 안다
 
@@ -460,12 +528,28 @@ encoder.popDebugGroup()                                      // popDebugGroup
 device.queue.submit([encoder.finish()])   // ← 여기서 한 번에 네이티브로 넘어간다
 ```
 
-- `beginRenderPass`는 멀티샘플 `resolveTarget`을 지원한다 (store op이 `multisampleResolve`로 바뀐다).
-- 복사 명령은 패스 **밖에서만** 쓸 수 있다.
+- `beginRenderPass`는 멀티샘플 `resolveTarget`을 지원한다. 명세대로 `storeOp`은 멀티샘플 뷰 자체에 걸리고
+  리졸브는 그와 별개로 일어난다 — `"store"`면 Metal `storeAndMultisampleResolve`(샘플을 남겨 다음 패스가
+  `loadOp: "load"`로 이어 그릴 수 있다), `"discard"`면 `multisampleResolve`다.
+  `storeOp`의 기본값은 `"store"`라서, TBDR GPU(Apple)에서는 **패스마다 MSAA 텍스처 전체가 메모리에
+  다시 쓰인다** — 샘플을 다시 읽지 않으면 MSAA 뷰에 `storeOp: "discard"`를 줄 것 (리졸브 결과는 그대로 남는다).
+  결합 동작은 Apple GPU 패밀리 3 이상(또는 Mac 2)에만 있어 **iOS 시뮬레이터(패밀리 2로 보고)에서는
+  에뮬레이션한다** — 패스는 `store`만 하고, 패스가 끝날 때 드로우 없는 패스가 `load` + `multisampleResolve`로
+  리졸브한다 (Dawn의 `EmulateStoreAndMSAAResolve`와 같다). 패스가 하나 더 든다. Metal은 `multisampleResolve`
+  뒤의 멀티샘플 내용을 형식상 정의하지 않지만, 드로우 없는 패스는 실제로 그것을 다시 쓰지 않아(Dawn의 같은
+  에뮬레이션도 이에 기댄다) 저장된 샘플이 남는다 — 보장이 아니라 관찰된 동작이다.
+- 인코더의 복사 명령(`copy*`·`clearBuffer`·`resolveQuerySet`)은 패스 **밖에서만** 쓸 수 있다.
+  큐 작업(`queue.writeBuffer`·`writeTexture`·`copyExternalImageToTexture`)은 패스가 열려 있어도 된다.
+- 지금 파이프라인 레이아웃 **범위 밖** 인덱스에 묶여 있는 바인드 그룹은 **무시된다** (명세 그대로).
+  그룹 0·1을 쓰는 파이프라인 뒤에 그룹 0만 쓰는 파이프라인으로 바꿔도 그 뒤 드로우가 실패하지 않고,
+  다시 그룹 1을 쓰는 파이프라인으로 돌아오면 남아 있던 그룹 1이 그대로 쓰인다 — `setBindGroup`을
+  다시 부를 필요가 없다. 디스패치와 번들 재생도 같다. 레이아웃의 그룹 수 안쪽 인덱스만 드로우 직전에
+  내려보내는 일은 엔진이 한다 — 레이아웃 **안쪽**의 빈 그룹 자리(맨 끝 자리 포함)에 맞지 않는 그룹을
+  묶으면 여전히 오류다.
 - **디버그 마커는 Xcode GPU 캡처에 구간 이름으로 뜬다** (Metal `pushDebugGroup`/`insertDebugSignpost`).
   없으면 캡처가 이름 없는 드로우 나열이라 어느 패스가 무엇인지 알 수 없다. 스코프는 두 층이다 —
-  **패스 안**에서 열면 그 패스 구간, **패스 밖**에서 열면 프레임 구간이다 (`writeBuffer`·복사가
-  속으로 여는 blit 인코더는 스코프가 아니다 — 그것까지 세면 프레임 구간이 거기서 닫히려 한다).
+  **패스 안**에서 열면 그 패스 구간, **패스 밖**에서 열면 프레임 구간이다 (복사가 속으로 여는
+  blit 인코더와 큐 쓰기용 커맨드 버퍼는 스코프가 아니다 — 그것까지 세면 프레임 구간이 거기서 닫히려 한다).
   `push`와 `pop`의 짝이 맞지 않거나 연 채로 패스가 끝나면 **Metal이 단언으로 프로세스를 죽이므로**,
   네이티브가 깊이를 세어 막고 validation 오류로 알린다 (닫아 주고 계속 간다).
 - `clearBuffer`는 `writeBuffer`로 0 배열을 미는 것과 결과가 같지만 **CPU에서 그 배열을 만들어

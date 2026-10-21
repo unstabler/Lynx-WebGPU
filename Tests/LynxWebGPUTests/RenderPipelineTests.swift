@@ -370,6 +370,138 @@ final class RenderPipelineTests: XCTestCase {
         XCTAssertEqual(try harness.pixel(x: 48, y: 32).a, 255)
     }
 
+    // MARK: - Bind groups beyond the layout
+
+    /// The spec ignores a bind group bound beyond the current pipeline layout. Switching from a
+    /// 2-group pipeline to a 1-group one in the same pass used to send @group(1) down to a layout with
+    /// no Metal index for it — the draw threw, and so did every later draw in the pass. Coming back to
+    /// the 2-group pipeline must reuse the group 1 still bound, with no new setBindGroup.
+    func test_aGroupBoundBeyondTheLayoutIsIgnoredAndComesBackForALaterPipeline() throws {
+        let vertex = """
+        @vertex
+        fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+            var positions = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+            return vec4f(positions[index], 0.0, 1.0);
+        }
+        """
+        let twoGroups = """
+        struct Tint { color: vec4f }
+        @group(0) @binding(0) var<uniform> base: Tint;
+        @group(1) @binding(0) var<uniform> extra: Tint;
+        \(vertex)
+        @fragment
+        fn fs_main() -> @location(0) vec4f { return base.color + extra.color; }
+        """
+        let oneGroup = """
+        struct Tint { color: vec4f }
+        @group(0) @binding(0) var<uniform> base: Tint;
+        \(vertex)
+        @fragment
+        fn fs_main() -> @location(0) vec4f { return base.color; }
+        """
+        let fragmentStage = 0x2
+
+        harness.executeExpectingSuccess([
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+            ["op": "createShaderModule", "id": 1, "code": twoGroups],
+            ["op": "createShaderModule", "id": 2, "code": oneGroup],
+            ["op": "createBuffer", "id": 5, "size": 16, "usage": TestUsage.uniform | TestUsage.copyDst,
+             "data": [Float]([1, 0, 0, 1]).base64],
+            ["op": "createBuffer", "id": 6, "size": 16, "usage": TestUsage.uniform | TestUsage.copyDst,
+             "data": [Float]([0, 0, 1, 0]).base64],
+            // Explicit layouts, so both pipelines accept the same bind groups (auto layouts are exclusive).
+            ["op": "createBindGroupLayout", "id": 10, "entries": [
+                ["binding": 0, "visibility": fragmentStage, "buffer": ["type": "uniform"]],
+            ]],
+            ["op": "createPipelineLayout", "id": 12, "bindGroupLayouts": [10, 10]],
+            ["op": "createPipelineLayout", "id": 13, "bindGroupLayouts": [10]],
+            ["op": "createRenderPipeline", "id": 3, "layout": 12,
+             "vertex": ["module": 1, "entryPoint": "vs_main"],
+             "fragment": ["module": 1, "entryPoint": "fs_main", "targets": [["format": "rgba8unorm"]]]],
+            ["op": "createRenderPipeline", "id": 4, "layout": 13,
+             "vertex": ["module": 2, "entryPoint": "vs_main"],
+             "fragment": ["module": 2, "entryPoint": "fs_main", "targets": [["format": "rgba8unorm"]]]],
+            ["op": "createBindGroup", "id": 20, "layout": 10,
+             "entries": [["binding": 0, "resource": ["buffer": 5]]]],
+            ["op": "createBindGroup", "id": 21, "layout": 10,
+             "entries": [["binding": 0, "resource": ["buffer": 6]]]],
+            ["op": "getCurrentTexture", "id": 30, "canvas": "test"],
+            ["op": "createTextureView", "id": 31, "texture": 30],
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 31, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 0, "g": 0, "b": 0, "a": 1],
+            ]]],
+            // Left third: both groups (red + blue).
+            ["op": "setPipeline", "pipeline": 3],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 20],
+            ["op": "setBindGroup", "index": 1, "bindGroup": 21],
+            ["op": "setScissorRect", "x": 0, "y": 0, "width": 21, "height": 64],
+            ["op": "draw", "vertexCount": 3],
+            // Middle third: the 1-group pipeline — group 1 stays bound but lies beyond its layout.
+            ["op": "setPipeline", "pipeline": 4],
+            ["op": "setScissorRect", "x": 21, "y": 0, "width": 21, "height": 64],
+            ["op": "draw", "vertexCount": 3],
+            // Right third: back to the 2-group pipeline with no new setBindGroup.
+            ["op": "setPipeline", "pipeline": 3],
+            ["op": "setScissorRect", "x": 42, "y": 0, "width": 22, "height": 64],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+        ])
+
+        try harness.assertPixel(x: 10, y: 32, equals: (255, 0, 255, 255), "two groups")
+        try harness.assertPixel(x: 32, y: 32, equals: (255, 0, 0, 255), "one group (group 1 ignored)")
+        try harness.assertPixel(x: 53, y: 32, equals: (255, 0, 255, 255), "group 1 back for the 2-group pipeline")
+    }
+
+    /// The other side of the line: a layout that **ends** in an empty group still owns that index, so a
+    /// non-empty group bound there is incompatible (spec, Dawn) — not "beyond the layout" and ignored.
+    func test_aNonEmptyGroupAtATrailingEmptyLayoutSlotIsStillRejected() {
+        let shader = """
+        struct Tint { color: vec4f }
+        @group(0) @binding(0) var<uniform> base: Tint;
+
+        @vertex
+        fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+            var positions = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+            return vec4f(positions[index], 0.0, 1.0);
+        }
+
+        @fragment
+        fn fs_main() -> @location(0) vec4f { return base.color; }
+        """
+        let fragmentStage = 0x2
+        let result = harness.execute([
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+            ["op": "createShaderModule", "id": 1, "code": shader],
+            ["op": "createBuffer", "id": 5, "size": 16, "usage": TestUsage.uniform | TestUsage.copyDst,
+             "data": [Float]([1, 0, 0, 1]).base64],
+            ["op": "createBindGroupLayout", "id": 10, "entries": [
+                ["binding": 0, "visibility": fragmentStage, "buffer": ["type": "uniform"]],
+            ]],
+            ["op": "createBindGroupLayout", "id": 11, "entries": [[String: Any]]()],
+            ["op": "createPipelineLayout", "id": 12, "bindGroupLayouts": [10, 11]],
+            ["op": "createRenderPipeline", "id": 3, "layout": 12,
+             "vertex": ["module": 1, "entryPoint": "vs_main"],
+             "fragment": ["module": 1, "entryPoint": "fs_main", "targets": [["format": "rgba8unorm"]]]],
+            ["op": "createBindGroup", "id": 20, "layout": 10,
+             "entries": [["binding": 0, "resource": ["buffer": 5]]]],
+            ["op": "getCurrentTexture", "id": 30, "canvas": "test"],
+            ["op": "createTextureView", "id": 31, "texture": 30],
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 31, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 0, "g": 0, "b": 0, "a": 1],
+            ]]],
+            ["op": "setPipeline", "pipeline": 3],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 20],
+            ["op": "setBindGroup", "index": 1, "bindGroup": 20],   // non-empty group at the empty slot 1
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+        ])
+
+        XCTAssertEqual(result["ok"] as? Bool, false)
+        XCTAssertTrue(harness.describeErrors(result).contains("@group(1)"), harness.describeErrors(result))
+    }
+
     // MARK: - Compute
 
     func test_aComputeShaderComputesIntoAStorageBuffer() throws {
@@ -406,6 +538,100 @@ final class RenderPipelineTests: XCTestCase {
 
         let output = try harness.readBufferSync(handle: 3, as: Float.self, size: 32)
         XCTAssertEqual(output, [2, 4, 6, 8, 10, 12, 14, 16])
+    }
+
+    func test_anOverrideWorkgroupSizeDispatchesThatManyThreads() throws {
+        // `@workgroup_size(blockSize)` used to be read as 1 — one workgroup filled one slot, not eight.
+        let shader = """
+        override blockSize: u32 = 1u;
+        @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+
+        @compute @workgroup_size(blockSize)
+        fn fill(@builtin(global_invocation_id) id: vec3u) {
+            out[id.x] = id.x + 1u;
+        }
+        """
+        harness.executeExpectingSuccess([
+            ["op": "createShaderModule", "id": 1, "code": shader],
+            ["op": "createBuffer", "id": 2, "size": 32, "usage": TestUsage.storage | TestUsage.copySrc],
+            ["op": "createComputePipeline", "id": 3, "layout": "auto",
+             "compute": ["module": 1, "entryPoint": "fill", "constants": ["blockSize": 8]]],
+            ["op": "getBindGroupLayout", "id": 4, "pipeline": 3, "index": 0],
+            ["op": "createBindGroup", "id": 5, "layout": 4, "entries": [
+                ["binding": 0, "resource": ["buffer": 2]],
+            ]],
+            ["op": "beginComputePass"],
+            ["op": "setPipeline", "pipeline": 3],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 5],
+            ["op": "dispatchWorkgroups", "x": 1],
+            ["op": "endPass"],
+        ])
+        let output = try harness.readBufferSync(handle: 2, as: UInt32.self, size: 32)
+        XCTAssertEqual(output, [1, 2, 3, 4, 5, 6, 7, 8])
+
+        // Past the device limit it is a pipeline-creation validation error — never a Metal assertion.
+        let rejected = harness.execute([
+            ["op": "createComputePipeline", "id": 6, "layout": "auto",
+             "compute": ["module": 1, "entryPoint": "fill", "constants": ["blockSize": 65536]]],
+        ])
+        XCTAssertEqual(rejected["ok"] as? Bool, false)
+        XCTAssertTrue(
+            harness.describeErrors(rejected).contains("exceeds maxComputeWorkgroupSizeX"),
+            harness.describeErrors(rejected)
+        )
+    }
+
+    func test_aZeroWorkgroupDispatchRunsNothing() throws {
+        // `dispatchWorkgroups(Math.ceil(n / 64))` with n = 0 is valid and a no-op by the spec. It used to
+        // be raised to 1 (running the shader once); handed to Metal as is, the empty grid asserts.
+        let shader = """
+        @group(0) @binding(0) var<storage, read_write> values: array<f32>;
+
+        @compute @workgroup_size(4)
+        fn mark(@builtin(global_invocation_id) id: vec3u) {
+            values[id.x] = 7.0;
+        }
+        """
+        let initial: [Float] = [1, 2, 3, 4, 5, 6, 7, 8]
+        func dispatch(_ x: Int, _ y: Int = 1, _ z: Int = 1) -> [[String: Any]] {
+            [
+                ["op": "beginComputePass"],
+                ["op": "setPipeline", "pipeline": 3],
+                ["op": "setBindGroup", "index": 0, "bindGroup": 5],
+                ["op": "dispatchWorkgroups", "x": x, "y": y, "z": z],
+                ["op": "endPass"],
+            ]
+        }
+
+        harness.executeExpectingSuccess([
+            ["op": "createShaderModule", "id": 1, "code": shader],
+            ["op": "createBuffer", "id": 2, "usage": TestUsage.storage | TestUsage.copySrc,
+             "data": initial.base64],
+            ["op": "createComputePipeline", "id": 3, "layout": "auto",
+             "compute": ["module": 1, "entryPoint": "mark"]],
+            ["op": "getBindGroupLayout", "id": 4, "pipeline": 3, "index": 0],
+            ["op": "createBindGroup", "id": 5, "layout": 4,
+             "entries": [["binding": 0, "resource": ["buffer": 2]]]],
+        ] + dispatch(0) + dispatch(2, 0) + dispatch(2, 1, 0))
+        XCTAssertEqual(try harness.readBufferSync(handle: 2, as: Float.self, size: 32), initial)
+
+        // `readBuffer` is mapAsync: the buffer stays mapped (and barred from queue work) until unmap.
+        harness.executeExpectingSuccess([["op": "unmapBuffer", "buffer": 2]])
+
+        // Past the advertised `maxComputeWorkgroupsPerDimension` is a validation error, not a launch.
+        let tooLarge = harness.execute(dispatch(65536))
+        XCTAssertEqual(tooLarge["ok"] as? Bool, false)
+        XCTAssertTrue(
+            harness.describeErrors(tooLarge).contains("maxComputeWorkgroupsPerDimension"),
+            harness.describeErrors(tooLarge)
+        )
+        XCTAssertEqual(try harness.readBufferSync(handle: 2, as: Float.self, size: 32), initial)
+
+        // The control: one workgroup marks exactly its four invocations.
+        harness.executeExpectingSuccess([["op": "unmapBuffer", "buffer": 2]] + dispatch(1))
+        XCTAssertEqual(
+            try harness.readBufferSync(handle: 2, as: Float.self, size: 32), [7, 7, 7, 7, 5, 6, 7, 8]
+        )
     }
 
     func test_arrayLengthReturnsTheBoundSize() throws {
@@ -457,6 +683,92 @@ final class RenderPipelineTests: XCTestCase {
 
         let lengths = try harness.readBufferSync(handle: 5, as: UInt32.self, size: 16)
         XCTAssertEqual(Array(lengths.prefix(3)), [10, 3, 2])
+    }
+
+    /// A compute pass that follows a render pass **in the same batch** binds with its own pipeline's layout.
+    ///
+    /// The backend used to pick the layout as "the render pipeline if one is set, else the compute
+    /// one", and the render pipeline survived its pass until the next batch. So the compute pass's
+    /// groups were mapped through the render layout — here that layout has no @group(0) @binding(1),
+    /// so the dispatch was dropped with a bogus validation error (with matching binding numbers it
+    /// would instead have bound the wrong Metal indices silently).
+    func test_aComputePassAfterARenderPassInOneBatchUsesTheComputeLayout() throws {
+        let renderShader = """
+        struct Tint { color: vec4f };
+        @group(0) @binding(0) var<uniform> tint: Tint;
+
+        @vertex
+        fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+            var positions = array<vec2f, 3>(
+                vec2f(-1.0, -1.0),
+                vec2f( 3.0, -1.0),
+                vec2f(-1.0,  3.0),
+            );
+            return vec4f(positions[index], 0.0, 1.0);
+        }
+
+        @fragment
+        fn fs_main() -> @location(0) vec4f {
+            return tint.color;
+        }
+        """
+        let computeShader = """
+        @group(0) @binding(0) var<storage, read> input: array<f32>;
+        @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+        @compute @workgroup_size(4)
+        fn double_values(@builtin(global_invocation_id) id: vec3u) {
+            output[id.x] = input[id.x] * 2.0;
+        }
+        """
+        let tint: [Float] = [0.0, 1.0, 0.0, 1.0]   // green
+        let input: [Float] = [1, 2, 3, 4, 5, 6, 7, 8]
+
+        harness.executeExpectingSuccess([
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+            ["op": "createShaderModule", "id": 1, "code": renderShader],
+            ["op": "createShaderModule", "id": 2, "code": computeShader],
+            ["op": "createBuffer", "id": 3, "size": 16,
+             "usage": TestUsage.uniform | TestUsage.copyDst, "data": tint.base64],
+            ["op": "createBuffer", "id": 4, "usage": TestUsage.storage | TestUsage.copyDst,
+             "data": input.base64],
+            ["op": "createBuffer", "id": 5, "size": 32,
+             "usage": TestUsage.storage | TestUsage.copySrc],
+            ["op": "createRenderPipeline", "id": 6, "layout": "auto",
+             "vertex": ["module": 1, "entryPoint": "vs_main"],
+             "fragment": ["module": 1, "entryPoint": "fs_main", "targets": [["format": "rgba8unorm"]]]],
+            ["op": "getBindGroupLayout", "id": 7, "pipeline": 6, "index": 0],
+            ["op": "createBindGroup", "id": 8, "layout": 7,
+             "entries": [["binding": 0, "resource": ["buffer": 3]]]],
+            ["op": "createComputePipeline", "id": 9, "layout": "auto",
+             "compute": ["module": 2, "entryPoint": "double_values"]],
+            ["op": "getBindGroupLayout", "id": 10, "pipeline": 9, "index": 0],
+            ["op": "createBindGroup", "id": 11, "layout": 10, "entries": [
+                ["binding": 0, "resource": ["buffer": 4]],
+                ["binding": 1, "resource": ["buffer": 5]],
+            ]],
+            ["op": "getCurrentTexture", "id": 20, "canvas": "test"],
+            ["op": "createTextureView", "id": 21, "texture": 20],
+            // Render first — leaves a render pipeline behind in the backend.
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 21, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 0.0, "g": 0.0, "b": 0.0, "a": 1.0],
+            ]]],
+            ["op": "setPipeline", "pipeline": 6],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 8],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+            // Then compute, in the same batch.
+            ["op": "beginComputePass"],
+            ["op": "setPipeline", "pipeline": 9],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 11],
+            ["op": "dispatchWorkgroups", "x": 2],
+            ["op": "endPass"],
+        ])
+
+        try harness.assertPixel(x: 32, y: 32, equals: (0, 255, 0, 255), "the render pass still draws")
+        let output = try harness.readBufferSync(handle: 5, as: Float.self, size: 32)
+        XCTAssertEqual(output, [2, 4, 6, 8, 10, 12, 14, 16])
     }
 
     // MARK: - Textures
@@ -652,6 +964,197 @@ final class RenderPipelineTests: XCTestCase {
         ])
 
         try harness.assertPixel(x: 32, y: 32, equals: (255, 0, 0, 255), "the front one (red) must remain")
+    }
+
+    // MARK: - Depth bias
+
+    /// Two full-screen triangles at the same depth (0.5): red and green.
+    private static let depthBiasShader = """
+    @vertex
+    fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+        var positions = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+        return vec4f(positions[index], 0.5, 1.0);
+    }
+    @fragment
+    fn fs_red() -> @location(0) vec4f {
+        return vec4f(1.0, 0.0, 0.0, 1.0);
+    }
+    @fragment
+    fn fs_green() -> @location(0) vec4f {
+        return vec4f(0.0, 1.0, 0.0, 1.0);
+    }
+    """
+
+    /// Pipeline 4 (red) pushes its fragments back with a large `depthBias`; pipeline 5 (green) has none.
+    /// The depth buffer is cleared to 0.6 with compare `less`, so at depth 0.5:
+    /// - red only passes **without** its bias (0.5 + bias ≥ 0.6 is rejected);
+    /// - green only passes **without** a bias (it must not inherit red's).
+    /// Drawing red then green therefore leaves green. Black = green inherited the bias, red = the bias never applied.
+    private func depthBiasResources() -> [[String: Any]] {
+        // Constant bias on a float depth format is scaled by 2^(e - 23) — 2^-24 at depth 0.5 — so this
+        // moves red by ~0.6, far past the 0.1 margin. An implementation that clamps to 1.0 rejects it too.
+        let depthBias = 10_000_000
+        return [
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+            ["op": "createShaderModule", "id": 1, "code": Self.depthBiasShader],
+            ["op": "createTexture", "id": 2, "size": ["width": 64, "height": 64],
+             "format": "depth32float", "usage": TestUsage.renderAttachment],
+            ["op": "createTextureView", "id": 3, "texture": 2],
+            ["op": "createRenderPipeline", "id": 4, "layout": "auto",
+             "vertex": ["module": 1, "entryPoint": "vs_main"],
+             "fragment": ["module": 1, "entryPoint": "fs_red", "targets": [["format": "rgba8unorm"]]],
+             "depthStencil": ["format": "depth32float", "depthWriteEnabled": true, "depthCompare": "less",
+                              "depthBias": depthBias]],
+            ["op": "createRenderPipeline", "id": 5, "layout": "auto",
+             "vertex": ["module": 1, "entryPoint": "vs_main"],
+             "fragment": ["module": 1, "entryPoint": "fs_green", "targets": [["format": "rgba8unorm"]]],
+             "depthStencil": ["format": "depth32float", "depthWriteEnabled": true, "depthCompare": "less"]],
+            ["op": "getCurrentTexture", "id": 10, "canvas": "test"],
+            ["op": "createTextureView", "id": 11, "texture": 10],
+        ]
+    }
+
+    private let depthBiasPass: [String: Any] = [
+        "op": "beginRenderPass",
+        "colorAttachments": [[
+            "view": 11, "loadOp": "clear", "storeOp": "store",
+            "clearValue": ["r": 0, "g": 0, "b": 0, "a": 1],
+        ]],
+        "depthStencilAttachment": [
+            "view": 3, "depthClearValue": 0.6, "depthLoadOp": "clear", "depthStoreOp": "store",
+        ],
+    ]
+
+    func test_aPipelineWithoutDepthBiasDoesNotInheritThePreviousPipelinesBias() throws {
+        // Metal's depth bias is encoder state that outlives `setRenderPipelineState` — in WebGPU it
+        // belongs to the pipeline, so the second pipeline in the same pass must draw unbiased.
+        harness.executeExpectingSuccess(depthBiasResources() + [
+            depthBiasPass,
+            ["op": "setPipeline", "pipeline": 4],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "setPipeline", "pipeline": 5],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+        ])
+
+        try harness.assertPixel(
+            x: 32, y: 32, equals: (0, 255, 0, 255),
+            "green must draw unbiased (black = it inherited red's depthBias, red = the bias never applied)"
+        )
+    }
+
+    func test_aBundlePipelineWithoutDepthBiasDoesNotInheritThePassPipelinesBias() throws {
+        // The same carry-over across a bundle boundary — the replayed `setPipeline` goes down the same path.
+        harness.executeExpectingSuccess(depthBiasResources() + [
+            ["op": "createRenderBundle", "id": 12, "colorFormats": ["rgba8unorm"],
+             "depthStencilFormat": "depth32float",
+             "commands": [
+                ["op": "setPipeline", "pipeline": 5],
+                ["op": "draw", "vertexCount": 3],
+             ]],
+            depthBiasPass,
+            ["op": "setPipeline", "pipeline": 4],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "executeBundles", "bundles": [12]],
+            ["op": "endPass"],
+        ])
+
+        try harness.assertPixel(
+            x: 32, y: 32, equals: (0, 255, 0, 255),
+            "the bundle's green must draw unbiased (black = it inherited the pass pipeline's depthBias)"
+        )
+    }
+
+    // MARK: - Multisample resolve
+
+    /// `storeOp: "store"` on a resolving attachment keeps the **multisample samples** too — the spec
+    /// applies storeOp to the view and resolves on top. Mapping every resolve to Metal's
+    /// `.multisampleResolve` discarded them, so a second pass that loads the MSAA texture (the usual
+    /// "draw in several passes, resolve each time" pattern) read undefined samples.
+    ///
+    /// Pass 1 clears the MSAA texture blue, draws red over the left half, stores + resolves. Pass 2
+    /// loads it, draws green into the bottom-right quadrant only and resolves again. The canvas holds
+    /// pass 2's resolve, so pass 1's red and blue surviving there proves the samples were kept.
+    ///
+    /// It discriminates on Apple Silicon (tile memory is only written back on store) — on IMR Mac GPUs
+    /// (Intel/AMD) the old `.multisampleResolve` may keep the samples anyway.
+    func test_aStoringResolvePassKeepsTheMultisampleContentsForALaterLoad() throws {
+        try assertStoringResolveKeepsTheMultisampleContents()
+    }
+
+    /// The same contract through the emulation used where `.storeAndMultisampleResolve` is missing
+    /// (the iOS simulator): store in the pass, resolve in a draw-less pass at its end.
+    func test_theEmulatedStoreAndResolveKeepsTheMultisampleContentsForALaterLoad() throws {
+        let context = try XCTUnwrap(harness.context, "the emulation switch is a Metal backend hook")
+        context.supportsStoreAndMultisampleResolve = false
+        try assertStoringResolveKeepsTheMultisampleContents()
+    }
+
+    private func assertStoringResolveKeepsTheMultisampleContents(
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let shader = """
+        @vertex
+        fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+            var positions = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+            return vec4f(positions[index], 0.0, 1.0);
+        }
+        @fragment
+        fn fs_red() -> @location(0) vec4f {
+            return vec4f(1.0, 0.0, 0.0, 1.0);
+        }
+        @fragment
+        fn fs_green() -> @location(0) vec4f {
+            return vec4f(0.0, 1.0, 0.0, 1.0);
+        }
+        """
+        func pipeline(id: Int, entryPoint: String) -> [String: Any] {
+            [
+                "op": "createRenderPipeline", "id": id, "layout": "auto",
+                "vertex": ["module": 1, "entryPoint": "vs_main"],
+                "fragment": ["module": 1, "entryPoint": entryPoint, "targets": [["format": "rgba8unorm"]]],
+                "multisample": ["count": 4],
+            ]
+        }
+
+        harness.executeExpectingSuccess([
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+            ["op": "createShaderModule", "id": 1, "code": shader],
+            ["op": "createTexture", "id": 2, "size": ["width": 64, "height": 64],
+             "format": "rgba8unorm", "sampleCount": 4, "usage": TestUsage.renderAttachment],
+            ["op": "createTextureView", "id": 3, "texture": 2],
+            pipeline(id: 4, entryPoint: "fs_red"),
+            pipeline(id: 5, entryPoint: "fs_green"),
+            ["op": "getCurrentTexture", "id": 10, "canvas": "test"],
+            ["op": "createTextureView", "id": 11, "texture": 10],
+
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 3, "resolveTarget": 11, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 0, "g": 0, "b": 1, "a": 1],
+            ]]],
+            ["op": "setPipeline", "pipeline": 4],
+            ["op": "setScissorRect", "x": 0, "y": 0, "width": 32, "height": 64],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 3, "resolveTarget": 11, "loadOp": "load", "storeOp": "discard",
+            ]]],
+            ["op": "setPipeline", "pipeline": 5],
+            ["op": "setScissorRect", "x": 32, "y": 32, "width": 32, "height": 32],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+        ], file: file, line: line)
+
+        try harness.assertPixel(x: 16, y: 16, equals: (255, 0, 0, 255), "pass 1's red must survive the load",
+                                file: file, line: line)
+        try harness.assertPixel(x: 16, y: 48, equals: (255, 0, 0, 255), "pass 1's red must survive the load",
+                                file: file, line: line)
+        try harness.assertPixel(x: 48, y: 16, equals: (0, 0, 255, 255), "pass 1's clear must survive the load",
+                                file: file, line: line)
+        try harness.assertPixel(x: 48, y: 48, equals: (0, 255, 0, 255), "pass 2's own draw",
+                                file: file, line: line)
     }
 
     // MARK: - HDR readback

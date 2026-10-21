@@ -17,6 +17,14 @@ public final class WGPUEngineBuffer<B: WGPUBackend> {
     /// Whether it is currently mapped to the CPU (between `mapAsync` and `unmap`) — the spec's
     /// "unavailable". The engine's mapping gate is what keeps such a buffer out of queue work.
     public var isMapped = false
+    /// The buffer range of the current **write** mapping (`mapAsync(GPUMapMode.WRITE)` or
+    /// `mappedAtCreation`) — the only range `unmapBuffer`'s `data` may be written back into.
+    /// Nil while unmapped or mapped for reading.
+    public var writeMappedRange: Range<Int>?
+    /// Bumped at every mapping request and every unmap — a `readBuffer` completion carrying an older
+    /// value belongs to a mapping that was already released (unmap while pending, then mapped again),
+    /// so it must not touch the current mapping's state.
+    public var mapGeneration = 0
 
     public init(raw: B.Buffer, size: Int, usage: WGPUBufferUsage) {
         self.raw = raw
@@ -30,6 +38,9 @@ public final class WGPUEngineTexture<B: WGPUBackend> {
     public let format: WGPUTextureFormat
     public let size: WGPUExtent3D
     public let sampleCount: Int
+    /// Needed to bound a copy's `mipLevel` and its per-level extent before the backend sees it.
+    public let mipLevelCount: Int
+    public let dimension: WGPUTextureDimension
     /// The canvas this drawable texture came from — nil for a regular texture. Non-nil means the
     /// handle expires once the frame is presented, and views of it inherit the same canvas scope
     /// (so a per-canvas expiry can pick them out).
@@ -37,11 +48,14 @@ public final class WGPUEngineTexture<B: WGPUBackend> {
     public var isDrawable: Bool { drawableCanvas != nil }
 
     public init(raw: B.Texture, format: WGPUTextureFormat, size: WGPUExtent3D,
-                sampleCount: Int, drawableCanvas: String? = nil) {
+                sampleCount: Int, mipLevelCount: Int = 1, dimension: WGPUTextureDimension = .twoD,
+                drawableCanvas: String? = nil) {
         self.raw = raw
         self.format = format
         self.size = size
         self.sampleCount = sampleCount
+        self.mipLevelCount = mipLevelCount
+        self.dimension = dimension
         self.drawableCanvas = drawableCanvas
     }
 }
@@ -89,8 +103,48 @@ public final class WGPUEngineBindGroupLayout<B: WGPUBackend> {
 
 public final class WGPUEnginePipelineLayout<B: WGPUBackend> {
     public let raw: B.PipelineLayout
+    /// Each group's layout entries (nil where they are unknown) — pipeline creation checks the
+    /// layout's `minBindingSize`s against the shader here.
+    public let groupEntries: [[WGPUBindGroupLayoutEntry]?]
 
-    public init(raw: B.PipelineLayout) { self.raw = raw }
+    public init(raw: B.PipelineLayout, groupEntries: [[WGPUBindGroupLayoutEntry]?] = []) {
+        self.raw = raw
+        self.groupEntries = groupEntries
+    }
+}
+
+/// One buffer entry of a bind group, as the draw-time binding size check needs it.
+public struct WGPUEngineBufferBinding {
+    public let binding: Int
+    /// The layout entry's type — picks the dynamic offset alignment limit.
+    public let type: WGPUBufferBindingType
+    public let bufferSize: Int
+    public let offset: Int
+    /// The entry's explicit `size` — nil means "to the end of the buffer", which a dynamic offset
+    /// then shortens (the spec's effective binding size is taken after adding it).
+    public let size: Int?
+    public let hasDynamicOffset: Bool
+    /// The layout entry's `minBindingSize` was non-zero, so `createBindGroup` already checked the
+    /// size and pipeline creation checked the shader against it — the spec's `[[prevalidatedSize]]`.
+    public let prevalidatedSize: Bool
+
+    public init(binding: Int, type: WGPUBufferBindingType, bufferSize: Int, offset: Int, size: Int?,
+                hasDynamicOffset: Bool, prevalidatedSize: Bool) {
+        self.binding = binding
+        self.type = type
+        self.bufferSize = bufferSize
+        self.offset = offset
+        self.size = size
+        self.hasDynamicOffset = hasDynamicOffset
+        self.prevalidatedSize = prevalidatedSize
+    }
+
+    /// The spec's "effective buffer binding size" once `dynamicOffset` is applied.
+    public func effectiveSize(dynamicOffset: Int) -> Int {
+        if let size { return size }
+        let (end, overflow) = offset.addingReportingOverflow(dynamicOffset)
+        return overflow ? 0 : max(bufferSize - end, 0)
+    }
 }
 
 public final class WGPUEngineBindGroup<B: WGPUBackend> {
@@ -98,10 +152,15 @@ public final class WGPUEngineBindGroup<B: WGPUBackend> {
     /// Buffers this group holds — needed to check "is it mapped?" right before a draw (the group
     /// pins its buffers at creation, so a buffer mapped afterwards is caught there).
     public let buffers: [WGPUEngineBuffer<B>]
+    /// Its buffer entries, sorted by binding — the size and dynamic offset checks read them. Nil when
+    /// the layout's entries were unknown (or the backend validates natively): those checks are skipped.
+    public let bufferBindings: [WGPUEngineBufferBinding]?
 
-    public init(raw: B.BindGroup, buffers: [WGPUEngineBuffer<B>]) {
+    public init(raw: B.BindGroup, buffers: [WGPUEngineBuffer<B>],
+                bufferBindings: [WGPUEngineBufferBinding]? = nil) {
         self.raw = raw
         self.buffers = buffers
+        self.bufferBindings = bufferBindings?.sorted { $0.binding < $1.binding }
     }
 }
 

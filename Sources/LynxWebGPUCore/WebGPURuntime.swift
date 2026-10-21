@@ -111,6 +111,9 @@ public protocol WebGPURuntime: AnyObject {
     // MARK: - Asynchronous
 
     /// `GPUBuffer.mapAsync` + `getMappedRange` — returns the contents once prior GPU work finishes.
+    /// A `MAP_WRITE` buffer is mapped **for writing** (`mapAsync(GPUMapMode.WRITE)` — the spec forbids
+    /// `MAP_READ | MAP_WRITE`, so usage decides the mode): the bytes written come back in the
+    /// `unmapBuffer` command's `offset` + `data` (`docs/COMMAND-STREAM.md` §4-3).
     func readBuffer(handle: Int, offset: Int, size: Int?, completion: @escaping ([String: Any]) -> Void)
 
     /// `createImageBitmap()` — decodes an image and registers it under a **JS-issued handle**.

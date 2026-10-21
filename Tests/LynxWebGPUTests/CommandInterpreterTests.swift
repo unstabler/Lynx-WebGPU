@@ -472,6 +472,80 @@ final class CommandInterpreterTests: XCTestCase {
         XCTAssertThrowsError(try harness.readBufferSync(handle: 1), "a second mapping is rejected")
     }
 
+    /// `mapAsync(GPUMapMode.WRITE)` → write into the mapping → `unmap()` must land in the buffer.
+    /// The JS mapping is a copy, so the bytes come back in `unmapBuffer`'s `data` — before, they were
+    /// silently dropped. Read back through the spec's path (copy into a `MAP_READ` staging buffer).
+    func test_aWriteMappingIsWrittenBackAtUnmap() throws {
+        harness.executeExpectingSuccess([
+            ["op": "createBuffer", "id": 1, "size": 16, "usage": TestUsage.mapWrite | TestUsage.copySrc,
+             "data": [Float]([9, 9, 9, 9]).base64],
+            ["op": "createBuffer", "id": 2, "size": 16, "usage": TestUsage.copyDst | TestUsage.mapRead],
+        ])
+        // The mapping starts as the current contents (spec).
+        XCTAssertEqual(try harness.readBufferSync(handle: 1, as: Float.self), [9, 9, 9, 9])
+
+        // Still unavailable to queue work until unmap.
+        let copy = harness.execute([
+            ["op": "copyBufferToBuffer", "source": 1, "destination": 2, "size": 16],
+        ])
+        XCTAssertTrue(
+            ((errors(copy).first?["message"] as? String) ?? "").contains("is mapped"),
+            harness.describeErrors(copy)
+        )
+
+        harness.executeExpectingSuccess([
+            ["op": "unmapBuffer", "buffer": 1, "offset": 0, "data": [Float]([1, 2, 3, 4]).base64],
+            ["op": "copyBufferToBuffer", "source": 1, "destination": 2, "size": 16],
+        ])
+        XCTAssertEqual(try harness.readBufferSync(handle: 2, as: Float.self), [1, 2, 3, 4])
+    }
+
+    /// A partial write mapping is addressed in buffer offsets: only its range is written back, the rest survives.
+    func test_aPartialWriteMappingWritesBackOnlyItsRange() throws {
+        harness.executeExpectingSuccess([
+            ["op": "createBuffer", "id": 1, "size": 16, "usage": TestUsage.mapWrite | TestUsage.copySrc,
+             "data": [Float]([9, 9, 9, 9]).base64],
+            ["op": "createBuffer", "id": 2, "size": 16, "usage": TestUsage.copyDst | TestUsage.mapRead],
+        ])
+        XCTAssertEqual(try harness.readBufferSync(handle: 1, as: Float.self, offset: 8, size: 8), [9, 9])
+
+        // Outside the mapping — rejected, and the buffer is unmapped anyway (unmap cannot fail in the spec).
+        let outside = harness.execute([
+            ["op": "unmapBuffer", "buffer": 1, "offset": 0, "data": [Float]([5, 5]).base64],
+        ])
+        XCTAssertTrue(
+            ((errors(outside).first?["message"] as? String) ?? "").contains("outside the mapped range"),
+            harness.describeErrors(outside)
+        )
+
+        _ = try harness.readBufferSync(handle: 1, offset: 8, size: 8)
+        harness.executeExpectingSuccess([
+            ["op": "unmapBuffer", "buffer": 1, "offset": 8, "data": [Float]([3, 4]).base64],
+            ["op": "copyBufferToBuffer", "source": 1, "destination": 2, "size": 16],
+        ])
+        XCTAssertEqual(try harness.readBufferSync(handle: 2, as: Float.self), [9, 9, 3, 4])
+    }
+
+    /// Data on an unmap needs a write mapping — otherwise `unmapBuffer` would be a back door around
+    /// `writeBuffer`'s COPY_DST rule.
+    func test_unmapDataWithoutAWriteMappingIsRejected() throws {
+        harness.executeExpectingSuccess([
+            ["op": "createBuffer", "id": 1, "size": 16, "usage": TestUsage.copyDst | TestUsage.mapRead,
+             "data": [Float]([7, 7, 7, 7]).base64],
+        ])
+        _ = try harness.readBufferSync(handle: 1)   // a read mapping
+
+        let result = harness.execute([
+            ["op": "unmapBuffer", "buffer": 1, "data": [Float]([1, 2, 3, 4]).base64],
+        ])
+        XCTAssertTrue(
+            ((errors(result).first?["message"] as? String) ?? "").contains("mapped for writing"),
+            harness.describeErrors(result)
+        )
+        XCTAssertEqual(try harness.readBufferSync(handle: 1, as: Float.self), [7, 7, 7, 7],
+                       "the data was not written, and the buffer was unmapped (mappable again)")
+    }
+
     /// The spec allows `MAP_READ` only with `COPY_DST` and `MAP_WRITE` only with `COPY_SRC`.
     /// Metal covers everything with `.storageModeShared`, but unchecked it breaks only in a browser.
     func test_mappingUsageCombinesOnlyWithCopies() {
@@ -523,11 +597,12 @@ final class CommandInterpreterTests: XCTestCase {
         XCTAssertEqual(harness.liveObjects, 0)
     }
 
-    // MARK: - writeTexture queue ordering
+    // MARK: - Queue write ordering
 
-    /// In one batch (1) a render pass paints the texture red and (2) **after that** writeTexture uploads
-    /// green. In stream order the final content is green — under the old scheme, where writeTexture ran its
-    /// own command buffer to completion first, red would remain.
+    /// Queue writes (`writeBuffer`/`writeTexture`) land on the queue timeline **at the call** — before
+    /// the batch's encoder work, which is the batch's submit (`WGPUBackend.writeBuffer`). Under the old
+    /// scheme they rode the frame command buffer's blit in stream order instead, so a write after a
+    /// pass in the same batch ran after it, and a write while a pass was open was rejected outright.
     /// The `bytesPerRow` of a buffer↔texture copy must be **a multiple of 256** (a spec requirement the
     /// engine enforces). So the readback buffer carries padding per row and the tight pixels must be re-extracted.
     private static let copyRowStride = 256
@@ -542,7 +617,9 @@ final class CommandInterpreterTests: XCTestCase {
         }
     }
 
-    func test_writeTextureRunsAfterAnEarlierRenderPassInTheSameBatch() throws {
+    /// Batch 1 paints the texture red and is submitted; batch 2 uploads green. The upload is serialized
+    /// **after** the earlier submit — not run ahead of it, which would leave red.
+    func test_writeTextureRunsAfterARenderPassSubmittedEarlier() throws {
         let green = [UInt8]([0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255])
         harness.executeExpectingSuccess([
             ["op": "createTexture", "id": 1, "size": ["width": 2, "height": 2], "format": "rgba8unorm",
@@ -553,6 +630,8 @@ final class CommandInterpreterTests: XCTestCase {
                 "clearValue": ["r": 1, "g": 0, "b": 0, "a": 1],
             ]]],
             ["op": "endPass"],
+        ])
+        harness.executeExpectingSuccess([
             // `queue.writeTexture` has no 256 limit — the tight 8B rows go up as they are.
             ["op": "writeTexture", "texture": 1, "data": Data(green).base64EncodedString(),
              "size": ["width": 2, "height": 2], "bytesPerRow": 8],
@@ -566,8 +645,133 @@ final class CommandInterpreterTests: XCTestCase {
         let bytes = Array(try harness.readBufferSync(handle: 3))
         XCTAssertEqual(
             packedRows(bytes, rowBytes: 8, rows: 2), green,
-            "the writeTexture later in the stream must be the final content"
+            "the upload must land after the earlier submit's render pass"
         )
+    }
+
+    /// In **one** batch a render pass paints red and a writeTexture **later in the stream** uploads green.
+    /// The batch's encoder work is one submit at the batch's end, so the queue write lands first and
+    /// the pass's clear is the final content — the browser and Dawn order of
+    /// `writeTexture(…); queue.submit([cb])` with the pass recorded into `cb` before the call.
+    func test_writeTextureLandsBeforeTheEncoderWorkOfItsOwnBatch() throws {
+        let green = [UInt8]([0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255])
+        let red = [UInt8]([255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255])
+        harness.executeExpectingSuccess([
+            ["op": "createTexture", "id": 1, "size": ["width": 2, "height": 2], "format": "rgba8unorm",
+             "usage": TestUsage.renderAttachment | TestUsage.textureCopyDst | TestUsage.textureCopySrc],
+            ["op": "createTextureView", "id": 2, "texture": 1],
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 2, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 1, "g": 0, "b": 0, "a": 1],
+            ]]],
+            ["op": "endPass"],
+            ["op": "writeTexture", "texture": 1, "data": Data(green).base64EncodedString(),
+             "size": ["width": 2, "height": 2], "bytesPerRow": 8],
+            ["op": "createBuffer", "id": 3, "size": 512, "usage": TestUsage.copyDst | TestUsage.mapRead],
+            ["op": "copyTextureToBuffer",
+             "source": ["texture": 1],
+             "destination": ["buffer": 3, "bytesPerRow": Self.copyRowStride],
+             "copySize": ["width": 2, "height": 2]],
+        ])
+
+        let bytes = Array(try harness.readBufferSync(handle: 3))
+        XCTAssertEqual(
+            packedRows(bytes, rowBytes: 8, rows: 2), red,
+            "the queue write precedes the batch's command buffer, so the pass's clear wins"
+        )
+    }
+
+    /// A fragment shader painting the color held in a uniform — for the open-pass write tests below.
+    private static let uniformColorShader = """
+    struct Tint { color: vec4f };
+    @group(0) @binding(0) var<uniform> tint: Tint;
+
+    @vertex
+    fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+        var positions = array<vec2f, 3>(
+            vec2f(-1.0, -1.0),
+            vec2f( 3.0, -1.0),
+            vec2f(-1.0,  3.0),
+        );
+        return vec4f(positions[index], 0.0, 1.0);
+    }
+
+    @fragment
+    fn fs_main() -> @location(0) vec4f {
+        return tint.color;
+    }
+    """
+
+    /// Resources for a full-screen draw whose color comes from uniform buffer 2 (initially red).
+    private func uniformColorSetup() -> [[String: Any]] {
+        let red: [Float] = [1, 0, 0, 1]
+        return [
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+            ["op": "createShaderModule", "id": 1, "code": Self.uniformColorShader],
+            ["op": "createBuffer", "id": 2, "size": 16,
+             "usage": TestUsage.uniform | TestUsage.copyDst, "data": red.base64],
+            ["op": "createRenderPipeline", "id": 3, "layout": "auto",
+             "vertex": ["module": 1, "entryPoint": "vs_main"],
+             "fragment": ["module": 1, "entryPoint": "fs_main", "targets": [["format": "rgba8unorm"]]]],
+            ["op": "getBindGroupLayout", "id": 4, "pipeline": 3, "index": 0],
+            ["op": "createBindGroup", "id": 5, "layout": 4,
+             "entries": [["binding": 0, "resource": ["buffer": 2]]]],
+            ["op": "getCurrentTexture", "id": 10, "canvas": "test"],
+            ["op": "createTextureView", "id": 11, "texture": 10],
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 11, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 0, "g": 0, "b": 0, "a": 1],
+            ]]],
+        ]
+    }
+
+    /// The everyday per-object loop — `queue.writeBuffer(uniform); pass.setBindGroup(); pass.draw()`
+    /// with the pass still recording. A queue operation is legal at any moment; it used to be rejected
+    /// as "copy and upload commands cannot be used inside a render/compute pass".
+    func test_aWriteBufferWhileARenderPassIsOpenIsAcceptedAndSeenByTheDraw() throws {
+        let green: [Float] = [0, 1, 0, 1]
+        harness.executeExpectingSuccess(uniformColorSetup() + [
+            ["op": "writeBuffer", "buffer": 2, "data": green.base64],
+            ["op": "setPipeline", "pipeline": 3],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 5],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "endPass"],
+        ])
+
+        try harness.assertPixel(x: 4, y: 4, equals: (0, 255, 0, 255), "the draw sees the written uniform")
+    }
+
+    /// A draw **recorded before** the write but submitted after it sees the **new** value — the pass is
+    /// still recording, so its command buffer is necessarily submitted after the write (spec queue
+    /// timeline; what browsers and Dawn do). Stream order would have painted red.
+    func test_aDrawRecordedBeforeAnOpenPassWriteSeesTheNewValue() throws {
+        let green: [Float] = [0, 1, 0, 1]
+        harness.executeExpectingSuccess(uniformColorSetup() + [
+            ["op": "setPipeline", "pipeline": 3],
+            ["op": "setBindGroup", "index": 0, "bindGroup": 5],
+            ["op": "draw", "vertexCount": 3],
+            ["op": "writeBuffer", "buffer": 2, "data": green.base64],
+            ["op": "endPass"],
+        ])
+
+        try harness.assertPixel(
+            x: 4, y: 4, equals: (0, 255, 0, 255), "the write lands before the pass is submitted"
+        )
+    }
+
+    /// Queue writes keep **call order among themselves** wherever the pass state stood when they were
+    /// issued — a write outside a pass and a later one inside a pass, to the same bytes, leave the
+    /// later value.
+    func test_queueWritesKeepCallOrderAcrossAnOpenPass() throws {
+        harness.executeExpectingSuccess([
+            ["op": "createBuffer", "id": 1, "size": 16, "usage": TestUsage.copyDst | TestUsage.mapRead],
+            ["op": "writeBuffer", "buffer": 1, "data": [Float]([1, 2, 3, 4]).base64],
+            ["op": "beginComputePass"],
+            ["op": "writeBuffer", "buffer": 1, "data": [Float]([5, 6, 7, 8]).base64],
+            ["op": "endPass"],
+        ])
+
+        XCTAssertEqual(try harness.readBufferSync(handle: 1, as: Float.self), [5, 6, 7, 8])
     }
 
     func test_writeTextureUploadsArrayTextureLayersSliceBySlice() throws {
@@ -735,7 +939,8 @@ final class CommandInterpreterTests: XCTestCase {
         let result = harness.execute([
             ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
             ["op": "createBuffer", "id": 1, "size": 16, "usage": TestUsage.copyDst],
-            // Outside a pass — it attaches to the command buffer. writeBuffer opens a blit encoder.
+            // Outside a pass — it attaches to the command buffer. (writeBuffer rides the separate
+            // queue-write command buffer — not a scope.)
             ["op": "pushDebugGroup", "groupLabel": "upload"],
             ["op": "writeBuffer", "buffer": 1, "data": [Float](repeating: 1, count: 4).base64],
             ["op": "insertDebugMarker", "markerLabel": "marker"],
@@ -1077,6 +1282,150 @@ final class CommandInterpreterTests: XCTestCase {
             XCTAssertNotNil(limits[key], "the spec limit '\(key)' is missing")
             XCTAssertGreaterThan((limits[key] as? Int) ?? 0, 0, "'\(key)' is 0")
         }
+    }
+
+    // MARK: - minBindingSize
+
+    /// Binding 0 needs 64 bytes (a uniform mat4x4f struct), binding 1 one 16-byte element.
+    private let minimumSizeShader = """
+    struct Params { m: mat4x4f }
+    struct Item { a: vec4f }
+    @group(0) @binding(0) var<uniform> params: Params;
+    @group(0) @binding(1) var<storage, read_write> items: array<Item>;
+
+    @compute @workgroup_size(1)
+    fn main() { items[0].a = params.m[0]; }
+    """
+
+    private func minimumSizeLayout(min0: Int) -> [String: Any] {
+        ["op": "createBindGroupLayout", "id": 2, "entries": [
+            ["binding": 0, "visibility": 4, "buffer": ["type": "uniform", "minBindingSize": min0]],
+            ["binding": 1, "visibility": 4, "buffer": ["type": "storage"]],
+        ]]
+    }
+
+    /// createBindGroup checks the bound range against the layout's minBindingSize — and an auto
+    /// layout carries the shader's minimum, so an undersized group fails right there.
+    func test_aBindGroupSmallerThanTheLayoutMinBindingSizeIsRejected() {
+        let explicit = harness.execute([
+            ["op": "createBuffer", "id": 1, "size": 32, "usage": TestUsage.uniform | TestUsage.storage],
+            minimumSizeLayout(min0: 64),
+            ["op": "createBindGroup", "id": 3, "layout": 2, "entries": [
+                ["binding": 0, "resource": ["buffer": 1]],
+                ["binding": 1, "resource": ["buffer": 1]],
+            ]],
+        ])
+        XCTAssertEqual(errors(explicit).first?["path"] as? String, "commands[2].entries[0]")
+        XCTAssertTrue(((errors(explicit).first?["message"] as? String) ?? "").contains("minBindingSize 64"))
+
+        let auto = harness.execute([
+            ["op": "createShaderModule", "id": 10, "code": minimumSizeShader],
+            ["op": "createComputePipeline", "id": 11, "layout": "auto", "compute": ["module": 10]],
+            ["op": "getBindGroupLayout", "id": 12, "pipeline": 11, "index": 0],
+            ["op": "createBindGroup", "id": 13, "layout": 12, "entries": [
+                ["binding": 0, "resource": ["buffer": 1]],
+                ["binding": 1, "resource": ["buffer": 1]],
+            ]],
+        ])
+        XCTAssertEqual(errors(auto).count, 1, "\(errors(auto))")
+        XCTAssertTrue(((errors(auto).first?["message"] as? String) ?? "").contains("minBindingSize 64"))
+    }
+
+    /// An explicit layout whose non-zero minBindingSize is below the shader's is rejected at pipeline creation.
+    func test_aPipelineLayoutMinBindingSizeBelowTheShaderIsRejected() {
+        let result = harness.execute([
+            ["op": "createShaderModule", "id": 1, "code": minimumSizeShader],
+            minimumSizeLayout(min0: 32),
+            ["op": "createPipelineLayout", "id": 3, "bindGroupLayouts": [2]],
+            ["op": "createComputePipeline", "id": 4, "layout": 3, "compute": ["module": 1]],
+        ])
+        XCTAssertEqual(errors(result).first?["path"] as? String, "commands[3].layout")
+        XCTAssertTrue(((errors(result).first?["message"] as? String) ?? "").contains("minimum binding size 64"))
+    }
+
+    /// A `minBindingSize: 0` entry is checked at the dispatch, against the pipeline's shader — after
+    /// the dynamic offset when the entry has no explicit size.
+    func test_aZeroMinBindingSizeEntryIsCheckedAtDispatch() {
+        let setup: [[String: Any]] = [
+            ["op": "createShaderModule", "id": 1, "code": minimumSizeShader],
+            minimumSizeLayout(min0: 0),
+            ["op": "createPipelineLayout", "id": 3, "bindGroupLayouts": [2]],
+            ["op": "createComputePipeline", "id": 4, "layout": 3, "compute": ["module": 1]],
+            ["op": "createBuffer", "id": 5, "size": 256, "usage": TestUsage.uniform],
+            ["op": "createBuffer", "id": 8, "size": 256, "usage": TestUsage.storage],
+            ["op": "createBindGroup", "id": 6, "layout": 2, "entries": [
+                ["binding": 0, "resource": ["buffer": 5, "size": 16]],
+                ["binding": 1, "resource": ["buffer": 8]],
+            ]],
+            ["op": "createBindGroup", "id": 7, "layout": 2, "entries": [
+                ["binding": 0, "resource": ["buffer": 5, "size": 64]],
+                ["binding": 1, "resource": ["buffer": 8, "size": 16]],
+            ]],
+        ]
+        func dispatch(_ group: Int) -> [[String: Any]] {
+            [
+                ["op": "beginComputePass"],
+                ["op": "setPipeline", "pipeline": 4],
+                ["op": "setBindGroup", "index": 0, "bindGroup": group],
+                ["op": "dispatchWorkgroups", "x": 1],
+                ["op": "endPass"],
+            ]
+        }
+        let rejected = harness.execute(setup + dispatch(6))
+        XCTAssertEqual(errors(rejected).count, 1, "\(errors(rejected))")
+        XCTAssertEqual(errors(rejected).first?["path"] as? String, "commands[\(setup.count + 3)].dispatchWorkgroups")
+        XCTAssertTrue(((errors(rejected).first?["message"] as? String) ?? "").contains("needs at least 64"))
+
+        let accepted = harness.execute(dispatch(7))
+        XCTAssertTrue(errors(accepted).isEmpty, "\(errors(accepted))")
+    }
+
+    // MARK: - Dynamic offsets
+
+    /// setBindGroup checks its dynamic offsets — unchecked, Metal's setBuffer bound past the buffer's end.
+    func test_setBindGroupRejectsBadDynamicOffsets() {
+        let setup: [[String: Any]] = [
+            ["op": "createShaderModule", "id": 1, "code": """
+            @group(0) @binding(0) var<uniform> u: vec4f;
+            @group(0) @binding(1) var<storage, read_write> o: array<vec4f>;
+            @compute @workgroup_size(1) fn main() { o[0] = u; }
+            """],
+            ["op": "createBindGroupLayout", "id": 2, "entries": [
+                ["binding": 0, "visibility": 4, "buffer": ["type": "uniform", "hasDynamicOffset": true]],
+                ["binding": 1, "visibility": 4, "buffer": ["type": "storage"]],
+            ]],
+            ["op": "createPipelineLayout", "id": 3, "bindGroupLayouts": [2]],
+            ["op": "createComputePipeline", "id": 4, "layout": 3, "compute": ["module": 1]],
+            ["op": "createBuffer", "id": 5, "size": 256, "usage": TestUsage.uniform],
+            ["op": "createBuffer", "id": 6, "size": 16, "usage": TestUsage.storage],
+            ["op": "createBindGroup", "id": 7, "layout": 2, "entries": [
+                ["binding": 0, "resource": ["buffer": 5, "size": 64]],
+                ["binding": 1, "resource": ["buffer": 6]],
+            ]],
+        ]
+        func dispatch(_ offsets: [Int]) -> [[String: Any]] {
+            [
+                ["op": "beginComputePass"],
+                ["op": "setPipeline", "pipeline": 4],
+                ["op": "setBindGroup", "index": 0, "bindGroup": 7, "dynamicOffsets": offsets],
+                ["op": "dispatchWorkgroups", "x": 1],
+                ["op": "endPass"],
+            ]
+        }
+        XCTAssertTrue(errors(harness.execute(setup)).isEmpty)
+
+        let pastTheEnd = harness.execute(dispatch([512]))
+        XCTAssertEqual(errors(pastTheEnd).first?["path"] as? String, "commands[2].dynamicOffsets[0]")
+        XCTAssertTrue(((errors(pastTheEnd).first?["message"] as? String) ?? "").contains("exceeds the buffer"))
+
+        let unaligned = harness.execute(dispatch([4]))
+        XCTAssertTrue(((errors(unaligned).first?["message"] as? String) ?? "").contains("minUniformBufferOffsetAlignment"))
+
+        let missing = harness.execute(dispatch([]))
+        XCTAssertEqual(errors(missing).first?["path"] as? String, "commands[2].dynamicOffsets")
+
+        XCTAssertFalse(errors(harness.execute(dispatch([256]))).isEmpty, "256 + 64 bytes run past a 256-byte buffer")
+        XCTAssertTrue(errors(harness.execute(dispatch([0]))).isEmpty)
     }
 
     /// The spec fixes each limit's **default (the minimum guarantee)**. Reporting lower makes code that

@@ -75,14 +75,35 @@ public protocol WGPUBackend: AnyObject {
 
     // MARK: - Batch lifetime
 
-    /// Batch start — the seat for backends needing per-batch diagnostic collection (Dawn: push a
-    /// device error scope). A backend whose failures arrive by completion handler, like Metal, has
-    /// nothing to do.
+    /// Batch start — the seat for backends needing per-batch setup (Dawn: drop a leftover encoder).
+    /// A backend whose failures arrive by completion handler, like Metal, has nothing to do.
     func beginBatch()
 
-    /// After the batch is submitted, the backend hands over the diagnostics it gathered (Dawn: pop
-    /// the scope, pump, collect errors). The engine routes them into error scopes / the batch result.
+    /// After the batch is submitted, the backend hands over the diagnostics that only surface late
+    /// (Dawn: pump events, then drain its uncaptured-error sink — encoder errors raised at Finish,
+    /// stragglers). The engine routes them into error scopes / the batch result.
     func collectBatchDiagnostics() -> [WGPUError]
+
+    /// Diagnostics the backend's own validator has **already raised** — handed over without
+    /// pumping anything. The engine calls this after **every command** (and once at batch start),
+    /// so each error is filed with the error scopes **as they were when the offending command
+    /// ran**. Collecting only at batch end would file it with the scopes open at the end instead:
+    /// a `push → create → pop` in one batch (the shim's `createRenderPipelineAsync`, a user's
+    /// per-frame scope) would resolve clean while the error leaked to `uncapturederror`.
+    ///
+    /// Must be cheap (it runs per command). Dawn: drain the uncaptured-error sink, which its
+    /// validator fills synchronously during the offending API call. Default: none (Metal — its
+    /// spec checks are the engine's and are thrown in-command).
+    func drainImmediateDiagnostics() -> [WGPUError]
+
+    /// Whether a diagnostic is only a **cascading echo** of an earlier root error (Dawn: "[Invalid
+    /// X] is invalid due to a previous error"). The engine drops echoes from the batch result's
+    /// `errors` when a root error is in that same result — an overlay showing the last error
+    /// would otherwise always show the echo and hide the cause. The filter has to be the
+    /// engine's: with per-command draining the root and its echo arrive in **different** drains.
+    /// **Scopes still catch echoes** — the spec raises a real validation error for using an
+    /// invalid object. Default: false.
+    func isCascadingEcho(_ diagnostic: WGPUError) -> Bool
 
     /// Whether GPU work to submit was produced in this batch (Metal: a command buffer exists).
     /// The engine decides present, accounting and frame expiry from this value.
@@ -122,10 +143,24 @@ public protocol WGPUBackend: AnyObject {
     // MARK: - Resources
 
     func makeBuffer(_ descriptor: WGPUBufferDescriptor) throws -> Buffer
+
+    /// `queue.writeBuffer` — a **queue** operation, not an encoder one.
+    ///
+    /// - It can arrive **while a pass is open** (the engine does not reject it — the spec allows a
+    ///   queue write at any moment, and a hand-written stream may interleave one with pass commands).
+    /// - Its effect lands on the queue timeline **before this batch's encoder work** (passes, copies,
+    ///   resolves — the batch's command buffer, submitted at the end of the batch), and in call order
+    ///   relative to the other queue writes (`writeTexture` included). This is the spec order
+    ///   `queue.writeBuffer(…); queue.submit([cb])` produces — even for commands recorded into `cb`
+    ///   before the write — and the shape of every batch the JS shim sends (queue ops at call time,
+    ///   the submit's command buffers at the end).
+    ///
+    /// Metal: a separate upload command buffer committed ahead of the batch's command buffer.
+    /// Dawn: `wgpuQueueWriteBuffer`, already on the queue timeline.
     func writeBuffer(_ buffer: Buffer, offset: Int, data: Data) throws
 
     /// `unmap()` — the wire mapping state is the engine's; only a backend with **real mapping**
-    /// (Dawn's `mappedAtCreation`) releases its own here. A no-op where there is none.
+    /// (Dawn's `mappedAtCreation` and `mapBufferForWrite`) releases its own here. A no-op where there is none.
     func unmapBuffer(_ buffer: Buffer)
 
     /// Reads buffer contents — guarantee the values are those after previously submitted GPU work.
@@ -133,11 +168,28 @@ public protocol WGPUBackend: AnyObject {
     func readBuffer(_ buffer: Buffer, offset: Int, length: Int,
                     deliver: @escaping (Result<Data, WGPUError>) -> Void)
 
+    /// `mapAsync(GPUMapMode.WRITE)` — maps `[offset, offset + length)` for writing and delivers its
+    /// **current contents** (the spec's initial view of a write mapping), with the same completion
+    /// contract as `readBuffer`. The engine calls this instead of `readBuffer` for a `MAP_WRITE` buffer
+    /// (the spec forbids `MAP_READ | MAP_WRITE`, so such a buffer has no other mapping). A backend with
+    /// real mapping keeps the buffer mapped until `unmapBuffer` (Dawn); offset is a multiple of 8 and
+    /// length of 4 (checked by the engine).
+    func mapBufferForWrite(_ buffer: Buffer, offset: Int, length: Int,
+                           deliver: @escaping (Result<Data, WGPUError>) -> Void)
+
+    /// The write-back of a write mapping at `unmap()` — stores `data` at buffer offset `offset`, inside
+    /// the mapped range (checked by the engine), **right before** `unmapBuffer` on the same buffer.
+    /// It is not `writeBuffer`: the target has `MAP_WRITE` usage, not `COPY_DST`, so a queue write is
+    /// invalid on a natively validating backend (Dawn writes through its mapped range instead).
+    func writeMappedBuffer(_ buffer: Buffer, offset: Int, data: Data) throws
+
     func makeTexture(_ descriptor: WGPUTextureDescriptor) throws -> Texture
 
     /// Uploads CPU data into a texture — `writeTexture` and `copyExternalImageToTexture` converge
     /// here (for the latter the engine finishes decoding, cropping and flipY and passes pixels only).
     /// Omitted defaults for `bytesPerRow`/`rowsPerImage` arrive already filled in by the engine.
+    /// A queue operation with the same ordering contract as `writeBuffer` (allowed inside an open
+    /// pass, lands before the batch's encoder work, in call order with the other queue writes).
     func writeTexture(_ texture: Texture, data: Data, origin: WGPUOrigin3D, size: WGPUExtent3D,
                       mipLevel: Int, bytesPerRow: Int, rowsPerImage: Int) throws
 
@@ -231,7 +283,9 @@ public protocol WGPUBackend: AnyObject {
 
     /// Right before a draw, **only the dirty groups** come down from the engine's shadow state —
     /// because binding invalidation at bundle boundaries is expressed in that shadow state (see
-    /// `WGPUBackendEngine`).
+    /// `WGPUBackendEngine`). A group bound beyond the pipeline layout (index ≥ `layoutGroupCount`, or
+    /// above the highest `requiredGroups` index when that is nil) is held back — the spec ignores it —
+    /// until a pipeline whose layout reaches it is set. With nil metadata every dirty group comes down.
     func applyBindGroup(_ group: BindGroup, at index: Int, dynamicOffsets: [Int]) throws
     /// Right before a draw, only the dirty slots come down. A `validatesNatively` backend must
     /// convert slot and offset safely itself (the engine's range check is skipped).
@@ -261,6 +315,9 @@ public protocol WGPUBackend: AnyObject {
 
     // MARK: - Draw / dispatch
 
+    /// Unless `validatesNatively`, the direct `draw`/`drawIndexed`/`dispatchWorkgroups` never receive a
+    /// zero vertex/index/instance/workgroup count — the spec makes such a call a valid no-op, so the
+    /// engine validates it and then stops (Metal asserts on an empty grid). Indirect arguments are the GPU's.
     func draw(_ command: WGPUDrawCommand) throws
     func drawIndexed(_ command: WGPUDrawIndexedCommand, index: WGPUResolvedIndexBinding<Self>) throws
     func drawIndirect(buffer: Buffer, offset: Int) throws
@@ -290,6 +347,13 @@ public protocol WGPUBackend: AnyObject {
                          destination: Buffer, destinationOffset: Int) throws
 }
 
+// MARK: - Defaults
+
+public extension WGPUBackend {
+    func drainImmediateDiagnostics() -> [WGPUError] { [] }
+    func isCascadingEcho(_ diagnostic: WGPUError) -> Bool { false }
+}
+
 // MARK: - Capabilities
 
 public struct WGPUBackendCapabilities {
@@ -311,7 +375,8 @@ public struct WGPUBackendCapabilities {
     /// True makes the engine skip spec-level checks (range, alignment, usage, occlusion nesting,
     /// bundle compatibility, compression limits) and keep only **bridging and minimal exception
     /// handling** — handle lookup, wire mapping state, pass state guards, CPU path protection. Bad
-    /// values are rejected by the backend's own validator (its device error scope), and trap
+    /// values are rejected by the backend's own validator (reported through its uncaptured-error
+    /// sink, drained per command by `drainImmediateDiagnostics` and at batch end), and trap
     /// prevention falls to the backend's safe conversions (the `dawnU32` family) — the same split
     /// react-native-webgpu uses over Dawn (`docs/extra/RN-WEBGPU-LAYERING.md`).
     ///
@@ -373,26 +438,45 @@ public struct WGPUCompilationMessage {
 public struct WGPURenderPipelineInfo {
     /// Group indices that must be bound before a draw (empty groups excluded).
     public let requiredGroups: Set<Int>?
+    /// Number of bind group layouts in the pipeline layout (trailing empty ones included). Groups
+    /// bound at this index or above are ignored (spec) and not sent down; nil falls back to
+    /// "above the highest `requiredGroups` index".
+    public let layoutGroupCount: Int?
     /// Vertex buffer slots that must be bound before a draw (declared by `vertex.buffers`).
     public let requiredVertexSlots: Set<Int>?
     /// Used when rejecting in a `depthReadOnly`/`stencilReadOnly` pass.
     public let writesDepth: Bool?
     public let writesStencil: Bool?
+    /// The spec's **minimum buffer binding size** of each buffer variable the pipeline's entry
+    /// points use, by group then binding. Checked against an explicit layout's `minBindingSize` at
+    /// pipeline creation and against the bound ranges (`minBindingSize: 0` entries) at draw time.
+    /// A binding missing from the table is not checked (a shader the backend cannot reflect).
+    public let minimumBindingSizes: [Int: [Int: Int]]?
 
-    public init(requiredGroups: Set<Int>? = nil, requiredVertexSlots: Set<Int>? = nil,
-                writesDepth: Bool? = nil, writesStencil: Bool? = nil) {
+    public init(requiredGroups: Set<Int>? = nil, layoutGroupCount: Int? = nil,
+                requiredVertexSlots: Set<Int>? = nil, writesDepth: Bool? = nil, writesStencil: Bool? = nil,
+                minimumBindingSizes: [Int: [Int: Int]]? = nil) {
         self.requiredGroups = requiredGroups
+        self.layoutGroupCount = layoutGroupCount
         self.requiredVertexSlots = requiredVertexSlots
         self.writesDepth = writesDepth
         self.writesStencil = writesStencil
+        self.minimumBindingSizes = minimumBindingSizes
     }
 }
 
 public struct WGPUComputePipelineInfo {
     public let requiredGroups: Set<Int>?
+    /// See `WGPURenderPipelineInfo.layoutGroupCount`.
+    public let layoutGroupCount: Int?
+    /// Same as `WGPURenderPipelineInfo.minimumBindingSizes` (checked at dispatch).
+    public let minimumBindingSizes: [Int: [Int: Int]]?
 
-    public init(requiredGroups: Set<Int>? = nil) {
+    public init(requiredGroups: Set<Int>? = nil, layoutGroupCount: Int? = nil,
+                minimumBindingSizes: [Int: [Int: Int]]? = nil) {
         self.requiredGroups = requiredGroups
+        self.layoutGroupCount = layoutGroupCount
+        self.minimumBindingSizes = minimumBindingSizes
     }
 }
 

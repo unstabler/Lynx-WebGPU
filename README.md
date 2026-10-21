@@ -78,7 +78,7 @@ host.attach(to: lynxView)
 | `LynxWebGPUCore` | WebGPU 열거형·디스크립터·오류·핸들 레지스트리 + **커맨드 스트림 엔진**(`WGPUBackendEngine` — 디코딩·검증·오류 스코프·프레임 수명)과 백엔드 동사 프로토콜(`WGPUBackend`). Metal-free |
 | `LynxWebGPUShader` | WGSL 렉서/파서/리플렉션/MSL 방출기 (순수 Swift) |
 | `LynxWebGPU` | 엔진 위의 **Metal 백엔드**(인코딩) + 캔버스 표면 + 기본 런타임 `LynxWebGPUContext` |
-| `LynxWebGPUConformance` | 런타임 무관 **적합성 스위트**(29검사) — 저장소 밖에서 만든 백엔드가 같은 계약을 지키는지 픽셀로 판정한다 ([docs/TESTING.md](docs/TESTING.md) §2-1) |
+| `LynxWebGPUConformance` | 런타임 무관 **적합성 스위트**(31검사) — 저장소 밖에서 만든 백엔드가 같은 계약을 지키는지 픽셀로 판정한다 ([docs/TESTING.md](docs/TESTING.md) §2-1) |
 | `LynxWebGPUBridge` | Lynx NativeModule + `<webgpu-canvas>` 엘리먼트 (iOS 전용) — **SPM 타깃이 아니라 소스**다 |
 
 **이 패키지는 외부 의존성이 0이다.** SPM product는 셋(`LynxWebGPU` 엔진 · `LynxWebGPUCore`
@@ -135,15 +135,15 @@ JS 스레드(터치·타이머 포함)로 번지지 않는다.
 
 ## 검증
 
-Swift 374개 + JS 133개 테스트가 몇 초 안에 돈다 — 시뮬레이터도 기기도 필요 없다.
+Swift 486개 + JS 150개 테스트가 30초 안에 돈다 — 시뮬레이터도 기기도 필요 없다.
 
 - 트랜스파일러 테스트는 생성된 MSL을 **실제 Metal 컴파일러로** 통과시킨다.
 - 렌더 테스트는 오프스크린 텍스처에 그린 뒤 **픽셀 값을 단언**한다 (삼각형, 유니폼, 인덱스 드로우,
   알파 블렌딩, 컴퓨트 + 리드백, 텍스처 샘플링, 가장자리 클램프 샘플링, 깊이 테스트).
   `rgba16float` 표면은 되읽었을 때 **1.0을 넘는 값과 음수가 살아 있는지**까지 본다 — HDR 결과를
   8비트로 떨어뜨리지 않는다는 근거다.
-- 커맨드 스트림의 계약도 단언한다 — `writeTexture`가 같은 배치의 앞선 렌더 패스 **뒤에**
-  실행되는지(큐 순서), 스테이징 풀이 프레임을 거듭해도 자라지 않는지, in-flight 카운터가
+- 커맨드 스트림의 계약도 단언한다 — 큐 쓰기가 앞서 제출된 렌더 패스 **뒤에**, 같은 배치의
+  인코더 작업 **앞에** 실행되는지(큐 타임라인 — 패스가 열려 있어도 받는다), 스테이징 풀이 프레임을 거듭해도 자라지 않는지, in-flight 카운터가
   커밋/완료로 오르내리는지.
 - **"브라우저에서만 깨지는 코드"를 막는 검증도 테스트로 고정한다** — 렌더 번들의 상태 격리,
   매핑 중인 버퍼의 큐 작업 거부, read-only 어태치먼트 강제처럼 Metal이 그냥 통과시키는 것들이다.
@@ -152,10 +152,10 @@ Swift 374개 + JS 133개 테스트가 몇 초 안에 돈다 — 시뮬레이터�
 - **호스트가 넘긴 페이로드는 배치를 시작하기 전에 네이티브 컨테이너로 옮긴다** — 원본 `NSDictionary`를
   중간에 비워도 배치 끝까지 같은 값을 읽는지, ObjC 트리로 들어온 페이로드가 프레임을 그려 내는지를
   테스트가 잡는다 (0.5.2에서 고친 크래시의 회귀 방지 — `docs/COMMAND-STREAM.md` §5-1-1).
-- **적합성 스위트(`LynxWebGPUConformance`, 29검사)는 런타임을 갈아끼워도 그대로 돈다** —
+- **적합성 스위트(`LynxWebGPUConformance`, 31검사)는 런타임을 갈아끼워도 그대로 돈다** —
   커맨드 스트림·`readCanvasPixels`·`readBuffer`·`adapterInfo`만 쓰므로, 저장소 밖 백엔드도
-  같은 검사로 자신을 증명한다. 기본 Metal 런타임 29/29에 더해, 진짜 Dawn 위에 얹은 백엔드가
-  같은 스위트를 28/29(+1 시뮬레이터 건너뜀)로 통과한다 ([docs/TESTING.md](docs/TESTING.md) §2-1).
+  같은 검사로 자신을 증명한다. 기본 Metal 런타임 31/31에 더해, 진짜 Dawn 위에 얹은 백엔드가
+  같은 스위트를 30/31(+1 시뮬레이터 건너뜀)로 통과한다 ([docs/TESTING.md](docs/TESTING.md) §2-1).
   **두 백엔드 모두 iOS 시뮬레이터에서도 같은 스위트를 돌린다** (스킴 `WebGPUCheck` · `DawnCheck`) —
   `swift test`는 macOS라 드라이버·GPU 패밀리가 다르고, 실려 나가는 곳은 iOS이기 때문이다.
 - JS shim은 node 내장 러너로 검증한다 — 바이너리 경로의 타입·바이트를 단언하고,

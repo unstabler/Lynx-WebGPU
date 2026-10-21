@@ -66,7 +66,9 @@ NativeModule 딕셔너리 브리지라 프레임당 1왕복 커맨드 스트림�
   폭을 벗어나면 트랩 대신 validation으로 거부한다 (`DawnHardeningTests`가 이 층을 판정).
 - **배치 진단은 uncaptured 콜백으로 모은다.** 디바이스 오류 스코프는 첫 오류 하나만
   돌려줘서 한 배치의 다중 거부가 뭉개진다 — uncaptured는 오류마다 개별 전달이라
-  브라우저의 오류 밀도와 같다 (`DawnBackend.collectBatchDiagnostics`).
+  브라우저의 오류 밀도와 같다. 콜백은 실패한 호출 안에서 동기로 오므로 엔진이 **명령마다**
+  싱크를 비워(`DawnBackend.drainImmediateDiagnostics`) 그 명령 시점의 오류 스코프에 귀속시키고,
+  `Finish`·펌프에서 늦게 오는 것만 배치 끝(`collectBatchDiagnostics`)에 거둔다.
 
 ## 3. 알려진 와이어 차이 (설계상 감수)
 

@@ -131,28 +131,35 @@ enum MSLPrelude {
     template<typename T, int C, int R, typename I> inline constant vec<T, R>& wgpu_at(constant matrix<T, C, R>& m, I i) { return m[min(uint(i), uint(C - 1))]; }
     template<typename T, int C, int R, typename I> inline threadgroup vec<T, R>& wgpu_at(threadgroup matrix<T, C, R>& m, I i) { return m[min(uint(i), uint(C - 1))]; }
 
-    // A runtime-sized array (`array<T>`) arrives as a pointer with no size in its type — there the
-    // emitter computes the bound from the buffer size table and passes it (`wgpu_at_n`). With no table it falls through to here.
-    template<typename T, typename I> inline device T& wgpu_at(device T* p, I i) { return p[uint(i)]; }
-    template<typename T, typename I> inline const device T& wgpu_at(const device T* p, I i) { return p[uint(i)]; }
-    template<typename T, typename I> inline constant T& wgpu_at(constant T* p, I i) { return p[uint(i)]; }
+    // A runtime-sized array (`array<T>`) arrives as a pointer with no size in its type — a bare
+    // binding is `device T*`, and a trailing struct member is `T items[1]`, which decays to one.
+    // The emitter computes the bound from the buffer size table and passes it (`wgpu_at_n`).
+    // **A pointer reaching plain `wgpu_at` is a shape the emitter could not bound**, so these overloads
+    // are deleted: such a shader fails to compile instead of indexing GPU memory unchecked.
+    // (Deleted rather than absent so the error names the cause, and no other overload can take the call.)
+    template<typename T, typename I> void wgpu_at(device T* p, I i) = delete;
+    template<typename T, typename I> void wgpu_at(const device T* p, I i) = delete;
+    template<typename T, typename I> void wgpu_at(constant T* p, I i) = delete;
 
-    // The form taking the bound from outside — for runtime-sized arrays. A `count` of 0 folds to index 0
-    // (there is nothing to read in that buffer, but the address alone stays valid).
+    // The form taking the bound from outside — for runtime-sized arrays. A `count` of 0 (a binding
+    // smaller than one element past the array's start) has no in-bounds slot: a write through
+    // `wgpu_store_n` is dropped (the spec allows discarding an out-of-bounds store), while a reference
+    // must still name some place and folds to index 0 — the array's first slot, inside the binding
+    // whenever the binding meets the spec's minimum binding size (the fixed part plus one element).
     template<typename T, typename I> inline device T& wgpu_at_n(device T* p, I i, uint count) { return p[count == 0u ? 0u : min(uint(i), count - 1u)]; }
     template<typename T, typename I> inline const device T& wgpu_at_n(const device T* p, I i, uint count) { return p[count == 0u ? 0u : min(uint(i), count - 1u)]; }
 
     // The **write** path in index position. Vector components cannot come back by reference, so the
-    // assignment finishes inside the function. Arrays, matrices and pointers take the same name so the
-    // emitter need not distinguish the target kind.
+    // assignment finishes inside the function. Arrays and matrices take the same name so the emitter
+    // need not distinguish the target kind. A runtime-sized array writes only through `wgpu_store_n`.
     template<typename C, typename I, typename V> inline void wgpu_store(thread C& c, I i, V value) { wgpu_at(c, i) = value; }
     template<typename C, typename I, typename V> inline void wgpu_store(device C& c, I i, V value) { wgpu_at(c, i) = value; }
     template<typename C, typename I, typename V> inline void wgpu_store(threadgroup C& c, I i, V value) { wgpu_at(c, i) = value; }
     template<typename T, int N, typename I, typename V> inline void wgpu_store(thread vec<T, N>& v, I i, V value) { v[min(uint(i), uint(N - 1))] = value; }
     template<typename T, int N, typename I, typename V> inline void wgpu_store(device vec<T, N>& v, I i, V value) { v[min(uint(i), uint(N - 1))] = value; }
     template<typename T, int N, typename I, typename V> inline void wgpu_store(threadgroup vec<T, N>& v, I i, V value) { v[min(uint(i), uint(N - 1))] = value; }
-    template<typename T, typename I, typename V> inline void wgpu_store(device T* p, I i, V value) { p[uint(i)] = value; }
-    template<typename T, typename I, typename V> inline void wgpu_store_n(device T* p, I i, uint count, V value) { p[count == 0u ? 0u : min(uint(i), count - 1u)] = value; }
+    template<typename T, typename I, typename V> void wgpu_store(device T* p, I i, V value) = delete;
+    template<typename T, typename I, typename V> inline void wgpu_store_n(device T* p, I i, uint count, V value) { if (count != 0u) { p[min(uint(i), count - 1u)] = value; } }
 
     // MSL has no radians/degrees.
     template<typename T> inline T wgpu_radians(T d) { return d * T(0.017453292519943295); }

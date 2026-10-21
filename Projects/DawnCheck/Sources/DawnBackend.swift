@@ -14,10 +14,11 @@ import LynxWebGPUCore
 /// ## How Dawn errors are moved onto the wire model
 ///
 /// - Handle, state and range errors are turned into path-tagged validation by **the engine** (the same wording as Metal).
-/// - Dawn's own validation errors are wrapped in a device error scope (validation/out-of-memory) around the
-///   whole batch and reclaimed in `collectBatchDiagnostics()` — the engine puts them on the same batch result.
-/// - Errors outside a scope (uncaptured) are collected through the same channel and handed over at the next
-///   reclamation — the engine's deferred error queue ships them with the next batch (`docs/COMMAND-STREAM.md` §2).
+/// - Dawn's own validation errors all arrive through the device's **uncaptured callback** (no device scope is
+///   pushed). Dawn calls it synchronously inside the offending API call, so the engine drains the sink
+///   **after every command** (`drainImmediateDiagnostics()`) and files each error with the error scopes open
+///   when that command ran. What surfaces only at Finish/submit or on a pump is reclaimed in
+///   `collectBatchDiagnostics()`; anything later still rides the next batch (`docs/COMMAND-STREAM.md` §2).
 ///
 /// ## Simulator note
 ///
@@ -45,7 +46,8 @@ final class DawnBackend: WGPUBackend {
     /// The spec spellings of the advertisable features — the compression support query and adapterInfo use the same list.
     private let featureLabels: Set<String>
 
-    /// Device errors outside a scope (uncaptured) — `collectBatchDiagnostics` drains them.
+    /// Device errors outside a scope (uncaptured) — `drainImmediateDiagnostics` (per command) and
+    /// `collectBatchDiagnostics` (batch end) drain them.
     private let uncaptured = WGPUDeferredErrorQueue()
 
     // Batch lifetime state (beginBatch ~ submit)
@@ -148,16 +150,25 @@ final class DawnBackend: WGPUBackend {
     }
 
     func collectBatchDiagnostics() -> [WGPUError] {
-        // Validation errors come out as callbacks from wgpuInstanceProcessEvents after encoder Finish and submit.
-        // Pump a few times to reclaim this batch's share — whatever still arrives late rides on the next batch
-        // as the deferred error contract says (`WGPUDeferredErrorQueue`).
+        // Encoder errors are raised at Finish (in submit), and some callbacks only come out of
+        // wgpuInstanceProcessEvents. Pump a few times to reclaim this batch's share — whatever still arrives
+        // late rides on the next batch as the deferred error contract says (`WGPUDeferredErrorQueue`).
         for _ in 0..<3 { wgpuInstanceProcessEvents(instance) }
-        let drained = uncaptured.drain()
-        // The cascading echo of an invalid object ("[Invalid X] is invalid due to a previous error") is a
-        // downstream repeat of the root error. When the root is in the same reclamation, the echoes are filtered
-        // out — a scene overlay only shows the last error, so unfiltered the echo always hides the root (it really did in the stencil scene).
-        let roots = drained.filter { !$0.message.contains("is invalid due to a previous error") }
-        return roots.isEmpty ? drained : roots
+        return uncaptured.drain()
+    }
+
+    func drainImmediateDiagnostics() -> [WGPUError] {
+        // No pump — the uncaptured callback fires synchronously inside the failing wgpu* call, so this
+        // command's errors are already in the sink. Draining here is what lets a `push → create → pop` in
+        // one batch catch the creation error in its scope.
+        uncaptured.drain()
+    }
+
+    func isCascadingEcho(_ diagnostic: WGPUError) -> Bool {
+        // The cascading echo of an invalid object is a downstream repeat of the root error. The engine
+        // drops it from the batch result when the root is there too — a scene overlay only shows the
+        // last error, so unfiltered the echo always hides the root (it really did in the stencil scene).
+        diagnostic.message.contains("is invalid due to a previous error")
     }
 
     var hasPendingWork: Bool { commandEncoder != nil }
@@ -275,6 +286,7 @@ final class DawnBackend: WGPUBackend {
     }
 
     func unmapBuffer(_ buffer: DawnBufferObject) {
+        buffer.mapGeneration += 1   // a write mapping still pending is aborted — its callback is stale
         if buffer.dawnMapped {
             wgpuBufferUnmap(buffer.buffer)
             buffer.dawnMapped = false
@@ -378,6 +390,90 @@ final class DawnBackend: WGPUBackend {
         }
         callbackInfo.userdata1 = Unmanaged.passRetained(context).toOpaque()
         _ = wgpuBufferMapAsync(buffer, WGPUMapMode_Read, 0, mapSize, callbackInfo)
+    }
+
+    /// `mapAsync(GPUMapMode.WRITE)` — a real Dawn write mapping of the MAP_WRITE buffer itself. The
+    /// mapped range starts as the buffer's current contents (spec), which go to JS; the buffer **stays
+    /// mapped** until `unmapBuffer`, and `writeMappedBuffer` copies JS's bytes into it right before.
+    /// (`wgpuQueueWriteBuffer` cannot serve the write-back: a MAP_WRITE buffer has no COPY_DST usage.)
+    func mapBufferForWrite(
+        _ buffer: DawnBufferObject, offset: Int, length: Int,
+        deliver: @escaping (Result<Data, WGPUError>) -> Void
+    ) {
+        final class WriteMapContext {
+            let object: DawnBufferObject
+            let offset: Int
+            let length: Int
+            let generation: Int
+            let deliver: (Result<Data, WGPUError>) -> Void
+            init(object: DawnBufferObject, offset: Int, length: Int, generation: Int,
+                 deliver: @escaping (Result<Data, WGPUError>) -> Void) {
+                self.object = object
+                self.offset = offset
+                self.length = length
+                self.generation = generation
+                self.deliver = deliver
+            }
+        }
+        // Marked up front so an unmap while still pending also releases it (Dawn aborts the map).
+        buffer.dawnMapped = true
+        buffer.mapGeneration += 1
+        let context = WriteMapContext(
+            object: buffer, offset: offset, length: length,
+            generation: buffer.mapGeneration, deliver: deliver
+        )
+        var callbackInfo = WGPUBufferMapCallbackInfo()
+        callbackInfo.mode = WGPUCallbackMode_AllowProcessEvents
+        callbackInfo.callback = { status, message, userdata1, _ in
+            guard let userdata1 else { return }
+            let context = Unmanaged<WriteMapContext>.fromOpaque(userdata1).takeRetainedValue()
+            // A mapping `unmapBuffer` aborted may report after a newer one began — it must not touch
+            // the newer mapping's state (clearing `dawnMapped` would make its unmap skip the Dawn unmap).
+            let isCurrent = context.object.mapGeneration == context.generation
+            guard status == WGPUMapAsyncStatus_Success else {
+                if isCurrent { context.object.dawnMapped = false }
+                context.deliver(.failure(WGPUError.backend(
+                    "mapAsync(WRITE) failed — \(String(wgpu: message))"
+                )))
+                return
+            }
+            guard isCurrent else {
+                // Defensive: Dawn reports an unmapped pending map as Aborted, so this is not expected —
+                // but a stale success must not read the newer mapping's range either way.
+                context.deliver(.failure(WGPUError.backend("mapAsync(WRITE) was superseded by unmap()")))
+                return
+            }
+            guard context.length > 0 else {
+                context.deliver(.success(Data()))
+                return
+            }
+            guard let pointer = wgpuBufferGetMappedRange(
+                context.object.buffer, context.offset, context.length
+            ) else {
+                wgpuBufferUnmap(context.object.buffer)
+                context.object.dawnMapped = false
+                context.deliver(.failure(WGPUError.backend(
+                    "could not obtain the mapped range (offset \(context.offset), length \(context.length))"
+                )))
+                return
+            }
+            context.deliver(.success(Data(bytes: pointer, count: context.length)))
+        }
+        callbackInfo.userdata1 = Unmanaged.passRetained(context).toOpaque()
+        _ = wgpuBufferMapAsync(buffer.buffer, WGPUMapMode_Write, offset, length, callbackInfo)
+    }
+
+    func writeMappedBuffer(_ buffer: DawnBufferObject, offset: Int, data: Data) throws {
+        guard buffer.dawnMapped,
+              let mapped = wgpuBufferGetMappedRange(buffer.buffer, offset, data.count) else {
+            throw WGPUError.backend(
+                "the buffer is not mapped for writing at the Dawn level (offset \(offset), \(data.count)B)"
+            )
+        }
+        data.withUnsafeBytes { source in
+            guard let base = source.baseAddress else { return }
+            mapped.copyMemory(from: base, byteCount: data.count)
+        }
     }
 
     // MARK: - Textures
@@ -494,7 +590,7 @@ final class DawnBackend: WGPUBackend {
         guard let module else {
             throw WGPUError.backend("failed to create the GPUShaderModule")
         }
-        // Compilation diagnostics come out through the device scope (collectBatchDiagnostics) and getCompilationInfo.
+        // Compilation diagnostics come out through the uncaptured sink (drainImmediateDiagnostics) and getCompilationInfo.
         return WGPUShaderModuleCreation(module: DawnShaderModuleObject(module: module), failure: nil)
     }
 
@@ -960,7 +1056,23 @@ final class DawnBackend: WGPUBackend {
     func configureSurface(
         _ surface: DawnCanvas, configuration: LynxWebGPUCore.WGPUCanvasConfiguration
     ) throws {
-        try surface.configure(device: device, format: configuration.format)
+        // A usage the surface does not support (e.g. STORAGE_BINDING on the Metal-layer surface) would
+        // fail the native configure and with it every later acquire — it is dropped so the canvas keeps
+        // rendering, and reported as validation.
+        var usage = configuration.usage
+        var unsupported: LynxWebGPUCore.WGPUTextureUsage = []
+        if let layerCanvas = surface as? DawnLayerCanvas,
+           let supported = layerCanvas.supportedUsage(adapter: adapter) {
+            unsupported = usage.subtracting(supported)
+            usage.formIntersection(supported)
+        }
+        try surface.configure(device: device, format: configuration.format, usage: usage)
+        guard unsupported.isEmpty else {
+            throw WGPUError.validation(
+                "canvas '\(configuration.canvasId)': usage 0x\(String(unsupported.rawValue, radix: 16)) "
+                    + "is not supported by this surface and was dropped"
+            )
+        }
     }
 
     func resizeSurface(_ surface: DawnCanvas, size: CGSize) {

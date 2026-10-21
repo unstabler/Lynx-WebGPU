@@ -53,8 +53,37 @@ struct MSLEmitter {
     private var injectedGlobalNames: Set<String> = []
     /// Active shadowing renames (original name → emitted name). Saved and restored at block boundaries.
     private var localRenames: [String: String] = [:]
+    /// What each name declared in the current function (parameters and local declarations) refers to.
+    /// Saved and restored together with `localRenames`.
+    ///
+    /// Two jobs: a local that shadows a global is **not** that global, and a `let` holding `&place`
+    /// lets `(*p)[i]` find the bound of a runtime-sized array behind the pointer (`storagePlace(of:)`).
+    private var localBindings: [String: LocalBinding] = [:]
+
+    /// A place rooted at a module-scope variable — the variable itself, or one member of it.
+    /// The only shapes a runtime-sized array can live in (it may only be the store type or its last member).
+    private struct StoragePlace {
+        var global: String
+        var member: String?
+    }
+
+    private enum LocalBinding {
+        /// A value, or a pointer to something that is not a module-scope place (a local).
+        case value
+        /// A `let` pointer known to point at this place.
+        case pointer(StoragePlace)
+        /// A pointer **parameter** (or a `let` copied from one) — it points at whatever the caller chose,
+        /// so no bound can be found for it. Carries the pointee type to recognise a runtime-sized array behind it.
+        case parameterPointer(WGSLType)
+    }
     /// Name of the synthetic global masking writes after `discard`. Not created when the module has no `discard`.
-    private static let discardFlagName = "wgpu_discarded"
+    ///
+    /// It lives in the syntax tree next to the user's globals, so it carries the synthetic sigil — no
+    /// WGSL identifier can spell it, so a user global of the same MSL name cannot replace it in
+    /// `globalsByName` or the usage sets (`MSLTypeMapping.syntheticNameSigil`).
+    private static let discardFlagName = "\(MSLTypeMapping.syntheticNameSigil)discarded"
+    /// The flag's MSL name — the same mapping its declaration and threaded arguments go through.
+    private static let discardFlagMSLName = MSLTypeMapping.identifier(discardFlagName)
     /// Functions that must take that flag as an argument (empty turns the transformation off entirely).
     private let discardFlagUsers: Set<String>
     /// Names of storage address space globals — used to pick what to mask after `discard`.
@@ -90,7 +119,9 @@ struct MSLEmitter {
         self.bindings = bindings
         self.uniformStructs = WGSLLayout.uniformStructNames(module)
         self.usage = usage
-        self.globalsByName = Dictionary(uniqueKeysWithValues: module.globals.map { ($0.name, $0) })
+        // The parser rejects duplicate module-scope names, but this table must never be what traps on
+        // one — shader source comes from the bundle (JS), so a trap here would take the host down.
+        self.globalsByName = Dictionary(module.globals.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
         self.structNames = Set(module.structs.map(\.name))
         self.needsBufferSizes = WGSLReflectionBuilder.functionsNeedingBufferSizes(in: module)
         self.storageGlobalNames = Set(module.globals.filter { $0.addressSpace == "storage" }.map(\.name))
@@ -106,6 +137,14 @@ struct MSLEmitter {
         line("")
         output += MSLPrelude.source + "\n\n"
 
+        // Aliases come before the struct definitions (a struct member may be spelled with an alias),
+        // yet an alias may name a struct (`alias B = Buf;`). Forward declarations let `using B = Buf;`
+        // name a declared type; the definitions below complete it.
+        if !module.aliases.isEmpty {
+            for structure in module.structs {
+                line("struct \(MSLTypeMapping.identifier(structure.name));")
+            }
+        }
         for alias in module.aliases {
             line("using \(MSLTypeMapping.identifier(alias.name)) = \(try MSLTypeMapping.type(alias.type, module: module));")
         }
@@ -187,57 +226,137 @@ struct MSLEmitter {
     }
 
     /// `arrayLength(&buffer)` / `arrayLength(&buffer.member)` → a buffer size table lookup.
+    /// A `let` pointer to either works too (`let p = &buffer.member; arrayLength(p)`).
     ///
     /// A Metal shader cannot know a buffer's size. The runtime plugs a size table into the reserved
     /// index, and here we compute (bytes in the table − the array's start offset) ÷ element size.
     private func arrayLengthExpression(_ arguments: [WGSLExpression]) throws -> String {
-        var target = arguments.first ?? .identifier("")
-        if case .addressOf(let inner) = target { target = inner }
-
-        var globalName = ""
-        var memberName: String?
-        switch target {
-        case .identifier(let name):
-            globalName = name
-        case .member(.identifier(let name), let field):
-            globalName = name
-            memberName = field
-        default:
+        let argument = arguments.first ?? .identifier("")
+        guard let place = pointerTarget(of: argument) ?? storagePlace(of: argument) else {
             throw WGPUError.unsupported(
                 "WGSL: arrayLength() can only be used on a storage buffer variable (or a member of one)"
             )
         }
-
-        guard let global = globalsByName[globalName],
-              let group = global.group, let binding = global.binding,
-              let index = bindings.index(group: group, binding: binding) else {
-            throw WGPUError.validation("arrayLength(): '\(globalName)' is not a bound storage buffer")
-        }
-
-        var element: WGSLType
-        var offset = 0
-        if case .array(let inner, nil) = global.type, memberName == nil {
-            element = inner
-        } else if case .named(let structName) = global.type, let memberName,
-                  let structure = WGSLLayout.resolveStruct(structName, module: module) {
-            let placement = WGSLLayout.layout(
-                of: structure, module: module, uniform: uniformStructs.contains(structName)
-            )
-            guard let member = placement.members.first(where: { $0.name == memberName }),
-                  case .array(let inner, nil) = member.type else {
-                throw WGPUError.unsupported("WGSL: the target of arrayLength() is not a runtime-sized array")
-            }
-            element = inner
-            offset = member.offset
-        } else {
+        guard let count = try runtimeArrayElementCount(at: place) else {
             throw WGPUError.unsupported("WGSL: the target of arrayLength() is not a runtime-sized array")
         }
+        return count
+    }
 
+    /// The element count of the runtime-sized array at `place`, or nil when that place is not one.
+    ///
+    /// The bound size can be **smaller than the array's start offset** (nothing validates a binding
+    /// against the struct's fixed part). Subtracting in uint32 would then wrap round to ~4e9 and turn
+    /// every clamp built on this count into a no-op, so the subtraction saturates at 0.
+    private func runtimeArrayElementCount(at place: StoragePlace) throws -> String? {
+        guard let global = globalsByName[place.global] else { return nil }
+
+        let element: WGSLType
+        var offset = 0
+        switch (global.type, place.member) {
+        case (.array(let inner, nil), nil):
+            element = inner
+        case (.named(let typeName), let memberName?):
+            // Through `resolveStruct`, so `alias B = Buf; var<storage> b: B;` finds `Buf`'s members.
+            guard let structure = WGSLLayout.resolveStruct(typeName, module: module) else { return nil }
+            let placement = WGSLLayout.layout(
+                of: structure, module: module, uniform: uniformStructs.contains(structure.name)
+            )
+            guard let member = placement.members.first(where: { $0.name == memberName }),
+                  case .array(let inner, nil) = member.type else { return nil }
+            element = inner
+            offset = member.offset
+        default:
+            return nil
+        }
+
+        guard let group = global.group, let binding = global.binding,
+              let index = bindings.index(group: group, binding: binding) else {
+            throw WGPUError.validation("runtime-sized array '\(place.global)' is not a bound storage buffer")
+        }
         let elementType = try MSLTypeMapping.type(element, module: module)
-        let total = offset == 0
-            ? "\(Self.bufferSizesName)[\(index)]"
-            : "(\(Self.bufferSizesName)[\(index)] - \(offset)u)"
+        let size = "\(Self.bufferSizesName)[\(index)]"
+        let total = offset == 0 ? size : "(\(size) > \(offset)u ? \(size) - \(offset)u : 0u)"
         return "(\(total) / uint(sizeof(\(elementType))))"
+    }
+
+    /// The module-scope place an expression designates — `g`, `g.member`, and the same reached
+    /// **through a `let` pointer** (`*p`, `(*p).member`). nil when it is rooted in a local or is any
+    /// other shape; such a target is never given a bound, and the prelude refuses to index a runtime-sized
+    /// array without one (a compile error rather than an unchecked access).
+    private func storagePlace(of expression: WGSLExpression) -> StoragePlace? {
+        switch expression {
+        case .paren(let inner):
+            return storagePlace(of: inner)
+        case .identifier(let name):
+            guard localBindings[name] == nil, globalsByName[name] != nil else { return nil }
+            return StoragePlace(global: name, member: nil)
+        case .member(let base, let field):
+            guard let place = storagePlace(of: base), place.member == nil else { return nil }
+            return StoragePlace(global: place.global, member: field)
+        case .dereference(let pointer):
+            return pointerTarget(of: pointer)
+        default:
+            return nil
+        }
+    }
+
+    /// The place a pointer-valued expression points at — `&place`, or a `let` pointer holding one.
+    private func pointerTarget(of expression: WGSLExpression) -> StoragePlace? {
+        switch expression {
+        case .paren(let inner):
+            return pointerTarget(of: inner)
+        case .addressOf(let place):
+            return storagePlace(of: place)
+        case .identifier(let name):
+            guard case .pointer(let place)? = localBindings[name] else { return nil }
+            return place
+        default:
+            return nil
+        }
+    }
+
+    /// Function parameters are locals — a parameter shadowing a global is not that global. A pointer
+    /// parameter points at the caller's choice of place, so it is never resolved to one.
+    private static func parameterBindings(of function: WGSLFunction) -> [String: LocalBinding] {
+        Dictionary(function.parameters.map { parameter in
+            if case .pointer(_, let pointee, _) = parameter.type {
+                return (parameter.name, LocalBinding.parameterPointer(pointee))
+            }
+            return (parameter.name, LocalBinding.value)
+        }, uniquingKeysWith: { first, _ in first })
+    }
+
+    /// The pointee type of a pointer that leads back to a pointer **parameter** (`q`, `&(*q)`,
+    /// `&(*q).member`, or a `let` holding one of those). nil for anything else.
+    private func parameterPointee(of expression: WGSLExpression) -> WGSLType? {
+        switch expression {
+        case .paren(let inner):
+            return parameterPointee(of: inner)
+        case .identifier(let name):
+            guard case .parameterPointer(let pointee)? = localBindings[name] else { return nil }
+            return pointee
+        case .addressOf(let place):
+            return parameterPlaceType(of: place)
+        default:
+            return nil
+        }
+    }
+
+    /// The type of a place reached through a pointer parameter (`*q`, `(*q).member`). nil for anything else.
+    private func parameterPlaceType(of expression: WGSLExpression) -> WGSLType? {
+        switch expression {
+        case .paren(let inner):
+            return parameterPlaceType(of: inner)
+        case .dereference(let pointer):
+            return parameterPointee(of: pointer)
+        case .member(let base, let field):
+            guard case .named(let typeName)? = parameterPlaceType(of: base),
+                  let structure = WGSLLayout.resolveStruct(typeName, module: module) else { return nil }
+            return structure.members.first(where: { $0.name == field })?.type
+        default:
+            return nil
+        }
     }
 
     /// Guesses the type from the initializer's **syntax** alone (reading constructor names, not inferring types).
@@ -269,9 +388,10 @@ struct MSLEmitter {
                 return .vector(size: size, element: element)
             }
             if callee == "array" {
-                let element = typeArguments.first ?? arguments.first.flatMap(inferredType(of:))
-                guard let element else { return nil }
-                return .array(element: element, count: .intLiteral(String(arguments.count)))
+                return arrayConstructorType(typeArguments: typeArguments, argumentCount: arguments.count)
+                    ?? arguments.first.flatMap(inferredType(of:)).map {
+                        WGSLType.array(element: $0, count: .intLiteral(String(arguments.count)))
+                    }
             }
             return nil
         default:
@@ -298,8 +418,10 @@ struct MSLEmitter {
     /// Block scope boundary — keeps shadowing renames registered inside from leaking out of the block.
     private mutating func scoped(_ body: (inout MSLEmitter) throws -> Void) rethrows {
         let saved = localRenames
+        let savedBindings = localBindings
         try indented(body)
         localRenames = saved
+        localBindings = savedBindings
     }
 
     // MARK: - Structs (padded to the WGSL layout)
@@ -428,10 +550,12 @@ struct MSLEmitter {
             textureScope = previousScope
             injectedGlobalNames = []
             localRenames = [:]
+            localBindings = [:]
         }
         registerTextures(of: function)
         injectedGlobalNames = Set(threadedGlobals(for: function.name).map(\.name))
         localRenames = [:]
+        localBindings = Self.parameterBindings(of: function)
 
         var parameters = try function.parameters.map { parameter in
             "\(try MSLTypeMapping.type(parameter.type, module: module)) \(MSLTypeMapping.identifier(parameter.name))"
@@ -477,7 +601,9 @@ struct MSLEmitter {
         defer { textureScope = previousScope }
         registerTextures(of: function)
 
-        let innerName = "wgpu_\(function.name)_inner"
+        // Names derived from the entry point carry their own `wgpu_ep_` tag: a bare `wgpu_<entry>_…`
+        // could spell a renamed user identifier (`wgpu_id_…`) for an entry point named `id_…`.
+        let innerName = "wgpu_ep_\(function.name)_inner"
         let resources = threadedGlobals(for: function.name)
 
         // 1) The inner function keeping the original signature.
@@ -493,12 +619,14 @@ struct MSLEmitter {
         line("{")
         injectedGlobalNames = Set(resources.map(\.name))
         localRenames = [:]
+        localBindings = Self.parameterBindings(of: function)
         try indented { emitter in
             try emitter.statements(function.body)
         }
         // Wrapper emission is outside the injection scope — a leaked rename would make wgpu_out packing use the wrong name.
         injectedGlobalNames = []
         localRenames = [:]
+        localBindings = [:]
         line("}")
         line("")
 
@@ -519,7 +647,7 @@ struct MSLEmitter {
             }
         }
 
-        let inputStructName = "wgpu_\(function.name)_in"
+        let inputStructName = "wgpu_ep_\(function.name)_in"
         if !interface.stageInFields.isEmpty {
             line("struct \(inputStructName) {")
             indented { emitter in
@@ -529,7 +657,7 @@ struct MSLEmitter {
             line("")
         }
 
-        let outputStructName = "wgpu_\(function.name)_out"
+        let outputStructName = "wgpu_ep_\(function.name)_out"
         if !interface.outFields.isEmpty {
             line("struct \(outputStructName) {")
             indented { emitter in
@@ -572,9 +700,9 @@ struct MSLEmitter {
                 try emitter.emitLocalGlobal(global)
             }
             if stage == .compute, !workgroupGlobals.isEmpty {
-                try emitter.emitWorkgroupZeroInit(
-                    workgroupGlobals, threadsPerGroup: function.workgroupSize ?? (1, 1, 1)
-                )
+                // The module here has the pipeline constants applied — the same size the dispatch uses.
+                let threadsPerGroup = try emitter.module.workgroupSize(of: function) ?? (1, 1, 1)
+                try emitter.emitWorkgroupZeroInit(workgroupGlobals, threadsPerGroup: threadsPerGroup)
             }
             for statement in interface.prelude { emitter.line(statement) }
 
@@ -588,10 +716,10 @@ struct MSLEmitter {
             }
             if interface.outFields.isEmpty {
                 emitter.line("\(call);")
-                if discardTail { emitter.line("if (\(Self.discardFlagName)) { discard_fragment(); }") }
+                if discardTail { emitter.line("if (\(Self.discardFlagMSLName)) { discard_fragment(); }") }
             } else {
                 emitter.line("\(returnType) wgpu_result = \(call);")
-                if discardTail { emitter.line("if (\(Self.discardFlagName)) { discard_fragment(); }") }
+                if discardTail { emitter.line("if (\(Self.discardFlagMSLName)) { discard_fragment(); }") }
                 emitter.line("\(outputStructName) wgpu_out{};")
                 for statement in interface.packStatements { emitter.line(statement) }
                 emitter.line("return wgpu_out;")
@@ -611,7 +739,17 @@ struct MSLEmitter {
         _ globals: [WGSLGlobalVariable],
         threadsPerGroup: (Int, Int, Int)
     ) throws {
-        let total = max(threadsPerGroup.0 * threadsPerGroup.1 * threadsPerGroup.2, 1)
+        // `translateToMSL` does not apply the device limits, so the product is checked here: it must
+        // not overflow, and it is emitted as a `uint` literal.
+        let (partial, overflowXY) = threadsPerGroup.0.multipliedReportingOverflow(by: threadsPerGroup.1)
+        let (product, overflowXYZ) = partial.multipliedReportingOverflow(by: threadsPerGroup.2)
+        guard !overflowXY, !overflowXYZ, product <= Int(UInt32.max) else {
+            throw WGPUError.validation(
+                "@workgroup_size (\(threadsPerGroup.0), \(threadsPerGroup.1), \(threadsPerGroup.2)) — "
+                    + "the invocation count does not fit in u32"
+            )
+        }
+        let total = max(product, 1)
         let index = Self.localInvocationIndexName
         line("// WGSL guarantees zero-initialization of var<workgroup> (MSL threadgroup storage does not).")
         for global in globals {
@@ -779,7 +917,7 @@ struct MSLEmitter {
         case .letDeclaration, .constDeclaration, .varDeclaration, .assignment, .increment, .decrement:
             let text = try simpleStatement(statement)
             if masksAfterDiscard(statement) {
-                line("if (!\(Self.discardFlagName)) { \(text); }")
+                line("if (!\(Self.discardFlagMSLName)) { \(text); }")
             } else {
                 line("\(text);")
             }
@@ -787,33 +925,30 @@ struct MSLEmitter {
         case .expressionStatement(let expression):
             let text = try self.expression(expression)
             if masksAfterDiscard(statement) {
-                line("if (!\(Self.discardFlagName)) { \(text); }")
+                line("if (!\(Self.discardFlagMSLName)) { \(text); }")
             } else {
                 line("\(text);")
             }
 
-        case .ifStatement(let condition, let then, let elseBranch):
-            line("if (\(try expression(condition)))")
-            line("{")
-            try scoped { emitter in try emitter.statements(then) }
-            line("}")
-            switch elseBranch {
-            case .block(let statements)?:
+        case .ifStatement(let clauses, let elseBody):
+            // The chain stays flat in MSL too: `if … else if … else …`, one loop iteration per arm.
+            for (index, clause) in clauses.enumerated() {
+                line("\(index == 0 ? "if" : "else if") (\(try expression(clause.condition)))")
+                line("{")
+                try scoped { emitter in try emitter.statements(clause.body) }
+                line("}")
+            }
+            if let elseBody {
                 line("else")
                 line("{")
-                try scoped { emitter in try emitter.statements(statements) }
+                try scoped { emitter in try emitter.statements(elseBody) }
                 line("}")
-            case .chained(let nested)?:
-                // `else if` — attach the nested if after the else.
-                line("else")
-                try scoped { emitter in try emitter.emitStatement(nested) }
-            case nil:
-                break
             }
 
         case .forStatement(let initializer, let condition, let update, let body):
             // A header declaration's rename scopes over the condition, increment and body — undone when the for ends.
             let savedRenames = localRenames
+            let savedBindings = localBindings
             let initializerText = try initializer.map { try simpleStatement($0) } ?? ""
             let conditionText = try condition.map { try expression($0) } ?? ""
             let updateText = try update.map { try simpleStatement($0) } ?? ""
@@ -822,6 +957,7 @@ struct MSLEmitter {
             try scoped { emitter in try emitter.statements(body) }
             line("}")
             localRenames = savedRenames
+            localBindings = savedBindings
 
         case .whileStatement(let condition, let body):
             let conditionText = try expression(condition)
@@ -893,7 +1029,7 @@ struct MSLEmitter {
             if discardFlagUsers.isEmpty {
                 line("discard_fragment();")
             } else {
-                line("\(Self.discardFlagName) = true;")
+                line("\(Self.discardFlagMSLName) = true;")
             }
         }
     }
@@ -955,7 +1091,12 @@ struct MSLEmitter {
         case .letDeclaration(let name, let type, let value), .constDeclaration(let name, let type, let value):
             let typeText = try type.map { try MSLTypeMapping.type($0, module: module) } ?? "auto"
             let valueText = try expression(value)
-            return "const \(typeText) \(declaredName(name)) = \(valueText)"
+            // Resolved before the name is declared — the initializer sees the outer meaning of every name.
+            let target = pointerTarget(of: value)
+            let parameterTarget = target == nil ? parameterPointee(of: value) : nil
+            let declared = declaredName(name)
+            localBindings[name] = target.map(LocalBinding.pointer) ?? parameterTarget.map(LocalBinding.parameterPointer) ?? .value
+            return "const \(typeText) \(declared) = \(valueText)"
 
         case .varDeclaration(let name, let type, let value):
             guard let type else {
@@ -963,11 +1104,13 @@ struct MSLEmitter {
                     throw WGPUError.validation("WGSL: var '\(name)' has neither a type nor an initializer")
                 }
                 let valueText = try expression(value)
+                localBindings[name] = .value
                 return "auto \(declaredName(name)) = \(valueText)"
             }
             let typeText = try MSLTypeMapping.type(type, module: module)
-            guard let value else { return "\(typeText) \(declaredName(name)){}" }
-            let valueText = try expression(value)
+            let valueText = try value.map { try expression($0) }
+            localBindings[name] = .value
+            guard let valueText else { return "\(typeText) \(declaredName(name)){}" }
             return "\(typeText) \(declaredName(name)) = \(valueText)"
 
         case .assignment(let target, let op, let value):
@@ -1015,13 +1158,9 @@ struct MSLEmitter {
                 return true
             case .block(let inner), .whileStatement(_, let inner), .forStatement(_, _, _, let inner):
                 if containsContinue(inner) { return true }
-            case .ifStatement(_, let then, let elseBranch):
-                if containsContinue(then) { return true }
-                switch elseBranch {
-                case .block(let inner)?: if containsContinue(inner) { return true }
-                case .chained(let nested)?: if containsContinue([nested]) { return true }
-                case nil: break
-                }
+            case .ifStatement(let clauses, let elseBody):
+                for clause in clauses where containsContinue(clause.body) { return true }
+                if let elseBody, containsContinue(elseBody) { return true }
             case .switchStatement(_, let cases):
                 for switchCase in cases where containsContinue(switchCase.body) { return true }
             default:
@@ -1097,7 +1236,7 @@ struct MSLEmitter {
     /// A separate helper is needed, unlike reads, because of **vector components** — in MSL `v[i]`
     /// cannot bind to a reference (`non-const reference cannot bind to vector element`), so returning
     /// a clamped reference does not work. Finishing the assignment inside the helper covers arrays,
-    /// matrices and pointers under the same name.
+    /// matrices and vectors under the same name; a runtime-sized array takes `wgpu_store_n` instead.
     ///
     /// A compound assignment (`+=`) builds the read expression once more — the target is an identifier or member, so there is no side effect.
     private mutating func storeStatement(
@@ -1122,21 +1261,24 @@ struct MSLEmitter {
     /// The MSL expression for the element count, when this expression is a **runtime-sized array**.
     ///
     /// The same calculation as `arrayLength(&x)` — the buffer's byte count divided by the element size.
-    /// So the list of functions using the table (`needsBufferSizes`) counts this use as well.
+    /// So the list of functions using the table (`needsBufferSizes`) counts this use as well. A pointer
+    /// can only be formed from a global named in the same function, so that list already covers `(*p)[i]`.
+    ///
+    /// A runtime-sized array behind a **pointer parameter** has no findable bound (the caller picks the
+    /// buffer), so it is refused here with a WGSL-level message.
+    ///
+    /// nil sends the index down the plain `wgpu_at` path — where a runtime-sized array **does not compile**
+    /// (the prelude deletes the unbounded pointer overloads), so a shape missed here still fails loudly.
     private func runtimeArrayCount(of expression: WGSLExpression) throws -> String? {
-        switch expression {
-        case .identifier(let name):
-            guard let global = globalsByName[name], case .array(_, nil) = global.type else { return nil }
-            return try? arrayLengthExpression([.addressOf(.identifier(name))])
-        case .member(.identifier(let name), let field):
-            guard let global = globalsByName[name], case .named(let structName) = global.type,
-                  let structure = module.structNamed(structName),
-                  let member = structure.members.first(where: { $0.name == field }),
-                  case .array(_, nil) = member.type else { return nil }
-            return try? arrayLengthExpression([.addressOf(.member(.identifier(name), field))])
-        default:
+        guard let place = storagePlace(of: expression) else {
+            if case .array(_, nil)? = parameterPlaceType(of: expression) {
+                throw WGPUError.unsupported(
+                    "WGSL: indexing a runtime-sized array through a pointer parameter is not supported"
+                )
+            }
             return nil
         }
+        return try runtimeArrayElementCount(at: place)
     }
 
     /// The expression used as the target of a swizzle or index.
@@ -1180,9 +1322,11 @@ struct MSLEmitter {
         if let reason = MSLTypeMapping.unsupportedBuiltins[callee] {
             throw WGPUError.unsupported("WGSL: \(callee)() — \(reason)")
         }
+        // Before anything below picks arguments out by index.
+        try Self.checkArity(callee, count: arguments.count)
 
         if callee == "bitcast" {
-            guard let target = typeArguments.first, arguments.count == 1 else {
+            guard let target = typeArguments.first else {
                 throw WGPUError.validation("WGSL: the form must be bitcast<T>(x)")
             }
             return "as_type<\(try MSLTypeMapping.type(target, module: module))>(\(try expression(arguments[0])))"
@@ -1236,13 +1380,17 @@ struct MSLEmitter {
         }
         if callee == "array" {
             // With the element type omitted, guess it from the first argument's constructor name (`array(vec2f(…), …)`).
-            let element = typeArguments.first ?? arguments.first.flatMap(inferredType(of:))
-            guard let element, let elementType = try? MSLTypeMapping.type(element, module: module) else {
+            let arrayType = arrayConstructorType(typeArguments: typeArguments, argumentCount: emitted.count)
+                ?? arguments.first.flatMap(inferredType(of:)).map {
+                    WGSLType.array(element: $0, count: .intLiteral(String(emitted.count)))
+                }
+            guard let arrayType else {
                 throw WGPUError.unsupported(
                     "WGSL: cannot determine the element type of an array(…) constructor — spell it out as `array<T, N>(…)`"
                 )
             }
-            return "array<\(elementType), \(emitted.count)>{\(emitted.joined(separator: ", "))}"
+            // An empty brace list is value-initialization — the zero value `array<T, N>()` asks for.
+            return "\(try MSLTypeMapping.type(arrayType, module: module)){\(emitted.joined(separator: ", "))}"
         }
         // WGSL defines f32 → i32/u32 conversion as **saturating** (a C++ cast is UB out of range).
         // Only a single argument is a conversion; a constructor listing components already passed each argument through its own.
@@ -1263,8 +1411,32 @@ struct MSLEmitter {
             return "\(MSLTypeMapping.functionName(callee))(\((emitted + extra).joined(separator: ", ")))"
         }
 
-        let name = MSLTypeMapping.renamedBuiltins[callee] ?? callee
+        // Anything else passes through by name (builtins, alias constructors) — through `identifier(_:)`
+        // so it matches the declaration it refers to and cannot reach an internal `wgpu_` helper.
+        let name = MSLTypeMapping.renamedBuiltins[callee] ?? MSLTypeMapping.identifier(callee)
         return "\(name)(\(emitted.joined(separator: ", ")))"
+    }
+
+    /// Rejects a builtin in `MSLTypeMapping.builtinArities` called with the wrong argument count —
+    /// as a compile error, not an out-of-range trap in the lowering that indexes the arguments.
+    private static func checkArity(_ callee: String, count: Int) throws {
+        guard let arity = MSLTypeMapping.builtinArities[callee], !arity.contains(count) else { return }
+        let expected = arity.lowerBound == arity.upperBound
+            ? "\(arity.lowerBound)"
+            : "\(arity.lowerBound) to \(arity.upperBound)"
+        let noun = arity.upperBound == 1 ? "argument" : "arguments"
+        throw WGPUError.validation("WGSL: \(callee)() expects \(expected) \(noun), got \(count)")
+    }
+
+    /// The type an `array<T, N>(…)` / `array<T>(…)` constructor builds — the parser keeps the written
+    /// array type as the sole type argument. Its length is the declared one (the zero-argument form
+    /// has nothing else to go by); when there is none, or it cannot be computed here, the argument count.
+    private func arrayConstructorType(typeArguments: [WGSLType], argumentCount: Int) -> WGSLType? {
+        guard case .array(let element, let count)? = typeArguments.first else { return nil }
+        if let count, argumentCount == 0 || WGSLLayout.constantValue(count, module: module) != nil {
+            return .array(element: element, count: count)
+        }
+        return .array(element: element, count: .intLiteral(String(argumentCount)))
     }
 
     /// The saturating conversion helper name, when this is an integer-producing constructor (`i32`, `u32`, `vec3i`, `vec2<u32>`, …).
@@ -1335,6 +1507,17 @@ struct MSLEmitter {
             }
         }
 
+        /// The optional trailing `offset` (a const-expression `vec2<i32>` / `vec3<i32>`). Metal takes it
+        /// as the **last** argument, after any LOD option — dropping it silently samples the wrong texel.
+        /// WGSL allows it only on 2d, 2d_array and 3d textures (depth ones included), never on cubes.
+        func appendOffset(to parameters: inout [String]) throws {
+            guard !rest.isEmpty else { return }
+            guard rest.count == 1, ["2d", "2d_array", "3d"].contains(dimension) else {
+                throw WGPUError.validation("WGSL: too many arguments to \(callee)() for a \(dimension) texture")
+            }
+            parameters.append("\(dimension == "3d" ? "int3" : "int2")(\(rest.removeFirst()))")
+        }
+
         switch callee {
         case "textureSample", "textureSampleBias", "textureSampleLevel", "textureSampleGrad":
             guard rest.count >= 2 else {
@@ -1355,10 +1538,17 @@ struct MSLEmitter {
                 guard rest.count >= 2 else { throw WGPUError.validation("WGSL: textureSampleGrad has no derivatives") }
                 let dx = rest.removeFirst()
                 let dy = rest.removeFirst()
-                parameters.append("gradient2d(\(dx), \(dy))")
+                let gradient: String
+                switch dimension {
+                case "3d": gradient = "gradient3d"
+                case "cube", "cube_array": gradient = "gradientcube"
+                default: gradient = "gradient2d"
+                }
+                parameters.append("\(gradient)(\(dx), \(dy))")
             default:
                 break
             }
+            try appendOffset(to: &parameters)
             return "\(receiver).sample(\(parameters.joined(separator: ", ")))"
 
         case "textureSampleCompare", "textureSampleCompareLevel":
@@ -1370,6 +1560,10 @@ struct MSLEmitter {
             var parameters = [sampler, coordinates]
             if isArrayed, rest.count >= 2 { parameters.append(rest.removeFirst()) }
             parameters.append(rest.removeFirst())
+            // `…CompareLevel` samples mip level 0 — spelled out, because Metal's option-less overload
+            // takes an implicit LOD (fragment-only) and the offset must follow the LOD option.
+            if callee == "textureSampleCompareLevel" { parameters.append("level(0)") }
+            try appendOffset(to: &parameters)
             return "\(receiver).sample_compare(\(parameters.joined(separator: ", ")))"
 
         case "textureLoad":
@@ -1426,10 +1620,8 @@ struct MSLEmitter {
 
     private mutating func atomicCall(callee: String, arguments: [WGSLExpression]) throws -> String {
         let emitted = try arguments.map { try expression($0) }
+        // Argument counts were checked against `builtinArities` by `call`.
         if let operation = MSLTypeMapping.atomicFetchOperations[callee] {
-            guard emitted.count == 2 else {
-                throw WGPUError.validation("WGSL: the form must be \(callee)(&atomic, value)")
-            }
             return "\(operation)(\(emitted[0]), \(emitted[1]), memory_order_relaxed)"
         }
         switch callee {

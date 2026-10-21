@@ -123,8 +123,8 @@ A를 고르는 이유는 하나다: **커맨드 스트림이 이미 직렬화된
 >
 > Dawn이 채워야 할 자리는 이제 **`WGPUBackend`의 동사들**(핸들 해석·검증이 끝난 값을 받는
 > 좁은 함수들)로 닫혀 있고, 지켜야 할 계약은 `docs/COMMAND-STREAM.md`, 증명 수단은
-> `WebGPUConformance.run(on:)`(29검사), 실물은 `Projects/DawnCheck`의 `DawnBackend`
-> (`WGPUBackendEngine<DawnBackend>`로 조립 — 28/29)다. 런타임 수준(`WebGPURuntime`) 대체가
+> `WebGPUConformance.run(on:)`(31검사), 실물은 `Projects/DawnCheck`의 `DawnBackend`
+> (`WGPUBackendEngine<DawnBackend>`로 조립 — 30/31, +1 시뮬레이터 건너뜀)다. 런타임 수준(`WebGPURuntime`) 대체가
 > 필요하면 `Examples/ExternalRuntime`의 `StubRuntime`이 그 경계의 출발점이다.
 
 ### 1) `WebGPURuntime` 프로토콜 추출 · 소 · 위험 낮음

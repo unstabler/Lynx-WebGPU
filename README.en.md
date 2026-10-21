@@ -81,7 +81,7 @@ All docs except this file are written in Korean — they translate well with any
 | `LynxWebGPUCore` | WebGPU enums · descriptors · errors · handle registry + the **command-stream engine** (`WGPUBackendEngine` — decoding, validation, error scopes, frame lifetime) and the backend verb protocol (`WGPUBackend`). Metal-free |
 | `LynxWebGPUShader` | WGSL lexer/parser/reflection/MSL emitter (pure Swift) |
 | `LynxWebGPU` | The **Metal backend** (encoding) on top of the engine + canvas surfaces + the default runtime `LynxWebGPUContext` |
-| `LynxWebGPUConformance` | Runtime-agnostic **conformance suite** (29 checks) — judges, in pixels, whether a backend built outside this repo keeps the same contract ([docs/TESTING.md](docs/TESTING.md) §2-1) |
+| `LynxWebGPUConformance` | Runtime-agnostic **conformance suite** (31 checks) — judges, in pixels, whether a backend built outside this repo keeps the same contract ([docs/TESTING.md](docs/TESTING.md) §2-1) |
 | `LynxWebGPUBridge` | Lynx NativeModule + `<webgpu-canvas>` element (iOS only) — **sources, not an SPM target** |
 
 **This package has zero external dependencies.** There are three SPM products (`LynxWebGPU` the engine,
@@ -140,15 +140,16 @@ The measurement harness ships in the repo, so the numbers can be re-taken anytim
 
 ## Verification
 
-374 Swift + 133 JS tests run in seconds — no simulator, no device.
+486 Swift + 150 JS tests run in under half a minute — no simulator, no device.
 
 - Transpiler tests push the generated MSL through the **actual Metal compiler**.
 - Render tests draw into offscreen textures and **assert pixel values** (triangle, uniforms, indexed draw,
   alpha blending, compute + readback, texture sampling, edge-clamp sampling, depth testing).
   `rgba16float` surfaces are read back and checked that **values above 1.0 and below 0 survive** — the
   evidence that HDR results are never crushed to 8 bits.
-- Command stream contracts are asserted too — that `writeTexture` executes **after** an earlier render pass
-  in the same batch (queue order), that the staging pool stops growing across frames, that the in-flight
+- Command stream contracts are asserted too — that queue writes execute **after** an earlier submitted
+  render pass and **before** their own batch's encoder work (queue timeline — accepted even while a pass
+  is open), that the staging pool stops growing across frames, that the in-flight
   counter rises and falls with commit/completion.
 - Values the runtime slips into shaders behind the scenes (like `arrayLength()`) are read back from the GPU
   and **asserted as numbers**.
@@ -156,10 +157,10 @@ The measurement harness ships in the repo, so the numbers can be re-taken anytim
   emptying the source `NSDictionary` mid-batch changes nothing, and a payload arriving as an Objective-C
   tree still renders a frame (regression guard for the crash fixed in 0.5.2 —
   `docs/COMMAND-STREAM.md` §5-1-1).
-- **The conformance suite (`LynxWebGPUConformance`, 29 checks) survives a runtime swap** — it only uses the
+- **The conformance suite (`LynxWebGPUConformance`, 31 checks) survives a runtime swap** — it only uses the
   command stream, `readCanvasPixels`, `readBuffer` and `adapterInfo`, so a backend built outside this repo
-  proves itself with the same checks. Beyond the default Metal runtime at 29/29, a backend on top of real
-  Dawn passes the same suite 28/29 (+1 simulator skip) ([docs/TESTING.md](docs/TESTING.md) §2-1).
+  proves itself with the same checks. Beyond the default Metal runtime at 31/31, a backend on top of real
+  Dawn passes the same suite 30/31 (+1 simulator skip) ([docs/TESTING.md](docs/TESTING.md) §2-1).
   **Both backends also run the same suite on the iOS simulator** (schemes `WebGPUCheck` and `DawnCheck`) —
   `swift test` is macOS, a different driver and GPU family, and iOS is where this actually ships.
 - The JS shim is verified with node's built-in runner — binary-path types and bytes are asserted, and a mock

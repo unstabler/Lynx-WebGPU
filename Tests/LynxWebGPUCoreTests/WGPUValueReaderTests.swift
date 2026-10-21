@@ -7,7 +7,7 @@ final class WGPUValueReaderTests: XCTestCase {
         let reader = WGPUValueReader(["size": 128, "label": "vertices", "flag": true])
 
         XCTAssertEqual(try reader.requiredInt("size"), 128)
-        XCTAssertEqual(reader.int("missing", default: 7), 7)
+        XCTAssertEqual(try reader.int("missing", default: 7), 7)
         XCTAssertEqual(try reader.requiredString("label"), "vertices")
         XCTAssertTrue(reader.bool("flag", default: false))
         XCTAssertFalse(reader.bool("missing", default: false))
@@ -100,5 +100,78 @@ final class WGPUValueReaderTests: XCTestCase {
         XCTAssertThrowsError(try entries?[1].requiredInt("binding")) { error in
             XCTAssertEqual((error as? WGPUError)?.path, "cmd.entries[1].binding")
         }
+    }
+
+    // MARK: - Integer range (WebIDL [EnforceRange])
+
+    /// What a JS number can be that `Int(Double)` traps on (or `NSNumber.intValue` saturates/wraps).
+    private static let unusableIntegers: [Double] = [.nan, .infinity, -.infinity, 1e20, -1e20]
+
+    private func assertValidation(
+        _ expression: @autoclosure () throws -> Any?, path: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertThrowsError(try expression(), file: file, line: line) { error in
+            guard let error = error as? WGPUError else {
+                return XCTFail("not a WGPUError: \(error)", file: file, line: line)
+            }
+            XCTAssertEqual(error.kind, .validation, file: file, line: line)
+            XCTAssertEqual(error.path, path, file: file, line: line)
+        }
+    }
+
+    func test_integersRejectNonFiniteAndUnsafeValuesWithTheElementPath() {
+        for bad in Self.unusableIntegers {
+            let reader = WGPUValueReader(["offsets": [256, bad]], path: "commands[2]")
+            assertValidation(try reader.integers("offsets"), path: "commands[2].offsets[1]")
+            assertValidation(try reader.handles("offsets"), path: "commands[2].offsets[1]")
+        }
+    }
+
+    func test_everyIntegerAccessorRejectsNonFiniteAndUnsafeValues() {
+        for bad in Self.unusableIntegers {
+            let scalar = WGPUValueReader(["v": bad], path: "cmd")
+            assertValidation(try scalar.requiredInt("v"), path: "cmd.v")
+            assertValidation(try scalar.int("v", default: 0), path: "cmd.v")
+            assertValidation(try scalar.optionalInt("v"), path: "cmd.v")
+            assertValidation(try scalar.requiredHandle("v"), path: "cmd.v")
+            assertValidation(try scalar.optionalHandle("v"), path: "cmd.v")
+            assertValidation(try scalar.flags("v", WGPUBufferUsage.self, default: []), path: "cmd.v")
+            assertValidation(try scalar.requiredFlags("v", WGPUBufferUsage.self), path: "cmd.v")
+
+            let objectForms = WGPUValueReader(["size": ["width": 4, "height": bad], "origin": ["z": bad]], path: "cmd")
+            assertValidation(try objectForms.requiredExtent("size"), path: "cmd.size.height")
+            assertValidation(try objectForms.extent("size"), path: "cmd.size.height")
+            assertValidation(try objectForms.origin("origin"), path: "cmd.origin.z")
+
+            let arrayForms = WGPUValueReader(["size": [4, 4, bad], "origin": [bad], "data": [1, bad]], path: "cmd")
+            assertValidation(try arrayForms.requiredExtent("size"), path: "cmd.size[2]")
+            assertValidation(try arrayForms.extent("size"), path: "cmd.size[2]")
+            assertValidation(try arrayForms.origin("origin"), path: "cmd.origin[0]")
+            assertValidation(try arrayForms.requiredData("data"), path: "cmd.data[1]")
+        }
+    }
+
+    func test_integerReadsTruncateWithinTheSafeIntegerRange() throws {
+        let max = Double(WGPUValueReader.maxSafeInteger)
+        let reader = WGPUValueReader([
+            "max": max, "min": -max, "over": max + 1, "under": -max - 1,
+            "fraction": 1.9, "negativeFraction": -1.9, "flag": true,
+            "int64": NSNumber(value: Int64.max), "text": "12",
+        ])
+
+        XCTAssertEqual(try reader.requiredInt("max"), WGPUValueReader.maxSafeInteger)
+        XCTAssertEqual(try reader.requiredInt("min"), -WGPUValueReader.maxSafeInteger)
+        assertValidation(try reader.requiredInt("over"), path: "over")
+        assertValidation(try reader.requiredInt("under"), path: "under")
+        assertValidation(try reader.requiredInt("int64"), path: "int64")
+        // [EnforceRange] truncates toward zero — the same result `intValue` gave before.
+        XCTAssertEqual(try reader.requiredInt("fraction"), 1)
+        XCTAssertEqual(try reader.requiredInt("negativeFraction"), -1)
+        XCTAssertEqual(try reader.requiredInt("flag"), 1)
+        // A non-number is still "absent" for the defaulted accessors (unchanged tolerance).
+        XCTAssertEqual(try reader.int("text", default: 7), 7)
+        XCTAssertNil(try reader.optionalInt("text"))
+        XCTAssertNil(try reader.extent("missing"))
     }
 }

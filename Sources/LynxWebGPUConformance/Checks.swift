@@ -44,6 +44,7 @@ public extension WebGPUConformance {
             indirectDrawEquivalence,
             errorAccumulation,
             errorScopeCapture,
+            errorScopeAttribution,
             handleTypeMismatch,
             adapterLimitsSpelling,
             canvasInfoReporting,
@@ -52,6 +53,7 @@ public extension WebGPUConformance {
             presentExpiresFrame,
             emptyPresentClosesFrame,
             readBufferContract,
+            mapWriteContract,
             resizeCanvasReflects,
             shaderCompilationInfoShape,
             mslOptional,
@@ -599,6 +601,48 @@ public extension WebGPUConformance {
             guard let captured = scopes[0] as? [String: Any],
                   (captured["kind"] as? String) == "validation" else {
                 throw ConformanceFailure("the scope did not catch the validation error — \(scopes[0])")
+            }
+        }
+    }
+
+    /// An error is filed with the scopes **open when its command ran**, not those open at batch end.
+    ///
+    /// `push → create → pop` in one batch is exactly what the shim's `createRenderPipelineAsync`
+    /// sends. A runtime collecting its validator's errors only at batch end (after the pop already
+    /// resolved) resolves the scope clean — the promise hands out an invalid pipeline — and leaks the
+    /// error to `uncapturederror`. The same failing creation after the pop must land in `errors`.
+    /// The error is one every validator raises at creation (a missing entry point), so it judges a
+    /// native validator (Dawn) and the engine's (Metal) alike.
+    static var errorScopeAttribution: Check {
+        Check("error-scope-attribution") { harness in
+            let badPipeline: (Int) -> [String: Any] = { id in
+                ["op": "createRenderPipeline", "id": id, "layout": "auto",
+                 "vertex": ["module": 1, "entryPoint": "vs_main"],
+                 "fragment": ["module": 1, "entryPoint": "no_such_entry_point",
+                              "targets": [["format": "rgba8unorm"]]]]
+            }
+            let result = harness.execute([
+                ["op": "createShaderModule", "id": 1, "code": WebGPUConformance.fullscreenShader],
+                ["op": "pushErrorScope", "filter": "validation"],
+                badPipeline(2),
+                ["op": "popErrorScope"],
+                // Same failure, no scope open — must reach the batch result.
+                badPipeline(3),
+            ])
+            guard let scopes = result["errorScopes"] as? [Any], scopes.count == 1 else {
+                throw ConformanceFailure("errorScopes was \(result["errorScopes"] ?? "absent") — expected 1")
+            }
+            guard let captured = scopes[0] as? [String: Any],
+                  (captured["kind"] as? String) == "validation" else {
+                throw ConformanceFailure(
+                    "the scope around the creation resolved without its error (\(scopes[0])) — errors: "
+                        + ConformanceHarness.describeErrors(result)
+                )
+            }
+            guard (result["ok"] as? Bool) == false,
+                  let errors = result["errors"] as? [[String: Any]],
+                  errors.contains(where: { ($0["kind"] as? String) == "validation" }) else {
+                throw ConformanceFailure("the unscoped creation's error did not reach the batch result")
             }
         }
     }

@@ -12,6 +12,10 @@ struct WGSLParser {
     /// Depth of expression parsing inside a generic argument (the length expression of `array<f32, 64>`).
     /// Above zero, `>` is read as **closing a template** rather than as a comparison.
     private var templateDepth = 0
+    /// How deeply types, expressions and statements are nested at the current token. Every one of
+    /// those is parsed recursively, so untrusted source (`((((…))))` or `array<array<…>>` a few
+    /// hundred thousand deep) would otherwise overflow the stack — `enterNesting()` caps it.
+    private var nestingDepth = 0
 
     /// Names whose `<` must be read as opening a generic.
     private static let templateNames: Set<String> = [
@@ -38,7 +42,10 @@ struct WGSLParser {
 
     static func parse(_ source: String) throws -> WGSLModule {
         var parser = WGSLParser(tokens: try WGSLLexer.tokenize(source))
-        return try parser.parseModule()
+        var module = try parser.parseModule()
+        try module.resolveIntegerAttributes()
+        try module.validateWorkgroupSizes()
+        return module
     }
 
     private init(tokens: [WGSLToken]) {
@@ -98,12 +105,25 @@ struct WGSLParser {
         }
     }
 
-    private func error(_ message: String) -> WGPUError {
+    /// The deepest nesting of types, expressions and statements a module may use — Tint's parser
+    /// limit. Real shaders stay far below it; past it parsing fails instead of exhausting the stack.
+    static let maximumNestingDepth = 128
+
+    /// Called on entry to every recursive production; pair it with `defer { nestingDepth -= 1 }`.
+    private mutating func enterNesting() throws {
+        nestingDepth += 1
+        guard nestingDepth <= Self.maximumNestingDepth else {
+            throw error("nesting is deeper than \(Self.maximumNestingDepth) levels")
+        }
+    }
+
+    private func error(_ message: String, line: Int? = nil) -> WGPUError {
         // Carry the line number **as a number too** — this is the value `getCompilationInfo()` hands the editor.
-        WGPUError(
+        let line = line ?? current.line
+        return WGPUError(
             kind: .validation,
-            message: "WGSL parse failed (line \(current.line)): \(message)",
-            line: current.line
+            message: "WGSL parse failed (line \(line)): \(message)",
+            line: line
         )
     }
 
@@ -111,29 +131,41 @@ struct WGSLParser {
 
     private mutating func parseModule() throws -> WGSLModule {
         var module = WGSLModule()
+        // Module-scope name → the line it was first declared on.
+        var declaredLines: [String: Int] = [:]
         while !isAtEnd {
             if match(";") { continue }
             let attributes = try parseAttributes()
+            let declarationLine = current.line
 
             if check("struct") {
                 advance()
-                module.structs.append(try parseStruct())
+                let structure = try parseStruct()
+                try declare(structure.name, line: declarationLine, in: &declaredLines)
+                module.structs.append(structure)
             } else if check("fn") {
                 advance()
-                module.functions.append(try parseFunction(attributes: attributes))
+                let function = try parseFunction(attributes: attributes)
+                try declare(function.name, line: declarationLine, in: &declaredLines)
+                module.functions.append(function)
             } else if check("var") {
                 advance()
-                module.globals.append(try parseGlobalVariable(attributes: attributes))
+                let global = try parseGlobalVariable(attributes: attributes)
+                try declare(global.name, line: declarationLine, in: &declaredLines)
+                module.globals.append(global)
             } else if check("const") || check("override") {
                 let isOverride = current.text == "override"
                 advance()
-                module.constants.append(try parseModuleConstant(isOverride: isOverride))
+                let constant = try parseModuleConstant(isOverride: isOverride)
+                try declare(constant.name, line: declarationLine, in: &declaredLines)
+                module.constants.append(constant)
             } else if check("alias") || check("type") {
                 advance()
                 let name = try expectIdentifier("alias name")
                 try expect("=", "alias")
                 let type = try parseType()
                 try expect(";", "alias")
+                try declare(name, line: declarationLine, in: &declaredLines)
                 module.aliases.append((name, type))
             } else if check("const_assert") {
                 // A compile-time assertion is not translated — skip to the semicolon.
@@ -148,33 +180,139 @@ struct WGSLParser {
                 throw error("token '\(current.text)' cannot appear at module scope")
             }
         }
+        // Every module-scope name is in `declaredLines` once (redeclarations were rejected above),
+        // so the type checks can point back at a struct or alias by name.
+        try Self.validateTypeDeclarations(module, lines: declaredLines)
         return module
+    }
+
+    /// Registers a module-scope name — **structs, aliases, functions, variables, constants and overrides
+    /// share one namespace** in WGSL, so a second declaration of any kind is a shader-creation error
+    /// (Tint rejects it the same way). Letting it through would leave two declarations that every
+    /// name-keyed table downstream (reflection, resource threading, emission) silently picks between.
+    private func declare(_ name: String, line: Int, in declaredLines: inout [String: Int]) throws {
+        if let first = declaredLines[name] {
+            throw error(
+                "redeclaration of '\(name)' (first declared on line \(first)) — module-scope "
+                    + "structs, aliases, functions, variables, constants and overrides share one namespace",
+                line: line
+            )
+        }
+        declaredLines[name] = line
+    }
+
+    // MARK: - Type declaration checks
+
+    /// The deepest composite type nesting a module may declare (Tint's limit — the WGSL spec only
+    /// guarantees 15). It also bounds every recursive walk over a type (layout, emission).
+    static let maximumCompositeNesting = 255
+
+    /// Rejects what the grammar cannot: **recursive types** and over-deep composite nesting.
+    ///
+    /// WGSL forbids a type that contains itself — directly (`struct S { a: S }`), through an array
+    /// (`array<S, 2>`), through an alias or through another struct — because it would have infinite
+    /// size. The layout calculator and the struct emitter walk these graphs recursively, so a cycle
+    /// that got past here would recurse until the stack overflowed. Checked once at module creation,
+    /// with the declaration's line, so nothing downstream ever sees one. The depth limit does the same
+    /// for long acyclic chains (`S1 { a: S0 }`, `S2 { a: S1 }`, …) an untrusted bundle can declare.
+    private static func validateTypeDeclarations(_ module: WGSLModule, lines: [String: Int]) throws {
+        var depths: [String: Int] = [:]
+        // Declarations currently being walked — meeting one again is a cycle.
+        var path: [String] = []
+
+        func failure(_ name: String, _ message: String) -> WGPUError {
+            let line = lines[name] ?? 0
+            return WGPUError(kind: .validation, message: "WGSL validation failed (line \(line)): \(message)", line: line)
+        }
+
+        func nesting(ofDeclaration name: String) throws -> Int {
+            if let known = depths[name] { return known }
+            if let start = path.firstIndex(of: name) {
+                let cycle = (path[start...] + [name]).joined(separator: " → ")
+                throw failure(name, "recursive type '\(name)' (\(cycle)) — WGSL types cannot contain themselves")
+            }
+            guard path.count < maximumCompositeNesting else {
+                throw failure(name, "type declarations nest more than \(maximumCompositeNesting) levels deep")
+            }
+            path.append(name)
+            defer { path.removeLast() }
+
+            let depth: Int
+            if let structure = module.structNamed(name) {
+                depth = 1 + (try structure.members.map { try nesting(of: $0.type) }.max() ?? 0)
+            } else if let alias = module.aliases.first(where: { $0.name == name }) {
+                depth = try nesting(of: alias.type)
+            } else {
+                depth = 0   // not a declared type — undefined names are left to later stages
+            }
+            guard depth <= maximumCompositeNesting else {
+                throw failure(name, "'\(name)' nests composite types \(depth) levels deep (limit \(maximumCompositeNesting))")
+            }
+            depths[name] = depth
+            return depth
+        }
+
+        func nesting(of type: WGSLType) throws -> Int {
+            switch type {
+            case .vector: return 1
+            case .matrix: return 2
+            case .array(let element, _): return 1 + (try nesting(of: element))
+            case .named(let name): return try nesting(ofDeclaration: name)
+            // Scalars, atomics and handle/pointer types do not embed another type's storage.
+            default: return 0
+            }
+        }
+
+        for structure in module.structs { _ = try nesting(ofDeclaration: structure.name) }
+        for alias in module.aliases { _ = try nesting(ofDeclaration: alias.name) }
     }
 
     private mutating func parseAttributes() throws -> [WGSLAttribute] {
         var attributes: [WGSLAttribute] = []
         while check("@") {
             advance()
+            let line = current.line
             let name = try expectIdentifier("attribute name")
             var arguments: [String] = []
+            var expressions: [WGSLExpression?] = []
             if match("(") {
                 repeat {
                     if check(")") { break }
-                    var text = ""
-                    var depth = 0
-                    while !isAtEnd {
-                        if depth == 0, check(",") || check(")") { break }
-                        if check("(") { depth += 1 }
-                        if check(")") { depth -= 1 }
-                        text += advance().text
-                    }
-                    arguments.append(text)
+                    let argument = parseAttributeArgument()
+                    arguments.append(argument.text)
+                    expressions.append(argument.expression)
                 } while match(",")
                 try expect(")", "attribute arguments")
             }
-            attributes.append(WGSLAttribute(name: name, arguments: arguments))
+            attributes.append(WGSLAttribute(name: name, arguments: arguments, expressions: expressions, line: line))
         }
         return attributes
+    }
+
+    /// One attribute argument — as an expression when it parses as one (`0x10`, `BASE + 1`), and as
+    /// source text always. An argument that is not an expression is kept as text only, so an attribute
+    /// this parser has no grammar for still passes as it did.
+    private mutating func parseAttributeArgument() -> (text: String, expression: WGSLExpression?) {
+        let start = index
+        // `expectGenericClose` rewrites tokens in place, so the text and a rollback read the originals.
+        let original = tokens
+        let originalTemplateDepth = templateDepth
+        if let expression = try? parseExpression(), check(",") || check(")") {
+            return (original[start..<index].map(\.text).joined(), expression)
+        }
+        index = start
+        tokens = original
+        templateDepth = originalTemplateDepth
+
+        var text = ""
+        var depth = 0
+        while !isAtEnd {
+            if depth == 0, check(",") || check(")") { break }
+            if check("(") { depth += 1 }
+            if check(")") { depth -= 1 }
+            text += advance().text
+        }
+        return (text, nil)
     }
 
     private mutating func parseStruct() throws -> WGSLStruct {
@@ -266,6 +404,8 @@ struct WGSLParser {
     // MARK: - Types
 
     private mutating func parseType() throws -> WGSLType {
+        try enterNesting()
+        defer { nestingDepth -= 1 }
         let name = try expectIdentifier("type name")
 
         switch name {
@@ -401,6 +541,8 @@ struct WGSLParser {
     }
 
     private mutating func parseStatement() throws -> WGSLStatement {
+        try enterNesting()
+        defer { nestingDepth -= 1 }
         // Attributes on a statement (@diagnostic and the like) do not affect translation.
         _ = try parseAttributes()
 
@@ -495,19 +637,20 @@ struct WGSLParser {
         return try parseAssignmentOrCall()
     }
 
+    /// The `else if` arms are read in a loop (as Tint does) — a chain's length is not nesting, so it
+    /// neither recurses nor counts toward `maximumNestingDepth`.
     private mutating func parseIfStatement() throws -> WGSLStatement {
-        let condition = try parseExpression()
-        let thenBranch = try parseBlock()
-        var elseBranch: WGSLElseBranch?
-        if match("else") {
-            if check("if") {
-                advance()
-                elseBranch = .chained(try parseIfStatement())
-            } else {
-                elseBranch = .block(try parseBlock())
+        var clauses = [WGSLIfClause(condition: try parseExpression(), body: try parseBlock())]
+        var elseBody: [WGSLStatement]?
+        while match("else") {
+            guard check("if") else {
+                elseBody = try parseBlock()
+                break
             }
+            advance()
+            clauses.append(WGSLIfClause(condition: try parseExpression(), body: try parseBlock()))
         }
-        return .ifStatement(condition: condition, then: thenBranch, elseBranch: elseBranch)
+        return .ifStatement(clauses: clauses, elseBody: elseBody)
     }
 
     private mutating func parseForStatement() throws -> WGSLStatement {
@@ -614,32 +757,49 @@ struct WGSLParser {
     ]
 
     mutating func parseExpression() throws -> WGSLExpression {
-        try parseBinary(level: 0)
+        try enterNesting()
+        defer { nestingDepth -= 1 }
+        return try parseBinary(minimumLevel: 0)
     }
 
-    private mutating func parseBinary(level: Int) throws -> WGSLExpression {
-        guard level < Self.precedence.count else { return try parseUnary() }
-        var left = try parseBinary(level: level + 1)
-        while Self.precedence[level].contains(current.text), current.kind == .punctuation,
-              !(templateDepth > 0 && Self.templateClosers.contains(current.text)) {
+    /// Precedence climbing — one call per operand instead of one per precedence level, so a nested
+    /// parenthesis costs a handful of stack frames rather than a dozen (the depth limit has to fit a
+    /// 512 KB thread stack). Operators of one level associate left.
+    private mutating func parseBinary(minimumLevel: Int) throws -> WGSLExpression {
+        var left = try parseUnary()
+        while let level = binaryOperatorLevel(), level >= minimumLevel {
             let op = advance().text
-            let right = try parseBinary(level: level + 1)
+            let right = try parseBinary(minimumLevel: level + 1)
             left = .binary(op: op, left, right)
         }
         return left
     }
 
+    /// The precedence level of the binary operator at the current token, if it is one here.
+    private func binaryOperatorLevel() -> Int? {
+        guard current.kind == .punctuation,
+              !(templateDepth > 0 && Self.templateClosers.contains(current.text)) else { return nil }
+        return Self.precedence.firstIndex { $0.contains(current.text) }
+    }
+
     private mutating func parseUnary() throws -> WGSLExpression {
+        // A prefix operator recurses without passing through parseExpression (`- - - … x`), so it counts too.
         if check("-") || check("!") || check("~") {
             let op = advance().text
+            try enterNesting()
+            defer { nestingDepth -= 1 }
             return .unary(op: op, try parseUnary())
         }
         if check("&") {
             advance()
+            try enterNesting()
+            defer { nestingDepth -= 1 }
             return .addressOf(try parseUnary())
         }
         if check("*") {
             advance()
+            try enterNesting()
+            defer { nestingDepth -= 1 }
             return .dereference(try parseUnary())
         }
         return try parsePostfix()
@@ -681,10 +841,10 @@ struct WGSLParser {
             if name == "array" {
                 // The second argument of `array<f32, 3>(…)` is a length expression, not a type.
                 // The type parser already knows that shape, so we rewind to the name token and reuse it.
+                // The **whole array type** is kept: the zero-value form `array<u32, 4>()` has no
+                // arguments to count, so the length lives only here.
                 index -= 1
-                if case .array(let element, _) = try parseType() {
-                    typeArguments = [element]
-                }
+                typeArguments = [try parseType()]
             } else {
                 advance()
                 repeat {

@@ -7,18 +7,24 @@ import Foundation
 /// An attribute such as `@vertex`, `@group(0)` or `@location(2)`.
 struct WGSLAttribute: Equatable {
     var name: String
+    /// Each argument's source text (tokens joined) — what name-like arguments (`@builtin(position)`) are read from.
     var arguments: [String]
-
-    var firstInt: Int? { arguments.first.flatMap { Int($0.filter(\.isNumber)) } }
+    /// Each argument parsed as an expression — nil where it does not parse as one.
+    /// Integer arguments are evaluated from these (`WGSLConstantEvaluator`), never from the text.
+    var expressions: [WGSLExpression?] = []
+    var line: Int = 0
+    /// The value of an integer const-expression attribute (`@group` `@binding` `@location` `@align`
+    /// `@size`), settled by `WGSLModule.resolveIntegerAttributes()` once the module is parsed.
+    var integerValue: Int?
 }
 
 extension Array where Element == WGSLAttribute {
     func first(named name: String) -> WGSLAttribute? { first { $0.name == name } }
     func has(_ name: String) -> Bool { contains { $0.name == name } }
-    var location: Int? { first(named: "location")?.firstInt }
+    var location: Int? { first(named: "location")?.integerValue }
     var builtin: String? { first(named: "builtin")?.arguments.first }
-    var group: Int? { first(named: "group")?.firstInt }
-    var binding: Int? { first(named: "binding")?.firstInt }
+    var group: Int? { first(named: "group")?.integerValue }
+    var binding: Int? { first(named: "binding")?.integerValue }
 }
 
 indirect enum WGSLType: Equatable {
@@ -85,7 +91,10 @@ indirect enum WGSLStatement: Equatable {
     case assignment(target: WGSLExpression, op: String, value: WGSLExpression)
     case increment(WGSLExpression)
     case decrement(WGSLExpression)
-    case ifStatement(condition: WGSLExpression, then: [WGSLStatement], elseBranch: WGSLElseBranch?)
+    /// `if c0 { … } else if c1 { … } … else { … }` — the whole chain is **one** statement with a flat
+    /// clause list, so a machine-generated chain of any length is parsed, walked and emitted by loops
+    /// rather than one recursion per `else if`.
+    case ifStatement(clauses: [WGSLIfClause], elseBody: [WGSLStatement]?)
     case forStatement(
         initializer: WGSLStatement?,
         condition: WGSLExpression?,
@@ -104,9 +113,10 @@ indirect enum WGSLStatement: Equatable {
     case block([WGSLStatement])
 }
 
-indirect enum WGSLElseBranch: Equatable {
-    case block([WGSLStatement])
-    case chained(WGSLStatement)
+/// One `if` / `else if` arm of an `ifStatement`.
+struct WGSLIfClause: Equatable {
+    var condition: WGSLExpression
+    var body: [WGSLStatement]
 }
 
 struct WGSLSwitchCase: Equatable {
@@ -171,12 +181,6 @@ struct WGSLFunction: Equatable {
         if attributes.has("fragment") { return .fragment }
         if attributes.has("compute") { return .compute }
         return nil
-    }
-
-    var workgroupSize: (Int, Int, Int)? {
-        guard let attribute = attributes.first(named: "workgroup_size") else { return nil }
-        let values = attribute.arguments.map { Int($0) ?? 1 }
-        return (values.count > 0 ? values[0] : 1, values.count > 1 ? values[1] : 1, values.count > 2 ? values[2] : 1)
     }
 }
 

@@ -143,4 +143,118 @@ final class WGPUCommandDecodeTests: XCTestCase {
         XCTAssertEqual(command.commands.count, 1)
         XCTAssertEqual(try WGPUCommand(from: command.commands[0]).opName, "draw")
     }
+
+    /// `pass.setBindGroup(0, bg, [Infinity])` used to reach `Int(Double.infinity)` — a runtime trap
+    /// that `try?` cannot catch, so one bad JS number killed the host process.
+    func test_setBindGroupWithAnUnusableDynamicOffsetIsAValidationError() throws {
+        for bad in [Double.infinity, -.infinity, .nan, 1e20, -1e20] {
+            let commands = try WGPUValueReader(["commands": [[
+                "op": "setBindGroup", "index": 0, "bindGroup": 1, "dynamicOffsets": [0, bad],
+            ]]]).requiredObjects("commands")
+            XCTAssertThrowsError(try WGPUCommand(from: commands[0]), "\(bad)") { error in
+                guard let error = error as? WGPUError else { return XCTFail("not a WGPUError") }
+                XCTAssertEqual(error.kind, .validation)
+                XCTAssertEqual(error.path, "commands[0].dynamicOffsets[1]")
+            }
+        }
+
+        // Absent still means "no dynamic offsets" — the shim omits the field when there are none.
+        let plain = try WGPUCommand(from: WGPUValueReader(["op": "setBindGroup", "index": 0, "bindGroup": 1]))
+        guard case .setBindGroup(let command) = plain else { return XCTFail("not the setBindGroup case") }
+        XCTAssertEqual(command.dynamicOffsets, [])
+    }
+
+    func test_unusableIntegersInOtherOpsAreValidationErrors() {
+        let cases: [(payload: [String: Any], path: String)] = [
+            (["op": "executeBundles", "bundles": [Double.infinity]], "bundles[0]"),
+            (["op": "createPipelineLayout", "id": 1, "bindGroupLayouts": [Double.nan]], "bindGroupLayouts[0]"),
+            (["op": "draw", "vertexCount": 3, "instanceCount": 1e20], "instanceCount"),
+            (["op": "dispatchWorkgroups", "x": Double.nan], "x"),
+            (["op": "setVertexBuffer", "slot": 0, "buffer": 1, "offset": -Double.infinity], "offset"),
+        ]
+        for (payload, path) in cases {
+            XCTAssertThrowsError(try WGPUCommand(from: WGPUValueReader(payload)), "\(payload)") { error in
+                XCTAssertEqual((error as? WGPUError)?.kind, .validation)
+                XCTAssertEqual((error as? WGPUError)?.path, path)
+            }
+        }
+    }
+
+    // MARK: - dispatchWorkgroups counts
+
+    private func dispatch(_ fields: [String: Any]) throws -> WGPUDispatchWorkgroupsCommand {
+        var payload = fields
+        payload["op"] = "dispatchWorkgroups"
+        guard case .dispatchWorkgroups(let command) = try WGPUCommand(from: WGPUValueReader(payload)) else {
+            throw WGPUError.validation("not the dispatchWorkgroups case")
+        }
+        return command
+    }
+
+    func test_aZeroWorkgroupCountIsKeptNotRaisedToOne() throws {
+        // `dispatchWorkgroups(Math.ceil(n / 64))` with n = 0 must dispatch nothing — raising it ran the shader once.
+        let cases: [([String: Any], [Int])] = [
+            (["x": 0, "y": 1, "z": 1], [0, 1, 1]),
+            (["x": 4, "y": 0, "z": 2], [4, 0, 2]),
+            (["x": 4, "y": 3, "z": 0], [4, 3, 0]),
+        ]
+        for (fields, expected) in cases {
+            let command = try dispatch(fields)
+            XCTAssertEqual([command.x, command.y, command.z], expected)
+            XCTAssertTrue(command.isEmpty, "\(fields)")
+        }
+        XCTAssertFalse(try dispatch(["x": 1, "y": 1, "z": 1]).isEmpty)
+    }
+
+    func test_anOmittedWorkgroupCountDefaultsToOne() throws {
+        let command = try dispatch(["x": 5])
+        XCTAssertEqual([command.x, command.y, command.z], [5, 1, 1])
+        XCTAssertFalse(command.isEmpty)
+    }
+
+    func test_aNegativeWorkgroupCountIsAValidationErrorWithItsPath() throws {
+        for key in ["x", "y", "z"] {
+            var fields: [String: Any] = ["x": 1, "y": 1, "z": 1]
+            fields[key] = -1
+            XCTAssertThrowsError(try dispatch(fields)) { error in
+                guard let error = error as? WGPUError else { return XCTFail("not a WGPUError") }
+                XCTAssertEqual(error.kind, .validation)
+                XCTAssertEqual(error.path, key)
+            }
+        }
+    }
+
+    /// A read mapping's unmap carries only the handle — no data means "nothing to write back".
+    func test_unmapBufferWithoutDataHasNoWriteBack() throws {
+        let decoded = try WGPUCommand(from: WGPUValueReader(["op": "unmapBuffer", "buffer": 4]))
+        guard case .unmapBuffer(let command) = decoded else {
+            return XCTFail("not the unmapBuffer case: \(decoded.opName)")
+        }
+        XCTAssertEqual(command.buffer, WGPUHandle(4))
+        XCTAssertNil(command.offset)
+        XCTAssertNil(command.data)
+    }
+
+    /// A write mapping's unmap carries its bytes back (`mapAsync(GPUMapMode.WRITE)` — the JS mapping is a
+    /// copy). `data` arrives as an `ArrayBuffer` (`Data`) from the shim; base64 and byte arrays decode too.
+    func test_unmapBufferDecodesAWriteMappingsOffsetAndData() throws {
+        for data in [Data([1, 2, 3, 4]), "AQIDBA==", [1, 2, 3, 4]] as [Any] {
+            let decoded = try WGPUCommand(from: WGPUValueReader([
+                "op": "unmapBuffer", "buffer": 4, "offset": 16, "data": data,
+            ]))
+            guard case .unmapBuffer(let command) = decoded else {
+                return XCTFail("not the unmapBuffer case: \(decoded.opName)")
+            }
+            XCTAssertEqual(command.offset, 16)
+            XCTAssertEqual(command.data, Data([1, 2, 3, 4]), "\(type(of: data))")
+        }
+    }
+
+    func test_unmapBufferRejectsUndecodableData() {
+        XCTAssertThrowsError(try WGPUCommand(from: WGPUValueReader([
+            "op": "unmapBuffer", "buffer": 4, "data": "not base64!",
+        ]))) { error in
+            XCTAssertEqual((error as? WGPUError)?.kind, .validation)
+        }
+    }
 }

@@ -245,6 +245,20 @@ public final class WGPUComputePipelineObject {
         let entry = try module.resolveEntryPoint(descriptor.entryPoint, stage: .compute)
         self.needsBufferSizes = module.wgsl?.usesArrayLength(entryPoints: [entry]) ?? false
 
+        // MSL has no workgroup size declaration. WGSL's `@workgroup_size` is evaluated with this
+        // pipeline's constants and used as threadsPerThreadgroup at dispatch — checked against the
+        // limits `adapterInfo()` advertises, before anything is compiled. (An MSL module declares none.)
+        let deviceLimit = device.maxThreadsPerThreadgroup
+        let size = try module.wgsl?.workgroupSize(
+            of: entry,
+            constants: descriptor.constants,
+            limits: WGSLWorkgroupLimits(
+                maxSizeX: deviceLimit.width, maxSizeY: deviceLimit.height,
+                maxSizeZ: deviceLimit.depth, maxInvocations: deviceLimit.width
+            )
+        ) ?? (x: 1, y: 1, z: 1)
+        threadsPerThreadgroup = MTLSize(width: size.x, height: size.y, depth: size.z)
+
         let library = try module.library(
             entryPoints: [entry],
             bindings: layout.assignment,
@@ -255,16 +269,21 @@ public final class WGPUComputePipelineObject {
         guard let function = library.makeFunction(name: name) else {
             throw WGPUError.validation("could not find compute entry point '\(entry)'")
         }
+        let pipelineState: MTLComputePipelineState
         do {
-            state = try device.makeComputePipelineState(function: function)
+            pipelineState = try device.makeComputePipelineState(function: function)
         } catch {
             throw WGPUError.backend("compute pipeline creation failed: \(error.localizedDescription)")
         }
-
-        // MSL has no workgroup size declaration. WGSL's `@workgroup_size` is taken from reflection and
-        // used as threadsPerThreadgroup at dispatch.
-        let size = module.wgsl?.workgroupSize(of: entry) ?? (x: 1, y: 1, z: 1)
-        threadsPerThreadgroup = MTLSize(width: size.x, height: size.y, depth: size.z)
+        // A kernel's own cap can sit below the device's (register pressure). Dispatching past it is a
+        // Metal assertion, so it is refused here instead.
+        guard size.x * size.y * size.z <= pipelineState.maxTotalThreadsPerThreadgroup else {
+            throw WGPUError.backend(
+                "compute pipeline creation failed: @workgroup_size (\(size.x), \(size.y), \(size.z)) exceeds "
+                    + "this kernel's maxTotalThreadsPerThreadgroup (\(pipelineState.maxTotalThreadsPerThreadgroup))"
+            )
+        }
+        state = pipelineState
     }
 }
 
@@ -287,7 +306,9 @@ enum WGPUPipelineLayoutResolver {
             for (groupIndex, entries) in wgsl.autoBindGroupLayouts(entryPoints: stage.entryPoints).enumerated() {
                 for entry in entries {
                     if let existing = merged[groupIndex]?[entry.binding] {
-                        guard existing.layout == entry.layout else {
+                        // Two modules may size the same buffer differently — the spec keeps the larger
+                        // `minBindingSize`, so only the rest of the entry has to match.
+                        guard let layout = Self.mergedLayout(existing.layout, entry.layout) else {
                             throw WGPUError.validation(
                                 "the resource kind of @group(\(groupIndex)) @binding(\(entry.binding)) differs between stages"
                             )
@@ -295,7 +316,7 @@ enum WGPUPipelineLayoutResolver {
                         merged[groupIndex, default: [:]][entry.binding] = WGPUBindGroupLayoutEntry(
                             binding: entry.binding,
                             visibility: existing.visibility.union(entry.visibility),
-                            layout: entry.layout
+                            layout: layout
                         )
                     } else {
                         merged[groupIndex, default: [:]][entry.binding] = entry
@@ -308,5 +329,14 @@ enum WGPUPipelineLayoutResolver {
         return (0...maximumGroup).map { index in
             WGPUBindGroupLayoutObject(entries: Array(merged[index]?.values ?? [:].values))
         }
+    }
+
+    /// The entry two stages' declarations of one binding merge into, or nil when they disagree.
+    private static func mergedLayout(_ a: WGPUBindingLayout, _ b: WGPUBindingLayout) -> WGPUBindingLayout? {
+        guard case .buffer(var first) = a, case .buffer(var second) = b else { return a == b ? a : nil }
+        let minimum = max(first.minBindingSize, second.minBindingSize)
+        first.minBindingSize = minimum
+        second.minBindingSize = minimum
+        return first == second ? .buffer(first) : nil
     }
 }

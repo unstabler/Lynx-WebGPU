@@ -41,22 +41,39 @@ final class ConformanceTests: XCTestCase {
 
     /// The suite **resets the runtime between checks** — objects left by one check would make the next
     /// one's verdict depend on chance.
+    ///
+    /// The probe has to **pass while the handle is alive** — otherwise it fails either way and proves
+    /// nothing (a mistyped handle and a missing one are both errors). A writeBuffer into a COPY_DST
+    /// buffer does: it passes exactly while 777 exists, and fails with "does not exist" once it is gone.
     func test_runtimeStateIsResetForEveryCheck() throws {
         try XCTSkipIf(MTLCreateSystemDefaultDevice() == nil, "no Metal device")
         let runtime = try LynxWebGPUContext()
+        let probe: [[String: Any]] = [
+            ["op": "writeBuffer", "buffer": 777, "data": [Float]([1, 2, 3, 4]).base64],
+        ]
 
-        runtime.execute(commands: [
-            ["op": "createBuffer", "id": 777, "size": 16, "usage": 0x0040],
+        let created = runtime.execute(commands: [
+            ["op": "createBuffer", "id": 777, "size": 16, "usage": WebGPUUsage.copyDst],
         ])
-        XCTAssertGreaterThan(runtime.liveObjectCount, 0)
+        XCTAssertEqual(created["ok"] as? Bool, true, ConformanceHarness.describeErrors(created))
+
+        // Positive control — the probe sees a live 777. Without it, the failure below would not mean "reset".
+        let alive = runtime.execute(commands: probe)
+        XCTAssertEqual(
+            alive["ok"] as? Bool, true,
+            "the probe must pass while 777 is alive: \(ConformanceHarness.describeErrors(alive))"
+        )
 
         _ = WebGPUConformance.run(on: runtime, only: ["clear-color"])
 
         // If handle 777 is still alive after the suite has run, the reset did not happen.
-        let result = runtime.execute(commands: [
-            ["op": "beginRenderPass", "colorAttachments": [["view": 777]]],
-        ])
-        XCTAssertEqual(result["ok"] as? Bool, false, "a handle from an earlier batch survived the suite")
+        let reset = runtime.execute(commands: probe)
+        XCTAssertEqual(reset["ok"] as? Bool, false, "a handle from an earlier batch survived the suite")
+        let messages = (reset["errors"] as? [[String: Any]] ?? []).compactMap { $0["message"] as? String }
+        XCTAssertTrue(
+            messages.contains { $0.contains("GPUBuffer #777 does not exist") },
+            "the probe must fail because 777 is gone, not for another reason: \(messages)"
+        )
     }
 
     /// **Does the suite actually filter?**
@@ -130,6 +147,31 @@ final class ConformanceTests: XCTestCase {
         stuck.forcedReadiness = false
         let readyOutcomes = WebGPUConformance.run(on: stuck, only: ["frame-readiness"])
         XCTAssertEqual(readyOutcomes.first?.status, .failed, "the readiness signal was false and it still passed")
+
+        // (8) a runtime filing its errors only at batch end — after the in-batch pop already resolved,
+        // so the scope comes back clean and the error lands in `errors` (what Dawn did before
+        // per-command draining).
+        let late = MisbehavingRuntime(runtime, corrupt: Self.attributeAtBatchEnd)
+        let attributionOutcomes = WebGPUConformance.run(on: late, only: ["error-scope-attribution"])
+        XCTAssertEqual(attributionOutcomes.first?.status, .failed, "scope errors leaked out and it still passed")
+    }
+
+    /// Rewrites a batch result as if every error had been collected after the batch's last pop:
+    /// each popped scope resolves clean and what it caught moves to `errors`.
+    static func attributeAtBatchEnd(_ result: [String: Any]) -> [String: Any] {
+        guard let scopes = result["errorScopes"] as? [Any] else { return result }
+        var broken = result
+        var errors = result["errors"] as? [[String: Any]] ?? []
+        broken["errorScopes"] = scopes.map { scope -> Any in
+            guard let captured = scope as? [String: Any], captured["rejected"] == nil else { return scope }
+            errors.append(captured)
+            return NSNull()
+        }
+        if !errors.isEmpty {
+            broken["errors"] = errors
+            broken["ok"] = false
+        }
+        return broken
     }
 }
 

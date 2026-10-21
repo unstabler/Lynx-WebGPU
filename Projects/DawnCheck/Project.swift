@@ -38,7 +38,7 @@ let project = Project(
         configurations: [.debug(name: "Debug"), .release(name: "Release")]
     ),
     targets: [
-        // Offscreen conformance verification (29 checks — docs/TESTING.md §2-1).
+        // Offscreen conformance verification (31 checks — docs/TESTING.md §2-1).
         .target(
             name: "DawnCheckTests",
             destinations: .iOS,

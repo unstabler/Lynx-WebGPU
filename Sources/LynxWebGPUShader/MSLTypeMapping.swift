@@ -43,8 +43,14 @@ enum MSLTypeMapping {
                     "WGSL: a runtime-sized array (array<T>) can only be used in a storage buffer binding"
                 )
             }
-            guard let length = WGSLLayout.constantValue(count, module: module) else {
-                throw WGPUError.unsupported("WGSL: the array length cannot be computed at compile time")
+            let length: Int
+            do {
+                length = try WGSLLayout.arrayLength(count, module: module)
+            } catch let failure as WGSLConstantEvaluator.Failure {
+                throw WGPUError.unsupported("WGSL: the array length cannot be computed at compile time — \(failure.reason)")
+            }
+            guard length > 0 else {
+                throw WGPUError.validation("WGSL: an array length must be positive — got \(length)")
             }
             return "array<\(try self.type(element, module: module)), \(length)>"
         case .atomic(let element):
@@ -145,6 +151,15 @@ enum MSLTypeMapping {
         "goto", "do", "typeid", "and", "or", "not", "xor", "compl", "bitand", "bitor",
         // MSL scalar/vector type names
         "half", "uchar", "ushort", "size_t", "ptrdiff_t",
+        // Names declared in the `metal` namespace — sampler options and sampling-coordinate structs.
+        // The prelude's `using namespace metal;` makes a module-scope `constant int bias` ambiguous
+        // with `metal::bias` at every use ("reference to 'bias' is ambiguous"). A function-local name
+        // hides the namespace instead, but the rename is applied to every kind alike — the mapping must
+        // stay one-to-one. WGSL builtin functions (`min`, `length`, …) are deliberately **not** here:
+        // calls to builtins pass through `identifier(_:)` too and must keep their MSL spelling.
+        "bias", "level", "gradient2d", "gradient3d", "gradientcube", "min_lod_clamp", "component",
+        "coord", "address", "filter", "mag_filter", "min_filter", "mip_filter", "compare_func",
+        "border_color", "lod_clamp", "mesh", "fast", "precise", "quad", "simd",
     ]
 
     /// Names unusable as function names (`main` is not a C++ keyword but Metal rejects it).
@@ -159,10 +174,28 @@ enum MSLTypeMapping {
         return identifier(name)
     }
 
+    /// The namespace of names the emitter generates itself (prelude helpers, `wgpu_in`/`wgpu_out`,
+    /// padding members, loop guards, …). A user identifier spelled with this prefix is moved out of it
+    /// by `identifier(_:)` — otherwise a shader could redeclare (or call into) an internal name.
+    static let internalPrefix = "wgpu_"
+
+    /// Sigil marking a name the **emitter itself** puts into the syntax tree (the `discard` flag
+    /// global). The WGSL lexer never produces `$` in an identifier, so such a name cannot meet a user
+    /// declaration in any name-keyed table; `identifier(_:)` maps it into the internal namespace.
+    static let syntheticNameSigil: Character = "$"
+
     /// Renames a variable, parameter, struct or member to a name that is safe in MSL.
     /// **The declaration and every use must go through the same function** or the names diverge.
+    ///
+    /// The mapping is injective and keeps user names out of the internal namespace:
+    /// - MSL reserved words and user names starting with `wgpu_` → `wgpu_id_<name>`
+    ///   (no generated name starts with `wgpu_id_`);
+    /// - synthetic names (`$x`) → `wgpu_x`;
+    /// - everything else is unchanged (and therefore never starts with `wgpu_`).
     static func identifier(_ name: String) -> String {
-        reservedIdentifiers.contains(name) ? "wgpu_id_\(name)" : name
+        if name.first == syntheticNameSigil { return internalPrefix + name.dropFirst() }
+        if reservedIdentifiers.contains(name) || name.hasPrefix(internalPrefix) { return "wgpu_id_\(name)" }
+        return name
     }
 
     // MARK: - Builtin functions
@@ -218,6 +251,44 @@ enum MSLTypeMapping {
         "frexp": "the return struct cannot be translated",
         "workgroupUniformLoad": "not supported",
     ]
+
+    /// Argument counts (inclusive, per the WGSL spec) of the builtins the emitter lowers **by position**.
+    ///
+    /// Those lowerings pick arguments out by index, so a short call (`atomicLoad()`) would index past
+    /// the end and trap the host process. Shader source comes from the bundle, so a wrong count must
+    /// fail like any other invalid WGSL — `MSLEmitter` checks this table before dispatching. Builtins
+    /// passed through by name (`select`, `pack4x8unorm`, …) never index, and the Metal compiler
+    /// rejects their counts.
+    static let builtinArities: [String: ClosedRange<Int>] = {
+        var arities: [String: ClosedRange<Int>] = [
+            "bitcast": 1...1,
+            "arrayLength": 1...1,
+            "quantizeToF16": 1...1,
+            "workgroupBarrier": 0...0,
+            "storageBarrier": 0...0,
+            "atomicLoad": 1...1,
+            "atomicStore": 2...2,
+            "atomicExchange": 2...2,
+            // (t, s, coords, [array_index], …, [offset])
+            "textureSample": 3...5,
+            "textureSampleBias": 4...6,
+            "textureSampleLevel": 4...6,
+            "textureSampleGrad": 5...7,
+            "textureSampleCompare": 4...6,
+            "textureSampleCompareLevel": 4...6,
+            "textureSampleBaseClampToEdge": 3...3,
+            // (t, coords, [array_index], [level | sample_index])
+            "textureLoad": 2...4,
+            // (t, coords, [array_index], value)
+            "textureStore": 3...4,
+            "textureDimensions": 1...2,
+            "textureNumLayers": 1...1,
+            "textureNumLevels": 1...1,
+            "textureNumSamples": 1...1,
+        ]
+        for name in atomicFetchOperations.keys { arities[name] = 2...2 }
+        return arities
+    }()
 
     /// WGSL `@builtin(x)` → the MSL attribute and type.
     static func builtin(_ name: String, stage: WGSLStage, isInput: Bool) throws -> (attribute: String, type: String) {

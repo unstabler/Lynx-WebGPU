@@ -74,6 +74,7 @@ Three.js의 지연 파이프라인 생성이 정확히 이 모양이었다.
 타임아웃·디바이스 제거 — Dawn이라면 uncaptured error)는 배치가 결과를 돌려준 뒤에야 도착하고
 따로 콜백 통로가 없다. 런타임은 모아 두었다가 **다음 `execute` 응답의 `errors`**로 흘려보낸다
 (열린 오류 스코프가 있으면 그쪽이 먼저 잡는다). Swift 쪽 자리는 `WGPUDeferredErrorQueue`(Core)다.
+이렇게 다음 배치로 넘어온 실패는 **그 배치의 첫 명령 전에** 기록된다 — 그때 열려 있는 스코프가 잡는다.
 
 응답 키의 철자와 생략 규칙은 `WGPUBatchResult`(Core)가 조립한다 — 백엔드가 이 모양을 손으로
 다시 만들면 철자 하나로 어긋난다. 적합성 검사 `error-accumulation`이 판정하는 것이 이 모양이다.
@@ -107,6 +108,7 @@ shim의 `snapshotValue`가 기록 시점에 깊은 복사를 한다. 브라우�
 | 열거형 | **명세 철자 문자열 그대로** (`"rgba8unorm"`, `"triangle-list"`) |
 | 바이너리 (`data`) | `ArrayBuffer` / base64 문자열 / 바이트 배열 |
 | 핸들 | 정수. `null`/누락은 "없음" |
+| 정수 필드 전반 (오프셋·크기·개수·핸들·플래그·배열 원소) | WebIDL `[EnforceRange]`처럼 읽는다 — NaN·±Infinity는 거부, 소수는 0 쪽으로 버림, ±(2^53 − 1)(`Number.MAX_SAFE_INTEGER`) 밖은 거부. 거부는 필드 경로가 붙은 `validation` 오류다 (`WGPUValueReader.enforceRange` 한 곳) |
 
 `null`은 **누락과 같게** 다룬다 (`WGPUValueReader`가 `NSNull`을 없는 값으로 본다). 단
 `colorFormats` 배열 안의 `null`은 "이 슬롯에는 어태치먼트가 없다"는 뜻으로 보존된다.
@@ -119,6 +121,26 @@ shim의 `snapshotValue`가 기록 시점에 깊은 복사를 한다. 브라우�
   (명세의 "Reset the render pass binding state"). 뷰포트·시저·블렌드 상수·스텐실 참조는 남는다.
 - 드로우/디스패치 전에 파이프라인 레이아웃이 요구하는 바인드 그룹과 정점 버퍼가 **전부**
   바인드되어 있어야 한다.
+
+### 3-5. 큐 작업의 순서
+
+스트림에는 인코더도 `submit`도 없다. 대신 **배치 하나 = 큐 작업들 + 배치 끝의 제출 하나**로 본다
+— shim이 정확히 그 모양으로 보낸다: 큐 작업(`writeBuffer`·`writeTexture`·
+`copyExternalImageToTexture`)은 호출 시점에 스트림에 실리고, 인코더 명령(패스·복사·resolve)은
+`queue.submit()`이 배치 끝에 붙인 뒤 곧바로 flush한다.
+
+- 큐 작업은 **패스가 열려 있어도 받는다.** 명세상 `GPUQueue` 호출은 언제든 합법이다 — 거부하면
+  `queue.writeBuffer(u); pass.setBindGroup(…); pass.draw()` 루프를 직접 스트림으로 옮긴 코드가
+  깨진다. (인코더 복사는 여전히 패스 밖에서만 된다.)
+- 큐 작업의 효과는 **그 배치의 인코더 명령보다 먼저**, 큐 작업끼리는 **호출 순서대로** 적용된다.
+  명세의 큐 타임라인 그대로다 — `writeBuffer` **전에** 기록했어도 **뒤에** 제출된 드로우는 새 값을
+  본다. 패스 도중의 쓰기도, 같은 배치에서 패스 **뒤에** 실린 쓰기도 그 패스보다 먼저 적용된다.
+- 앞선 배치(이미 제출된 작업) **뒤에** 적용된다 — 실행 중인 GPU 작업과 경쟁하지 않는다.
+
+백엔드 쪽 자리는 `WGPUBackend.writeBuffer`의 계약이다. Dawn은 `wgpuQueueWriteBuffer`/
+`wgpuQueueWriteTexture`가 원래 큐 타임라인이고 배치의 인코더는 배치 끝에 한 번 제출된다.
+Metal은 배치의 큐 쓰기를 **별도 커맨드 버퍼**(스테이징 + blit)에 모아 배치의 커맨드 버퍼보다
+먼저 커밋한다 — 한 큐에서는 커밋 순서가 실행 순서다.
 
 ---
 
@@ -167,6 +189,12 @@ shim의 `snapshotValue`가 기록 시점에 깊은 복사를 한다. 브라우�
 **`entries[]` (바인드 그룹)** — `binding` · `resource:{…}`, 안에 셋 중 하나:
 `{buffer, offset?, size?}` · `{sampler}` · `{textureView}`.
 
+`minBindingSize`는 엔진이 검사한다 (네이티브 검증 백엔드면 백엔드가): 바인드 그룹 생성 시 바인딩된 범위 ≥
+`minBindingSize`, 명시적 레이아웃 파이프라인 생성 시 0이 아닌 `minBindingSize` ≥ 셰이더 최소 크기, 그리고
+`minBindingSize: 0` 항목은 draw/dispatch 때 셰이더 최소 크기와 비교한다. 셰이더 최소 크기는 백엔드가
+`WGPURenderPipelineInfo`/`WGPUComputePipelineInfo.minimumBindingSizes`(그룹 → 바인딩 → 바이트)로 넘긴다 —
+nil이면 그 검사는 백엔드 몫이다. `getBindGroupLayout`이 돌려주는 자동 레이아웃은 이 값을 `minBindingSize`에 싣는다.
+
 **`vertex`** — `module` · `entryPoint`(생략 시 그 스테이지의 유일한 진입점) · `buffers[]` · `constants{}`.
 `buffers[]` 항목은 `arrayStride` · `stepMode`(`"vertex"`) · `attributes[{format, offset(0), shaderLocation}]`.
 
@@ -186,10 +214,13 @@ shim의 `snapshotValue`가 기록 시점에 깊은 복사를 한다. 브라우�
 | `writeBuffer` | `buffer` · `data` · `bufferOffset`(0). 대상은 `COPY_DST`여야 하고 offset·크기는 **4의 배수**여야 한다 |
 | `writeTexture` | `texture` · `data` · `mipLevel`(0) · `origin` · `size`(extent) · `bytesPerRow`(포맷에서 유도) · `rowsPerImage`(블록 행 수) |
 | `copyExternalImageToTexture` | `source:{source(ImageBitmap 핸들), origin?, flipY?}` · `destination:{texture, mipLevel?, origin?}` · `copySize`(생략 시 이미지의 남은 전부) |
-| `unmapBuffer` | `buffer` — `mapAsync` 상태를 푼다 |
+| `unmapBuffer` | `buffer` · `offset`(매핑 시작) · `data` — `mapAsync` 상태를 푼다. **쓰기 매핑**(`mapAsync(GPUMapMode.WRITE)`·네이티브 `mappedAtCreation`)이면 `data`가 그 매핑의 바이트이고 **버퍼 오프셋** `offset`에 써진 뒤 매핑이 풀린다 (JS 매핑은 사본이라 이게 없으면 쓴 내용이 사라진다). `data`는 매핑 구간 안이어야 하고 offset은 8의 배수·크기는 4의 배수 — 읽기 매핑이나 매핑 안 된 버퍼에 `data`를 실으면 거부된다 (`COPY_DST` 없이 쓰는 뒷문이 되므로). 명세의 `unmap`은 실패하지 않으므로 **write-back이 거부돼도 매핑은 풀린다** |
 
 `bytesPerRow`·`rowsPerImage`는 **블록 단위**다 (명세 `GPUTexelCopyBufferLayout`). 비압축
 포맷은 블록이 1×1이라 픽셀 행과 같다.
+
+`writeBuffer`·`writeTexture`·`copyExternalImageToTexture`는 패스가 열려 있어도 받고, 그 배치의
+인코더 명령보다 먼저 적용된다 (§3-5).
 
 ### 4-4. 복사
 
@@ -223,15 +254,15 @@ Metal은 둘 다 느슨해서, 안 막으면 브라우저·Dawn에서만 거부�
 |---|---|
 | `beginRenderPass` | `colorAttachments[]` · `depthStencilAttachment` · `occlusionQuerySet` · `timestampWrites` · `label` |
 | `setPipeline` | `pipeline` (렌더/컴퓨트 공용 — 열린 패스가 어느 쪽인지 정한다) |
-| `setBindGroup` | `index` · `bindGroup` · `dynamicOffsets[]` |
+| `setBindGroup` | `index` · `bindGroup` · `dynamicOffsets[]` — 개수는 레이아웃의 `hasDynamicOffset` 항목 수와 같아야 하고(바인딩 번호 순), 각 값은 `minUniformBufferOffsetAlignment`/`minStorageBufferOffsetAlignment`의 배수, `offset + 동적 오프셋 + size ≤ 버퍼 크기` (size 생략 시 버퍼 끝까지라 0만 된다 — Dawn과 같은 규칙). 어긋나면 이 명령에서 검증 오류 |
 | `setVertexBuffer` | `slot` · `buffer` · `offset`(0) |
 | `setIndexBuffer` | `buffer` · `format`(`"uint16"`\|`"uint32"`) · `offset`(0) |
 | `setViewport` | `x`(0) · `y`(0) · `width` · `height` · `minDepth`(0) · `maxDepth`(1) |
 | `setScissorRect` | `x`(0) · `y`(0) · `width` · `height` |
 | `setBlendConstant` | `color` |
 | `setStencilReference` | `reference`(0) — **WebIDL의 `u32` 변환(modulo)을 적용한다** |
-| `draw` | `vertexCount` · `instanceCount`(1) · `firstVertex`(0) · `firstInstance`(0) |
-| `drawIndexed` | `indexCount` · `instanceCount`(1) · `firstIndex`(0) · `baseVertex`(0) · `firstInstance`(0) |
+| `draw` | `vertexCount` · `instanceCount`(1) · `firstVertex`(0) · `firstInstance`(0) — 개수가 0이면 상태만 검증하고 백엔드 드로우는 건너뛴다 |
+| `drawIndexed` | `indexCount` · `instanceCount`(1) · `firstIndex`(0) · `baseVertex`(0) · `firstInstance`(0) — 위와 같다 |
 | `drawIndirect` | `indirectBuffer` · `indirectOffset`(0) — 인자 16B |
 | `drawIndexedIndirect` | `indirectBuffer` · `indirectOffset`(0) — 인자 20B |
 | `executeBundles` | `bundles[]` |
@@ -252,7 +283,7 @@ Metal은 둘 다 느슨해서, 안 막으면 브라우저·Dawn에서만 거부�
 | op | 필드 |
 |---|---|
 | `beginComputePass` | `timestampWrites` · `label` |
-| `dispatchWorkgroups` | `x`(1) · `y`(1) · `z`(1) — 각각 **최소 1로 올린다** |
+| `dispatchWorkgroups` | `x`(1) · `y`(1) · `z`(1) — **0은 그대로 둔다**(명세상 유효한 no-op — 상태 검증만 하고 백엔드 디스패치는 건너뛴다). 음수와 `maxComputeWorkgroupsPerDimension` 초과는 검증 오류 |
 | `dispatchWorkgroupsIndirect` | `indirectBuffer` · `indirectOffset`(0) — 인자 12B |
 
 ### 4-8. 쿼리
@@ -280,6 +311,25 @@ occlusion 쿼리는 중첩할 수 없고, 한 패스에서 같은 인덱스를 �
 이후 `pop`이 바깥 스코프를 가져가서, 앱이 안쪽 구간의 결과라고 믿는 값이 실제로는 바깥
 구간의 결과가 된다.
 
+**오류는 그 명령이 실행될 때 열려 있던 스코프에 귀속된다** — 배치가 끝날 때 열려 있는 스코프가
+아니다. `push → create → pop`이 한 배치에 실리는 것이 보통이라(shim의 `createRenderPipelineAsync`가
+정확히 그렇게 보낸다) 배치 끝에 모아 귀속시키면 `pop`이 이미 깨끗하게 풀린 뒤라, Promise는 무효
+파이프라인으로 resolve되고 오류는 `uncapturederror`로 샌다. 그래서 엔진은 **명령마다**(그리고 배치
+시작에 한 번) 백엔드의 `drainImmediateDiagnostics()`를 비워 기록한다 — 자체 검증기를 가진 백엔드(Dawn:
+uncaptured 콜백이 실패한 wgpu 호출 **안에서 동기로** 싱크를 채운다)의 오류도 Metal에서 엔진이
+명령 안에서 던지는 오류와 같은 스코프에 잡힌다. 명령 단위로 귀속시킬 수 없는 것만 배치 끝
+(`collectBatchDiagnostics()` — Dawn: 인코더 `Finish`에서 나는 인코더 오류, 펌프로 오는 콜백)에
+**그때 열린 스코프**로 기록되고, 그보다 늦은 것은 §2대로 다음 배치로 간다.
+인코더에 기록되는 명령(패스·드로우·복사)의 오류는 Dawn이 **커맨드 인코더 `Finish` 때**, 즉 배치 끝
+(submit)에 검증하므로, 손으로 짠 스트림에서 같은 배치 안의 `pop`은 그 오류를 잡지 못한다. JS shim은
+그런 모양을 만들지 않는다 — 인코더 명령은 `queue.submit` 때에야 스트림에 들어간다.
+적합성 검사 `error-scope-attribution`이 이 귀속을 판정한다.
+
+무효 객체를 쓴 데서 나는 **연쇄 메아리**(Dawn: "… is invalid due to a previous error" —
+`WGPUBackend.isCascadingEcho`)는 같은 응답의 `errors`에 근원 오류가 함께 있으면 `errors`에서 뺀다
+(마지막 오류만 보이는 오버레이에서 메아리가 원인을 가린다). 스코프는 메아리도 잡는다 — 명세상
+무효 객체 사용은 진짜 검증 오류다.
+
 ---
 
 ## 5. 커맨드 스트림 밖 (NativeModule 직접 호출)
@@ -293,7 +343,7 @@ occlusion 쿼리는 중첩할 수 없고, 한 패스에서 같은 인덱스를 �
 | `adapterInfo()` | `requestAdapter()`의 `info`·`limits`·`features`. **키는 명세 철자 그대로** |
 | `shaderCompilationInfo({module})` | `getCompilationInfo()` |
 | `canvasInfo({canvas})` | `{ok, width, height, format}` |
-| `readBuffer({buffer, offset?, size?}, cb)` | `mapAsync` + `getMappedRange` |
+| `readBuffer({buffer, offset?, size?}, cb)` | `mapAsync` + `getMappedRange`. **`MAP_WRITE` 버퍼는 쓰기 매핑**으로 연다 — 명세가 `MAP_READ \| MAP_WRITE`를 금하므로 usage로 모드가 정해진다. 결과는 버퍼의 현재 내용이고(명세의 쓰기 매핑 초기값), offset은 8의 배수·size는 4의 배수여야 한다. 쓴 바이트는 `unmapBuffer`의 `data`로 돌아온다 |
 | `loadAsset({name}, cb)` | 브라우저 `fetch()` 자리. 해석은 `WGPUAssetProvider`가 한다 |
 | `decodeImage({id, data?/name?, flipY?, premultiplyAlpha?, resizeWidth?, resizeHeight?}, cb)` | `createImageBitmap()` |
 | `startFrameLoop({fps})` / `stopFrameLoop()` | `webgpu:frame` 전역 이벤트 |
@@ -364,7 +414,6 @@ occlusion 쿼리는 중첩할 수 없고, 한 패스에서 같은 인덱스를 �
 | `GPURenderPassColorAttachment.depthSlice` | 읽지 않는다 — 항상 0번 슬라이스에 그린다 |
 | `GPURenderPassDescriptor.maxDrawCount` | 무시한다 (드라이버 힌트) |
 | `setBindGroup`의 `Uint32Array` 오버로드 | 없다 — 배열 형태와 결과가 같고 브리지를 건널 때 어차피 배열로 펴진다 |
-| `setBindGroup`의 `dynamicOffsets` 파싱 실패 | **빈 배열로 본다.** 실제로 필요했다면 바인드 그룹 적용에서 "개수가 부족하다"로 잡힌다 |
 
 미지원 API 전체 목록은 `docs/WEBGPU-API.md` §8에 있다.
 

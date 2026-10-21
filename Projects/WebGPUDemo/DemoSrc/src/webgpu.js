@@ -662,6 +662,13 @@ class GPUBuffer extends GPUObjectBase {
     /** Whether `mapAsync` is still waiting for a result (the spec's `"pending"` state). */
     this._mapPending = false;
     /**
+     * The current mapping's `GPUMapMode` — `WRITE` makes `unmap()` send the mapping back to native.
+     * (`mappedAtCreation` is a write mapping too, but its bytes travel with the creation command instead.)
+     */
+    this._mapMode = 0;
+    /** The buffer offset the current mapping starts at — `getMappedRange` offsets are buffer offsets. */
+    this._mapOffset = 0;
+    /**
      * The ranges handed out by `getMappedRange()` — used for the overlap check and `unmap()`'s write-back.
      * @type {{offset: number, length: number, view: ArrayBuffer | null}[]}
      */
@@ -693,19 +700,25 @@ class GPUBuffer extends GPUObjectBase {
    * Requesting the whole range first returns the mapping itself with no copy — saving one copy on the
    * common path of filling a large vertex buffer with `mappedAtCreation`.
    *
-   * Spec rules: `offset` must be a multiple of 8, `size` a multiple of 4, and ranges **may not overlap**.
+   * Spec rules: `offset` is a **buffer** offset (not one relative to the mapping) and must be a multiple
+   * of 8, `size` a multiple of 4, the range must lie inside the mapped range, and ranges **may not overlap**.
    *
-   * @param {number} [offset] the byte offset (a multiple of 8)
-   * @param {number} [size] the number of bytes (a multiple of 4). Omitted, it runs to the end
+   * @param {number} [offset] the byte offset in the buffer (a multiple of 8)
+   * @param {number} [size] the number of bytes (a multiple of 4). Omitted, it runs to the end of the buffer
+   *   (spec) — so after a partial `mapAsync` it must be given unless the mapping reaches the end
    * @returns {ArrayBuffer}
    */
   getMappedRange(offset, size) {
     if (!this._mapped) {
       throw new Error('getMappedRange can only be used after mappedAtCreation or mapAsync');
     }
-    const total = this._mapped.byteLength;
+    // Offsets are buffer offsets (spec) — the mapping covers [mapStart, mapEnd) of the buffer.
+    const mapStart = this._mapOffset;
+    const mapEnd = mapStart + this._mapped.byteLength;
     const start = offset || 0;
-    const length = size === undefined ? Math.max(0, total - start) : size;
+    // Omitted, it runs to the end of the **buffer** (spec), not of the mapping — the same for a
+    // whole-buffer mapping; past a partial one it is rejected below, as in a browser.
+    const length = size === undefined ? Math.max(0, (this.size || mapEnd) - start) : size;
 
     if (start % 8 !== 0) {
       throw new OperationError(`getMappedRange: offset must be a multiple of 8 (got ${start})`);
@@ -716,9 +729,9 @@ class GPUBuffer extends GPUObjectBase {
     if (size !== undefined && length % 4 !== 0) {
       throw new OperationError(`getMappedRange: size must be a multiple of 4 (got ${length})`);
     }
-    if (start < 0 || start + length > total) {
+    if (start < mapStart || start + length > mapEnd) {
       throw new OperationError(
-        `the getMappedRange range exceeds the mapping — offset ${start} + ${length}B > ${total}B`
+        `the getMappedRange range exceeds the mapping — offset ${start} + ${length}B is outside the mapped ${mapStart}~${mapEnd}`
       );
     }
     for (const range of this._mappedRanges) {
@@ -730,11 +743,11 @@ class GPUBuffer extends GPUObjectBase {
     }
 
     // Requesting the whole thing first hands over the mapping itself — there is nothing to write back.
-    if (start === 0 && length === total && this._mappedRanges.length === 0) {
-      this._mappedRanges.push({ offset: 0, length, view: null });
+    if (start === mapStart && length === this._mapped.byteLength && this._mappedRanges.length === 0) {
+      this._mappedRanges.push({ offset: start, length, view: null });
       return this._mapped;
     }
-    const view = this._mapped.slice(start, start + length);
+    const view = this._mapped.slice(start - mapStart, start - mapStart + length);
     this._mappedRanges.push({ offset: start, length, view });
     return view;
   }
@@ -744,7 +757,7 @@ class GPUBuffer extends GPUObjectBase {
     if (!this._mapped) return;
     for (const range of this._mappedRanges) {
       if (!range.view) continue;
-      new Uint8Array(this._mapped).set(new Uint8Array(range.view), range.offset);
+      new Uint8Array(this._mapped).set(new Uint8Array(range.view), range.offset - this._mapOffset);
     }
     this._mappedRanges = [];
   }
@@ -754,7 +767,10 @@ class GPUBuffer extends GPUObjectBase {
    *
    * For `mappedAtCreation`, this is where the actual creation command (initial data included) is recorded;
    * for something mapped by `mapAsync` it tells native "queue operations may use it now" —
-   * a buffer being mapped is rejected by queue operations per the spec, so **this must be called once you have read.**
+   * a buffer being mapped is rejected by queue operations per the spec, so **this must be called once you are done.**
+   *
+   * A `GPUMapMode.WRITE` mapping **carries its bytes back** here (`unmapBuffer`'s `offset` + `data`) —
+   * the mapping is a JS copy, so without that everything written into it would vanish silently.
    *
    * @returns {void}
    */
@@ -772,31 +788,76 @@ class GPUBuffer extends GPUObjectBase {
         data: this._mapped,   // already an ArrayBuffer
       });
       this._mappedAtCreation = false;
+    } else if (this._mapMode === GPUMapMode.WRITE) {
+      // The whole mapping goes back: it started as the buffer's current contents (spec), so bytes the
+      // app did not touch are written back unchanged.
+      this._recorder.push({
+        op: 'unmapBuffer',
+        buffer: this.id,
+        offset: this._mapOffset,
+        data: this._mapped,
+      });
     } else {
       this._recorder.push({ op: 'unmapBuffer', buffer: this.id });
     }
     this._mapped = null;
+    this._mapMode = 0;
+    this._mapOffset = 0;
   }
 
   /**
-   * Reads the buffer's contents. It is WebGPU's `mapAsync` + `getMappedRange` merged into one.
+   * Maps the buffer — WebGPU's `mapAsync`, and (an extension) it also resolves with the mapping itself,
+   * the same `ArrayBuffer` `getMappedRange()` hands over whole.
    *
-   * While reading, this buffer becomes **"unavailable"** per the spec and is rejected by queue operations
+   * - `GPUMapMode.READ` (also when `mode` is omitted — a shorthand of this implementation): reads the
+   *   contents once prior GPU work finishes.
+   * - `GPUMapMode.WRITE`: needs `GPUBufferUsage.MAP_WRITE`. The mapping starts as the buffer's current
+   *   contents (spec); what you write into it is **sent back at `unmap()`**.
+   *
+   * While mapped, this buffer becomes **"unavailable"** per the spec and is rejected by queue operations
    * (writes, copies, resolves, draw bindings). Otherwise the next frame's write would overlap the same
    * memory while the readback waits for GPU completion, and which frame the received value belongs to would not be guaranteed.
-   * **Call `unmap()` once you are done reading.**
+   * **Call `unmap()` once you are done.**
    *
-   * @param {number} [_mode] for spec compatibility — this implementation does not look at it
-   * @param {number} [offset] the byte offset
-   * @param {number} [size] the number of bytes to read. Omitted, it runs to the end
+   * Rejects with `OperationError` for a mode that is not exactly one of `READ`/`WRITE`, `WRITE` without
+   * `MAP_WRITE` usage, `READ` on a `MAP_WRITE` buffer (the spec forbids `MAP_READ | MAP_WRITE`, so such a
+   * buffer can only be mapped for writing), and — for `WRITE` — an offset that is not a multiple of 8, a
+   * size that is not a multiple of 4, or a range past the end of the buffer.
+   *
+   * @param {number} [mode] `GPUMapMode.READ` or `GPUMapMode.WRITE`. Omitted, `READ`
+   * @param {number} [offset] the byte offset (a multiple of 8 for `WRITE`)
+   * @param {number} [size] the number of bytes (a multiple of 4 for `WRITE`). Omitted, it runs to the end
    * @returns {Promise<ArrayBuffer>}
    */
-  async mapAsync(_mode, offset, size) {
+  async mapAsync(mode, offset, size) {
+    const mapMode = mode === undefined ? GPUMapMode.READ : mode;
+    const start = offset || 0;
+    if (mapMode !== GPUMapMode.READ && mapMode !== GPUMapMode.WRITE) {
+      throw new OperationError(`mapAsync: mode must be exactly one of GPUMapMode.READ or WRITE (got ${mode})`);
+    }
+    const usage = this.usage || 0;
+    if (mapMode === GPUMapMode.WRITE) {
+      if (!(usage & GPUBufferUsage.MAP_WRITE)) {
+        throw new OperationError('mapAsync(GPUMapMode.WRITE) needs a buffer created with GPUBufferUsage.MAP_WRITE');
+      }
+      const length = size === undefined ? Math.max(0, this.size - start) : size;
+      if (start % 8 !== 0 || length % 4 !== 0) {
+        throw new OperationError(
+          `mapAsync: offset must be a multiple of 8 and size a multiple of 4 (got ${start}, ${length}B)`
+        );
+      }
+      if (start + length > this.size) {
+        throw new OperationError(`mapAsync: offset ${start} + ${length}B exceeds the buffer size ${this.size}B`);
+      }
+    } else if (usage & GPUBufferUsage.MAP_WRITE) {
+      // Native maps a MAP_WRITE buffer for writing — a READ here would be invalid in a browser anyway.
+      throw new OperationError('mapAsync(GPUMapMode.READ) cannot map a MAP_WRITE buffer (use GPUMapMode.WRITE)');
+    }
     this._recorder.flush(false);
     this._mapPending = true;
     const result = await /** @type {Promise<WGPUReadBufferResult | undefined>} */ (
       new Promise((resolve) => {
-        nativeModule().readBuffer({ buffer: this.id, offset: offset || 0, size }, resolve);
+        nativeModule().readBuffer({ buffer: this.id, offset: start, size }, resolve);
       })
     );
     this._mapPending = false;
@@ -808,6 +869,8 @@ class GPUBuffer extends GPUObjectBase {
     const mapped = result.data;
     this._mapped = mapped;
     this._mappedAtCreation = false;
+    this._mapMode = mapMode;
+    this._mapOffset = start;
     // It is a new mapping, so the previous mapping's range records are dropped (so the overlap check does not spin on stale data).
     this._mappedRanges = [];
     return mapped;
@@ -1298,13 +1361,22 @@ class GPURenderBundleEncoder extends GPURenderCommandsBase {
 
 class GPUComputePassEncoder extends GPUPassEncoderBase {
   /**
+   * Dispatches an `x × y × z` grid of workgroups.
+   *
+   * A count of `0` is valid and dispatches nothing (`Math.ceil(n / 64)` with `n = 0`) — the pass state
+   * is still validated. Only an omitted `y`/`z` defaults to `1`.
+   *
    * @param {number} x
    * @param {number} [y]
    * @param {number} [z]
    * @returns {void}
    */
   dispatchWorkgroups(x, y, z) {
-    this._commands.push({ op: 'dispatchWorkgroups', x: x || 1, y: y || 1, z: z || 1 });
+    this._commands.push({
+      op: 'dispatchWorkgroups', x,
+      y: y === undefined ? 1 : y,
+      z: z === undefined ? 1 : z,
+    });
   }
 
   /**

@@ -65,6 +65,146 @@ final class ShaderSafetyTests: XCTestCase {
         )
     }
 
+    /// A runtime-sized array reached **through a `let` pointer** is clamped by the same table.
+    ///
+    /// Valid WGSL, and the index is a bundle-chosen value: left on the plain pointer path,
+    /// `(*p)[100000000u] = 7u` would write 400 MB past the binding.
+    func test_aRuntimeArrayReachedThroughALetPointerIsClamped() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var<storage, read_write> data: array<u32>;
+        @group(0) @binding(1) var<uniform> idx: u32;
+        @compute @workgroup_size(1) fn cs() {
+            let p = &data;
+            let alsoP = p;
+            (*p)[100000000u] = 7u;
+            (*alsoP)[idx] += (*p)[idx];
+        }
+        """, entryPoints: ["cs"])
+        let count = "(wgpu_buffer_sizes[0] / uint(sizeof(uint)))"
+        XCTAssertTrue(msl.contains("wgpu_store_n((*p), 100000000u, \(count), 7u)"), "a write through a pointer is unclamped\n\(msl)")
+        XCTAssertTrue(msl.contains("wgpu_store_n((*alsoP), idx, \(count),"), "a pointer copied from a pointer is unclamped\n\(msl)")
+        XCTAssertTrue(msl.contains("wgpu_at_n((*p), idx, \(count))"), "a read through a pointer is unclamped\n\(msl)")
+        XCTAssertFalse(msl.contains("wgpu_at((*"), msl)
+        XCTAssertFalse(msl.contains("wgpu_store((*"), msl)
+    }
+
+    /// A storage struct spelled **through an alias** still finds its runtime-sized member — and the
+    /// pipeline still binds the size table (the emitter and the pipeline must agree).
+    func test_aRuntimeArrayMemberOfAnAliasedStructIsClamped() throws {
+        let source = """
+        struct Buf { head: u32, items: array<u32> }
+        alias Inner = Buf;
+        alias B = Inner;
+        @group(0) @binding(0) var<storage, read_write> b: B;
+        @group(0) @binding(1) var<uniform> idx: u32;
+        @compute @workgroup_size(1) fn cs() {
+            b.items[idx] = b.items[idx + 1u] + b.head;
+        }
+        """
+        let msl = try translate(source, entryPoints: ["cs"])
+        // items starts at offset 4; the subtraction saturates at 0.
+        let count = "((wgpu_buffer_sizes[0] > 4u ? wgpu_buffer_sizes[0] - 4u : 0u) / uint(sizeof(uint)))"
+        XCTAssertTrue(msl.contains("wgpu_store_n(b.items, idx, \(count),"), "a write through an alias is unclamped\n\(msl)")
+        XCTAssertTrue(msl.contains("wgpu_at_n(b.items, idx + 1u, \(count))"), "a read through an alias is unclamped\n\(msl)")
+        XCTAssertTrue(
+            try WGSLShaderModule(source: source).usesArrayLength(entryPoints: ["cs"]),
+            "the clamp reads the size table, so the pipeline must bind it"
+        )
+    }
+
+    /// A pointer to the **whole struct** (`(*q).items[i]`) resolves to the same member bound.
+    func test_aRuntimeArrayMemberReachedThroughAStructPointerIsClamped() throws {
+        let msl = try translate("""
+        struct Buf { head: u32, items: array<u32> }
+        @group(0) @binding(0) var<storage, read_write> buf: Buf;
+        @group(0) @binding(1) var<uniform> idx: u32;
+        @compute @workgroup_size(1) fn cs() {
+            let q = &buf;
+            (*q).items[idx] = (*q).head;
+            buf.head = arrayLength(&(*q).items);
+        }
+        """, entryPoints: ["cs"])
+        let count = "((wgpu_buffer_sizes[0] > 4u ? wgpu_buffer_sizes[0] - 4u : 0u) / uint(sizeof(uint)))"
+        XCTAssertTrue(msl.contains("wgpu_store_n((*q).items, idx, \(count),"), "a write through a struct pointer is unclamped\n\(msl)")
+        XCTAssertTrue(msl.contains("buf.head = \(count)"), "arrayLength() through a pointer\n\(msl)")
+
+        // A pointer **straight to the runtime member** carries the member's offset as well.
+        let direct = try translate("""
+        struct Buf { head: u32, items: array<u32> }
+        @group(0) @binding(0) var<storage, read_write> buf: Buf;
+        @group(0) @binding(1) var<uniform> idx: u32;
+        @compute @workgroup_size(1) fn cs() {
+            let p = &buf.items;
+            (*p)[idx] = 7u;
+        }
+        """, entryPoints: ["cs"])
+        XCTAssertTrue(direct.contains("wgpu_store_n((*p), idx, \(count), 7u)"), "a write through a member pointer is unclamped\n\(direct)")
+    }
+
+    /// A pointer the emitter **cannot** bound — a `ptr<storage>` parameter points wherever the caller
+    /// chose — must not fall back to an unchecked access. The emitter refuses it at translate time with
+    /// a WGSL-level message; behind that, the prelude deletes the bare pointer overloads, so a shape
+    /// that slipped past the emitter would still fail to compile rather than index unchecked.
+    func test_aRuntimeArrayIndexThroughAPointerParameterIsRefused() throws {
+        let shapes = [
+            "(*q).items[i] = 1u;",
+            "let r = q; (*r).items[i] = 1u;",
+            "let r = &(*q).items; let v = (*r)[i];",
+        ]
+        for body in shapes {
+            let module = try WGSLShaderModule(source: """
+            struct Buf { head: u32, items: array<u32> }
+            alias B = Buf;
+            @group(0) @binding(0) var<storage, read_write> buf: Buf;
+            @group(0) @binding(1) var<uniform> idx: u32;
+            fn poke(q: ptr<storage, B, read_write>, i: u32) { \(body) }
+            @compute @workgroup_size(1) fn cs() { poke(&buf, idx); }
+            """)
+            let groups = module.autoBindGroupLayouts(entryPoints: ["cs"])
+            XCTAssertThrowsError(
+                try module.translateToMSL(entryPoints: ["cs"], bindings: try WGSLBindingAssigner.assign(groups: groups)),
+                body
+            ) { error in
+                XCTAssertEqual((error as? WGPUError)?.kind, .unsupported, body)
+                XCTAssertTrue(
+                    ((error as? WGPUError)?.message ?? "").contains("through a pointer parameter"), "\(body): \(error)"
+                )
+            }
+        }
+        // The fixed part behind the same parameter is not a runtime-sized array and stays allowed.
+        _ = try translate("""
+        struct Buf { head: u32, items: array<u32> }
+        @group(0) @binding(0) var<storage, read_write> buf: Buf;
+        fn bump(q: ptr<storage, Buf, read_write>) { (*q).head += 1u; }
+        @compute @workgroup_size(1) fn cs() { bump(&buf); }
+        """, entryPoints: ["cs"])
+        XCTAssertFalse(MSLPrelude.source.contains("p[uint(i)]"), "an unbounded pointer overload is back in the prelude")
+    }
+
+    /// A binding too small to hold one element gives a count of 0 — the store helper must then
+    /// **drop** the write rather than fall back to slot 0, which may lie past the binding's end.
+    func test_aRuntimeArrayStoreWithNoElementsIsDropped() {
+        XCTAssertTrue(
+            MSLPrelude.source.contains("wgpu_store_n(device T* p, I i, uint count, V value) { if (count != 0u) {"),
+            "a write with a count of 0 is no longer dropped"
+        )
+    }
+
+    /// A local that **shadows** a runtime-array global is not that global — it keeps the fixed-size clamp.
+    func test_aLocalShadowingARuntimeArrayGlobalIsNotBoundByItsTable() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var<storage, read_write> data: array<u32>;
+        @group(0) @binding(1) var<uniform> idx: u32;
+        @compute @workgroup_size(1) fn cs() {
+            data[0] = 1u;
+            var data = array<u32, 4>(0u, 0u, 0u, 0u);
+            data[idx] = 2u;
+        }
+        """, entryPoints: ["cs"])
+        XCTAssertTrue(msl.contains("wgpu_store_n(data, 0, "), msl)
+        XCTAssertTrue(msl.contains("wgpu_store(wgpu_shadow_data, idx, 2u)"), msl)
+    }
+
     /// Vector components cannot bind to a reference (an MSL limit), so reads go by value and writes through a store helper.
     func test_vectorComponentIndexingIsClampedForBothReadAndWrite() throws {
         let msl = try translate("""
@@ -258,6 +398,28 @@ final class ShaderSafetyTests: XCTestCase {
         )
     }
 
+    /// A user global spelled like the flag stays a separate variable. It used to share the flag's name
+    /// in the emitter's global table, which **trapped** (killing the host process) on the duplicate.
+    func test_aUserGlobalNamedLikeTheDiscardFlagStaysSeparate() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+        var<private> wgpu_discarded: f32 = 2.0;
+        @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+            if (p.x > wgpu_discarded) { discard; }
+            out[0] = wgpu_discarded;
+            return vec4f(1);
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("float wgpu_id_wgpu_discarded = 2.0;"), "the user global was lost\n\(msl)")
+        XCTAssertTrue(msl.contains("bool wgpu_discarded{};"), "the flag was lost\n\(msl)")
+        XCTAssertTrue(msl.contains("p.x > wgpu_id_wgpu_discarded"), "\(msl)")
+        XCTAssertTrue(msl.contains("wgpu_discarded = true"), "discard did not become a flag\n\(msl)")
+        XCTAssertTrue(
+            msl.contains("if (wgpu_discarded) { discard_fragment(); }"),
+            "the real discard must happen at the end of the entry point\n\(msl)"
+        )
+    }
+
     // MARK: - Infinite loops
 
     /// An infinite loop is UB in C++ — the compiler may assume it ends and delete the surrounding code.
@@ -308,5 +470,156 @@ final class ShaderSafetyTests: XCTestCase {
         """, entryPoints: ["fs"])
         XCTAssertTrue(msl.contains("wgpu_loop_guard_1"), "\(msl)")
         XCTAssertTrue(msl.contains("wgpu_loop_guard_2"), "guard names of nested loops collide\n\(msl)")
+    }
+
+    // MARK: - Builtin argument counts
+
+    /// The shader source comes from the bundle, so a builtin with missing arguments is **untrusted input**.
+    /// Lowerings that pick arguments out by position used to index past the end — a Swift trap that
+    /// killed the host process. It must be an ordinary compile error instead.
+    private func assertRejected(
+        _ source: String,
+        entryPoints: [String],
+        mentioning callee: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        do {
+            let module = try WGSLShaderModule(source: source)
+            let bindings = try WGSLBindingAssigner.assign(groups: module.autoBindGroupLayouts(entryPoints: entryPoints))
+            XCTAssertThrowsError(
+                try module.translateToMSL(entryPoints: entryPoints, bindings: bindings), file: file, line: line
+            ) { error in
+                let error = error as? WGPUError
+                XCTAssertEqual(error?.kind, .validation, "\(String(describing: error))", file: file, line: line)
+                XCTAssertTrue(
+                    error?.message.contains("\(callee)()") == true,
+                    "the error must name the builtin: \(String(describing: error))", file: file, line: line
+                )
+            }
+        } catch {
+            XCTFail("must parse and fail at translation, not \(error)", file: file, line: line)
+        }
+    }
+
+    func test_atomicsAndQuantizeWithMissingArgumentsAreCompileErrors() {
+        let header = """
+        @group(0) @binding(0) var<storage, read_write> counter: atomic<u32>;
+        @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+        """
+        let calls = [
+            ("atomicLoad", "out[0] = f32(atomicLoad());"),
+            ("atomicStore", "atomicStore(&counter);"),
+            ("atomicExchange", "out[0] = f32(atomicExchange(&counter));"),
+            ("atomicAdd", "out[0] = f32(atomicAdd(&counter));"),
+            ("quantizeToF16", "out[0] = quantizeToF16();"),
+        ]
+        for (callee, statement) in calls {
+            assertRejected("""
+            \(header)
+            @compute @workgroup_size(1) fn cs() { \(statement) }
+            """, entryPoints: ["cs"], mentioning: callee)
+        }
+    }
+
+    /// Every builtin in the arity table, one short and one long — the table is the only guard in
+    /// front of the positional lowerings, so an entry that is too permissive shows up here as a trap.
+    func test_everyPositionalBuiltinRejectsAWrongArgumentCount() {
+        for (callee, arity) in MSLTypeMapping.builtinArities.sorted(by: { $0.key < $1.key }) {
+            var counts = [arity.upperBound + 1]
+            if arity.lowerBound > 0 { counts.append(arity.lowerBound - 1) }
+            for count in counts {
+                let arguments = Array(repeating: "1.0", count: count).joined(separator: ", ")
+                assertRejected("""
+                @compute @workgroup_size(1) fn cs() { \(callee)(\(arguments)); }
+                """, entryPoints: ["cs"], mentioning: callee)
+            }
+        }
+    }
+
+    func test_wellFormedAtomicCallsStillTranslate() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var<storage, read_write> counter: atomic<u32>;
+        @group(0) @binding(1) var<storage, read_write> out: array<u32>;
+        @compute @workgroup_size(1) fn cs() {
+            atomicStore(&counter, 1u);
+            let added = atomicAdd(&counter, 2u);
+            let swapped = atomicExchange(&counter, 3u);
+            out[0] = atomicLoad(&counter) + added + swapped;
+        }
+        """, entryPoints: ["cs"])
+        XCTAssertTrue(msl.contains("atomic_store_explicit(&counter, 1u, memory_order_relaxed)"), msl)
+        XCTAssertTrue(msl.contains("atomic_fetch_add_explicit(&counter, 2u, memory_order_relaxed)"), msl)
+        XCTAssertTrue(msl.contains("atomic_exchange_explicit(&counter, 3u, memory_order_relaxed)"), msl)
+        XCTAssertTrue(msl.contains("atomic_load_explicit(&counter, memory_order_relaxed)"), msl)
+    }
+
+    func test_wellFormedQuantizeAndBitcastStillTranslate() throws {
+        let msl = try translate("""
+        @fragment fn fs() -> @location(0) vec4f {
+            let q = quantizeToF16(1.5);
+            let bits = bitcast<f32>(1065353216u);
+            return vec4f(q, bits, 0.0, 1.0);
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("float(half(1.5))"), msl)
+        XCTAssertTrue(msl.contains("as_type<float>(1065353216u)"), msl)
+    }
+
+    func test_wellFormedTextureCallsAtTheirLowerArityBoundsStillTranslate() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var tex: texture_2d<f32>;
+        @group(0) @binding(1) var samp: sampler;
+        @group(0) @binding(2) var depth: texture_depth_2d;
+        @group(0) @binding(3) var cmp: sampler_comparison;
+        @fragment fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+            let biased = textureSampleBias(tex, samp, uv, 0.5);
+            let graded = textureSampleGrad(tex, samp, uv, vec2f(0.01, 0.0), vec2f(0.0, 0.01));
+            let shadow = textureSampleCompare(depth, cmp, uv, 0.5);
+            let levels = textureNumLevels(tex);
+            let size = textureDimensions(tex, 0);
+            return biased + graded + vec4f(shadow, f32(levels), f32(size.x), 1.0);
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("tex.sample(samp, uv, bias(0.5))"), msl)
+        XCTAssertTrue(msl.contains("tex.sample(samp, uv, gradient2d("), msl)
+        XCTAssertTrue(msl.contains("depth.sample_compare(cmp, uv, 0.5)"), msl)
+        XCTAssertTrue(msl.contains("tex.get_num_mip_levels()"), msl)
+    }
+
+    /// The table's risk is at the **upper** bounds — an arrayed texture plus an offset is the longest form of each family.
+    /// The sampling assertions stop before the closing parenthesis on purpose: the emitter accepts the trailing
+    /// `offset` but does not emit it yet, and this test pins the arity bounds, not that omission.
+    func test_wellFormedTextureCallsAtTheirUpperArityBoundsStillTranslate() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var arr: texture_2d_array<f32>;
+        @group(0) @binding(1) var samp: sampler;
+        @group(0) @binding(2) var depths: texture_depth_2d_array;
+        @group(0) @binding(3) var cmp: sampler_comparison;
+        @fragment fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+            let a = textureSample(arr, samp, uv, 0, vec2i(1, 1));
+            let b = textureSampleBias(arr, samp, uv, 0, 0.5, vec2i(1, 1));
+            let c = textureSampleLevel(arr, samp, uv, 0, 0.0, vec2i(1, 1));
+            let d = textureSampleGrad(arr, samp, uv, 0, vec2f(0.01, 0.0), vec2f(0.0, 0.01), vec2i(1, 1));
+            let e = textureSampleCompare(depths, cmp, uv, 0, 0.5, vec2i(1, 1));
+            let f = textureSampleCompareLevel(depths, cmp, uv, 0, 0.5, vec2i(1, 1));
+            let g = textureLoad(arr, vec2i(0, 0), 0, 0);
+            return a + b + c + d + g + vec4f(e, f, 0.0, 1.0);
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("arr.sample(samp, uv, 0"), msl)
+        XCTAssertTrue(msl.contains("arr.sample(samp, uv, 0, bias(0.5)"), msl)
+        XCTAssertTrue(msl.contains("arr.sample(samp, uv, 0, level(0.0)"), msl)
+        XCTAssertTrue(msl.contains("arr.sample(samp, uv, 0, gradient2d("), msl)
+        XCTAssertTrue(msl.contains("depths.sample_compare(cmp, uv, 0, 0.5"), msl)
+        XCTAssertTrue(msl.contains("arr.read(uint2("), msl)
+
+        let store = try translate("""
+        @group(0) @binding(0) var layers: texture_storage_2d_array<rgba8unorm, write>;
+        @compute @workgroup_size(1) fn cs() {
+            textureStore(layers, vec2i(0, 0), 1, vec4f(1.0, 0.0, 0.0, 1.0));
+        }
+        """, entryPoints: ["cs"])
+        XCTAssertTrue(store.contains("layers.write("), store)
     }
 }

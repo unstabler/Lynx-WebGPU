@@ -38,15 +38,28 @@ public final class WGPUMetalBackend: WGPUBackend {
 
     // Batch lifetime state — valid only between beginBatch and submit.
     private var commandBuffer: MTLCommandBuffer?
+    /// The batch's **queue writes** (`writeBuffer`/`writeTexture`) — a command buffer of their own,
+    /// committed **ahead of** `commandBuffer`.
+    ///
+    /// A queue write is a queue-timeline operation: it lands before every command buffer submitted
+    /// after it, including commands recorded before the call (spec; Dawn's `wgpuQueueWriteBuffer`).
+    /// The batch's encoder work is that later submit, so the writes cannot ride its blit — that put
+    /// them in stream order inside the same command buffer, and a write arriving while a pass was
+    /// open had nowhere to go at all (a render encoder is active). The upload encoder stays open
+    /// across passes: the one-active-encoder rule is per command buffer.
+    private var uploadCommandBuffer: MTLCommandBuffer?
+    private var uploadEncoder: MTLBlitCommandEncoder?
     private var renderEncoder: MTLRenderCommandEncoder?
     private var computeEncoder: MTLComputeCommandEncoder?
     private var blitEncoder: MTLBlitCommandEncoder?
+    /// The pipeline set in the **open** pass — both are cleared when a pass opens or closes, so one
+    /// pass type's pipeline never leaks into the next pass of the other type within the same batch.
     private var currentRenderPipeline: WGPURenderPipelineObject?
     private var currentComputePipeline: WGPUComputePipelineObject?
     /// Binding size per Metal buffer index — `arrayLength()` looks it up in this table.
     /// Refreshed whenever a bind group is applied, and uploaded to the encoder only when the shader uses it.
     private var bufferSizes = [UInt32](repeating: 0, count: WGSLMetalLimits.maxBindGroupBuffers)
-    /// Staging buffers used for this frame's uploads — returned to the pool when the command buffer completes.
+    /// Staging buffers used for this batch's uploads — returned to the pool when the upload command buffer completes.
     private var frameStagingBuffers: [MTLBuffer] = []
     /// Drawables acquired this frame, keyed by canvas — `submit(present: true)` sends them to
     /// screen. Keyed so the engine can hand back **one** canvas's frame (a reclaim or a detach)
@@ -56,11 +69,23 @@ public final class WGPUMetalBackend: WGPUBackend {
     private var acquiredDrawables: [String: WGPUDrawable] = [:]
     /// The last committed command buffer — used when `readBuffer` waits on GPU completion.
     private(set) var lastCommittedBuffer: MTLCommandBuffer?
+    /// Whether `.storeAndMultisampleResolve` can be used. Settable only so tests can drive the
+    /// emulation path on a device that has the combined action.
+    var supportsStoreAndMultisampleResolve: Bool
+    /// `storeOp: "store"` resolves the open render pass still owes when the combined store action is
+    /// missing — `endPass` resolves them in a draw-less pass (multisample texture, resolve texture).
+    private var pendingResolves: [(texture: MTLTexture, resolve: MTLTexture)] = []
+    /// Failures found while encoding that cannot throw (`endPass`) — handed over by `collectBatchDiagnostics`.
+    private var batchDiagnostics: [WGPUError] = []
+    /// That batch's upload command buffer, when it was committed separately — a failed queue write
+    /// must fail the readback too, even though the frame buffer after it completed.
+    private var lastCommittedUploadBuffer: MTLCommandBuffer?
 
     public init(device: MTLDevice, queue: MTLCommandQueue) {
         self.device = device
         self.queue = queue
         self.stagingPool = WGPUStagingPool(device: device)
+        self.supportsStoreAndMultisampleResolve = WGPUDeviceCapability.supportsStoreAndMultisampleResolve(device)
     }
 
     // MARK: - Capabilities
@@ -96,52 +121,78 @@ public final class WGPUMetalBackend: WGPUBackend {
     public func reset() {
         acquiredDrawables.removeAll()
         lastCommittedBuffer = nil
+        lastCommittedUploadBuffer = nil
     }
 
     // MARK: - Batch lifetime
 
     public func beginBatch() {
-        // If the previous batch ended without a submit (an errors-only batch, say), clear the leftovers.
-        if commandBuffer == nil, !frameStagingBuffers.isEmpty {
+        // If the previous batch ended without a submit, clear the leftovers. Staging still listed here
+        // belongs to an upload command buffer that is dropped uncommitted below — the GPU never saw it.
+        if !frameStagingBuffers.isEmpty {
             stagingPool.recycle(frameStagingBuffers)
             frameStagingBuffers.removeAll()
         }
         commandBuffer = nil
+        uploadEncoder?.endEncoding()   // the one encoder `endPass` does not close
+        uploadCommandBuffer = nil
+        uploadEncoder = nil
         renderEncoder = nil
         computeEncoder = nil
         blitEncoder = nil
         currentRenderPipeline = nil
         currentComputePipeline = nil
+        pendingResolves.removeAll()
+        batchDiagnostics.removeAll()
     }
 
-    public func collectBatchDiagnostics() -> [WGPUError] { [] }
+    public func collectBatchDiagnostics() -> [WGPUError] {
+        defer { batchDiagnostics.removeAll() }
+        return batchDiagnostics
+    }
 
-    public var hasPendingWork: Bool { commandBuffer != nil }
+    public var hasPendingWork: Bool { commandBuffer != nil || uploadCommandBuffer != nil }
 
     public func ensureSubmittableWork() {
         _ = try? activeCommandBuffer()
     }
 
     public func submit(present: Bool, onCompleted: @escaping (WGPUError?) -> Void) {
-        guard let commandBuffer else { return }
+        let uploads = uploadCommandBuffer
+        // The frame's command buffer — a batch of queue writes only presents and reports through them.
+        guard let frame = commandBuffer ?? uploads else { return }
+        if let uploads {
+            uploadEncoder?.endEncoding()
+            // A completion handler can only be attached before commit (a Metal assertion).
+            if !frameStagingBuffers.isEmpty {
+                let buffers = frameStagingBuffers
+                let pool = stagingPool
+                uploads.addCompletedHandler { _ in pool.recycle(buffers) }
+            }
+            // Queue writes go first — commit order on one queue is execution order, so they land
+            // before the batch's encoder work (see `uploadCommandBuffer`).
+            if commandBuffer != nil { uploads.commit() }
+        }
         if present {
-            for drawable in acquiredDrawables.values { drawable.present(with: commandBuffer) }
+            for drawable in acquiredDrawables.values { drawable.present(with: frame) }
         }
-        // A completion handler can only be attached before commit (a Metal assertion).
-        if !frameStagingBuffers.isEmpty {
-            let buffers = frameStagingBuffers
-            let pool = stagingPool
-            commandBuffer.addCompletedHandler { _ in pool.recycle(buffers) }
+        // Collect GPU-side failures (.outOfMemory / .timeout / .deviceRemoved, …). The uploads were
+        // committed first, so they have finished by the time the frame buffer completes.
+        frame.addCompletedHandler { buffer in
+            if let uploads, uploads.status == .error {
+                onCompleted(Self.commandBufferError(uploads))
+            } else {
+                onCompleted(buffer.status == .error ? Self.commandBufferError(buffer) : nil)
+            }
         }
-        // Collect GPU-side failures (.outOfMemory / .timeout / .deviceRemoved, …).
-        commandBuffer.addCompletedHandler { buffer in
-            onCompleted(buffer.status == .error ? Self.commandBufferError(buffer) : nil)
-        }
-        commandBuffer.commit()
-        lastCommittedBuffer = commandBuffer
+        frame.commit()
+        lastCommittedBuffer = frame
+        lastCommittedUploadBuffer = commandBuffer != nil ? uploads : nil
         if present { acquiredDrawables.removeAll() }
         frameStagingBuffers.removeAll()
-        self.commandBuffer = nil
+        commandBuffer = nil
+        uploadCommandBuffer = nil
+        uploadEncoder = nil
     }
 
     /// Releases one canvas's drawable we could not draw — called by the engine when that canvas's
@@ -169,10 +220,12 @@ public final class WGPUMetalBackend: WGPUBackend {
         return created
     }
 
+    /// The blit encoder for **encoder copies** (copy*/clearBuffer/resolveQuerySet) — in stream order on
+    /// the frame command buffer. Queue writes use `activeUploadEncoder()` instead.
     private func activeBlitEncoder() throws -> MTLBlitCommandEncoder {
         if let blitEncoder { return blitEncoder }
         guard renderEncoder == nil, computeEncoder == nil else {
-            throw WGPUError.validation("copy and upload commands cannot be used inside a render/compute pass")
+            throw WGPUError.validation("copy commands cannot be used inside a render/compute pass")
         }
         guard let encoder = try activeCommandBuffer().makeBlitCommandEncoder() else {
             throw WGPUError.backend("MTLBlitCommandEncoder creation failed")
@@ -181,13 +234,58 @@ public final class WGPUMetalBackend: WGPUBackend {
         return encoder
     }
 
+    /// The blit encoder for **queue writes** — on the batch's upload command buffer, open regardless of
+    /// passes (see `uploadCommandBuffer`). Ended at `submit`, not at `endPass`.
+    private func activeUploadEncoder() throws -> MTLBlitCommandEncoder {
+        if let uploadEncoder { return uploadEncoder }
+        guard let created = queue.makeCommandBuffer() else {
+            throw WGPUError.backend("MTLCommandBuffer creation failed")
+        }
+        created.label = "webgpu.queue-writes"
+        guard let encoder = created.makeBlitCommandEncoder() else {
+            throw WGPUError.backend("MTLBlitCommandEncoder creation failed")
+        }
+        uploadCommandBuffer = created
+        uploadEncoder = encoder
+        return encoder
+    }
+
     public func endPass() {
         renderEncoder?.endEncoding()
         renderEncoder = nil
+        encodePendingResolves()
         computeEncoder?.endEncoding()
         computeEncoder = nil
         blitEncoder?.endEncoding()
         blitEncoder = nil
+        currentRenderPipeline = nil
+        currentComputePipeline = nil
+    }
+
+    /// Emulates `.storeAndMultisampleResolve` where the device lacks it: the pass stored its samples,
+    /// and a draw-less pass loads them and resolves (Dawn's `EmulateStoreAndMSAAResolve` does the same).
+    /// Formally Metal leaves the attachment undefined after `.multisampleResolve`; in practice (and in
+    /// Dawn's identical emulation) a draw-less pass does not write it back, so the stored samples survive.
+    private func encodePendingResolves() {
+        guard !pendingResolves.isEmpty else { return }
+        let resolves = pendingResolves
+        pendingResolves.removeAll()
+        let passDescriptor = MTLRenderPassDescriptor()
+        for (index, pair) in resolves.enumerated() {
+            let target = passDescriptor.colorAttachments[index]!
+            target.texture = pair.texture
+            target.resolveTexture = pair.resolve
+            target.loadAction = .load
+            target.storeAction = .multisampleResolve
+        }
+        // `endPass` cannot throw — the pass that owes this resolve already created the command buffer,
+        // so a failure is reported through `collectBatchDiagnostics` instead of dropped silently.
+        guard let encoder = commandBuffer?.makeRenderCommandEncoder(descriptor: passDescriptor) else {
+            batchDiagnostics.append(.backend("emulated store+resolve encoder creation failed"))
+            return
+        }
+        encoder.label = "webgpu.emulatedStoreAndResolve"
+        encoder.endEncoding()
     }
 
     /// The pass-scope target for debug groups and markers — blit is excluded as an internal encoder
@@ -203,9 +301,10 @@ public final class WGPUMetalBackend: WGPUBackend {
     }
 
     public func writeBuffer(_ buffer: WGPUBufferObject, offset: Int, data: Data) throws {
+        // A direct memcpy would race the previous frame's GPU work. A blit puts it in queue order —
+        // on the upload command buffer, ahead of this batch's encoder work (see `uploadCommandBuffer`).
+        let encoder = try activeUploadEncoder()
         let staging = try makeStagingBuffer(data)
-        // A direct memcpy would race the previous frame's GPU work. A blit puts it in queue order.
-        let encoder = try activeBlitEncoder()
         encoder.copy(
             from: staging, sourceOffset: 0,
             to: buffer.buffer, destinationOffset: offset, size: data.count
@@ -231,22 +330,45 @@ public final class WGPUMetalBackend: WGPUBackend {
         // If submitted work is still running, read after it completes.
         // `addCompletedHandler` cannot be attached after commit (a Metal assertion), so we wait on a dedicated queue.
         let pending = lastCommittedBuffer
-        if let pending, pending.status == .error {
-            finish(pending)
+        let uploads = lastCommittedUploadBuffer
+        // Either half of the last batch failing fails the read (the uploads first — they ran first).
+        let failedBuffer: () -> MTLCommandBuffer? = {
+            if let uploads, uploads.status == .error { return uploads }
+            if let pending, pending.status == .error { return pending }
+            return nil
+        }
+        if let failed = failedBuffer() {
+            finish(failed)
             return
         }
-        guard let pending, pending.status != .completed else {
+        let running = [uploads, pending].contains { ($0?.status ?? .completed) != .completed }
+        guard running else {
             finish(nil)
             return
         }
         Self.readbackQueue.async {
-            pending.waitUntilCompleted()
-            finish(pending.status == .error ? pending : nil)
+            uploads?.waitUntilCompleted()
+            pending?.waitUntilCompleted()
+            finish(failedBuffer())
         }
     }
 
     /// The dedicated queue waiting on GPU completion — it never blocks the JS thread.
     private static let readbackQueue = DispatchQueue(label: "org.lynxwebgpu.readback")
+
+    public func mapBufferForWrite(
+        _ buffer: WGPUBufferObject, offset: Int, length: Int,
+        deliver: @escaping (Result<Data, WGPUError>) -> Void
+    ) {
+        // Mapping is wire state only here (shared memory) — a write mapping's initial view is the
+        // current contents after prior GPU work, which is exactly what a read delivers.
+        readBuffer(buffer, offset: offset, length: length, deliver: deliver)
+    }
+
+    public func writeMappedBuffer(_ buffer: WGPUBufferObject, offset: Int, data: Data) throws {
+        // Metal has no usage flags, so the queue-ordered staging blit serves a MAP_WRITE buffer as is.
+        try writeBuffer(buffer, offset: offset, data: data)
+    }
 
     public func makeTexture(_ descriptor: WGPUTextureDescriptor) throws -> WGPUTextureObject {
         try WGPUTextureObject(device: device, descriptor: descriptor)
@@ -256,13 +378,16 @@ public final class WGPUMetalBackend: WGPUBackend {
         _ texture: WGPUTextureObject, data: Data, origin: WGPUOrigin3D, size: WGPUExtent3D,
         mipLevel: Int, bytesPerRow: Int, rowsPerImage: Int
     ) throws {
+        try Self.ensureNotFramebufferOnly(texture.texture, "writeTexture")
         let blockRows = texture.format.blockRows(height: size.height)
         let bytesPerImage = bytesPerRow * max(rowsPerImage, blockRows)
         let layers = max(size.depthOrArrayLayers, 1)
+        // A blit puts it in queue order for the same reason as writeBuffer — on the upload command
+        // buffer, so it is serialized after earlier batches and ahead of this batch's encoder work.
+        let encoder = try activeUploadEncoder()
         // Staging reserves the full image stride — the Metal validation layer computes the last image
         // by bytesPerImage too. The leftover tail is never copied into the texture.
         let staging = try makeStagingBuffer(data, minimumLength: bytesPerImage * layers)
-        // A blit puts it in queue order for the same reason as writeBuffer — serialized with earlier renders and copies.
         texture.encodeWrite(
             from: staging,
             origin: origin,
@@ -270,11 +395,11 @@ public final class WGPUMetalBackend: WGPUBackend {
             mipLevel: mipLevel,
             bytesPerRow: bytesPerRow,
             rowsPerImage: rowsPerImage,
-            blit: try activeBlitEncoder()
+            blit: encoder
         )
     }
 
-    /// Takes a staging buffer from the pool, fills it with data, and lists it for recycling at frame completion.
+    /// Takes a staging buffer from the pool, fills it with data, and lists it for recycling when the uploads complete.
     private func makeStagingBuffer(_ data: Data, minimumLength: Int = 0) throws -> MTLBuffer {
         let staging = try stagingPool.acquire(data, minimumLength: minimumLength)
         frameStagingBuffers.append(staging)
@@ -301,7 +426,8 @@ public final class WGPUMetalBackend: WGPUBackend {
     }
 
     public func unmapBuffer(_ buffer: WGPUBufferObject) {
-        // Mapping on the Metal path is wire state only (shared memory is read directly) — there is nothing to release.
+        // Mapping on the Metal path is wire state only (shared memory is read directly, and a write
+        // mapping's bytes already went through `writeMappedBuffer`) — there is nothing to release.
     }
 
     public func compilationMessages(of module: WGPUShaderModuleObject) -> [WGPUCompilationMessage] {
@@ -339,6 +465,7 @@ public final class WGPUMetalBackend: WGPUBackend {
             case .sampler(let sampler):
                 resource = .sampler(sampler.sampler)
             case .textureView(let view):
+                try Self.ensureNotFramebufferOnly(view.texture, "binding \(entry.binding)")
                 resource = .texture(view.texture)
             }
             return WGPUMetalBindGroup.Binding(
@@ -397,9 +524,11 @@ public final class WGPUMetalBackend: WGPUBackend {
             pipeline: pipeline,
             info: WGPURenderPipelineInfo(
                 requiredGroups: resolved.requiredGroups,
+                layoutGroupCount: resolved.groups.count,
                 requiredVertexSlots: pipeline.requiredVertexSlots,
                 writesDepth: pipeline.writesDepth,
-                writesStencil: pipeline.writesStencil
+                writesStencil: pipeline.writesStencil,
+                minimumBindingSizes: Self.minimumBindingSizes(stages: stages)
             )
         )
     }
@@ -420,8 +549,29 @@ public final class WGPUMetalBackend: WGPUBackend {
         )
         return WGPUComputePipelineCreation(
             pipeline: pipeline,
-            info: WGPUComputePipelineInfo(requiredGroups: resolved.requiredGroups)
+            info: WGPUComputePipelineInfo(
+                requiredGroups: resolved.requiredGroups, layoutGroupCount: resolved.groups.count,
+                minimumBindingSizes: Self.minimumBindingSizes(stages: [(module, [descriptor.entryPoint!])])
+            )
         )
+    }
+
+    /// The spec's minimum buffer binding size of every buffer the stages use, from WGSL reflection
+    /// (the larger one when two modules declare the same binding). An MSL module contributes nothing —
+    /// its bindings go unchecked.
+    private static func minimumBindingSizes(
+        stages: [(module: WGPUShaderModuleObject, entryPoints: [String])]
+    ) -> [Int: [Int: Int]] {
+        var sizes: [Int: [Int: Int]] = [:]
+        for stage in stages {
+            guard let wgsl = stage.module.wgsl else { continue }
+            for (group, bindings) in wgsl.reflection.minimumBindingSizes(usedBy: stage.entryPoints) {
+                for (binding, size) in bindings {
+                    sizes[group, default: [:]][binding] = max(sizes[group]?[binding] ?? 0, size)
+                }
+            }
+        }
+        return sizes
     }
 
     /// An explicit layout passes through; `"auto"` is derived from the shader declarations.
@@ -514,6 +664,7 @@ public final class WGPUMetalBackend: WGPUBackend {
 
     public func beginRenderPass(_ pass: WGPUResolvedRenderPass<WGPUMetalBackend>) throws {
         let passDescriptor = MTLRenderPassDescriptor()
+        var emulatedResolves: [(texture: MTLTexture, resolve: MTLTexture)] = []
 
         for (index, attachment) in pass.colorAttachments.enumerated() {
             let target = passDescriptor.colorAttachments[index]!
@@ -527,8 +678,15 @@ public final class WGPUMetalBackend: WGPUBackend {
                 alpha: attachment.clearValue.alpha
             )
             if let resolve = attachment.resolveTarget {
-                target.resolveTexture = resolve.texture
-                target.storeAction = .multisampleResolve
+                target.storeAction = WGPUMetalMapping.resolvingStoreAction(
+                    attachment.storeOp, combinedSupported: supportsStoreAndMultisampleResolve
+                )
+                if target.storeAction == .store {
+                    // No combined action — keep the samples now, resolve when the pass ends.
+                    emulatedResolves.append((attachment.view.texture, resolve.texture))
+                } else {
+                    target.resolveTexture = resolve.texture
+                }
             }
         }
 
@@ -575,6 +733,9 @@ public final class WGPUMetalBackend: WGPUBackend {
         if let label = pass.label { encoder.label = label }
         renderEncoder = encoder
         currentRenderPipeline = nil
+        currentComputePipeline = nil
+        // Only a pass that actually opened owes its resolves to `endPass`.
+        pendingResolves = emulatedResolves
     }
 
     public func beginComputePass(_ pass: WGPUResolvedComputePass<WGPUMetalBackend>) throws {
@@ -599,6 +760,7 @@ public final class WGPUMetalBackend: WGPUBackend {
         }
         if let label = pass.label { encoder.label = label }
         computeEncoder = encoder
+        currentRenderPipeline = nil
         currentComputePipeline = nil
     }
 
@@ -607,14 +769,19 @@ public final class WGPUMetalBackend: WGPUBackend {
         encoder.setRenderPipelineState(pipeline.state)
         encoder.setCullMode(pipeline.cullMode)
         encoder.setFrontFacing(pipeline.winding)
+        // Only pipelines with `depthStencil` carry a state object. In valid WebGPU its format must match
+        // the pass's depth attachment, so within one encoder either every pipeline has one or none does —
+        // a fresh encoder starts from Metal's default. (The engine does not check that match itself; the
+        // Metal validation layer does.)
         if let depthStencilState = pipeline.depthStencilState {
             encoder.setDepthStencilState(depthStencilState)
         }
-        if pipeline.depthBias != 0 || pipeline.depthBiasSlopeScale != 0 {
-            encoder.setDepthBias(
-                pipeline.depthBias, slopeScale: pipeline.depthBiasSlopeScale, clamp: pipeline.depthBiasClamp
-            )
-        }
+        // Depth bias is pipeline state in WebGPU but sticky encoder state in Metal — it survives
+        // `setRenderPipelineState`. Set it **unconditionally** (zeros for a pipeline without bias), or a
+        // pipeline without bias drawn after a shadow/decal pipeline inherits that pipeline's offset.
+        encoder.setDepthBias(
+            pipeline.depthBias, slopeScale: pipeline.depthBiasSlopeScale, clamp: pipeline.depthBiasClamp
+        )
         currentRenderPipeline = pipeline
     }
 
@@ -625,7 +792,11 @@ public final class WGPUMetalBackend: WGPUBackend {
     }
 
     public func applyBindGroup(_ group: WGPUMetalBindGroup, at groupIndex: Int, dynamicOffsets: [Int]) throws {
-        guard let layout = currentRenderPipeline?.layout ?? currentComputePipeline?.layout else { return }
+        // The layout comes from the open pass's own pipeline — never "whichever is set": a render
+        // pipeline left over from an earlier pass would map a compute pass's groups to its own Metal
+        // indices (silently wrong bindings, or a bogus "no @group" error that drops the dispatch).
+        let layout = renderEncoder != nil ? currentRenderPipeline?.layout : currentComputePipeline?.layout
+        guard let layout else { return }
         var offsetCursor = 0
         for binding in group.bindings {
             guard let metalIndex = layout.assignment.index(group: groupIndex, binding: binding.binding) else {
@@ -892,6 +1063,7 @@ public final class WGPUMetalBackend: WGPUBackend {
         size: WGPUExtent3D, buffer: WGPUBufferObject, offset: Int,
         bytesPerRow: Int, bytesPerImage: Int
     ) throws {
+        try Self.ensureNotFramebufferOnly(texture.texture, "copyTextureToBuffer")
         let encoder = try activeBlitEncoder()
         encoder.copy(
             from: texture.texture,
@@ -911,6 +1083,7 @@ public final class WGPUMetalBackend: WGPUBackend {
         texture: WGPUTextureObject, slice: Int, mipLevel: Int, origin: WGPUOrigin3D,
         size: WGPUExtent3D
     ) throws {
+        try Self.ensureNotFramebufferOnly(texture.texture, "copyBufferToTexture")
         let encoder = try activeBlitEncoder()
         encoder.copy(
             from: buffer.buffer,
@@ -931,6 +1104,8 @@ public final class WGPUMetalBackend: WGPUBackend {
         destination: WGPUTextureObject, destinationSlice: Int, destinationMipLevel: Int,
         destinationOrigin: WGPUOrigin3D, size: WGPUExtent3D
     ) throws {
+        try Self.ensureNotFramebufferOnly(source.texture, "copyTextureToTexture source")
+        try Self.ensureNotFramebufferOnly(destination.texture, "copyTextureToTexture destination")
         let encoder = try activeBlitEncoder()
         encoder.copy(
             from: source.texture,
@@ -942,6 +1117,20 @@ public final class WGPUMetalBackend: WGPUBackend {
             destinationSlice: destinationSlice,
             destinationLevel: destinationMipLevel,
             destinationOrigin: MTLOrigin(x: destinationOrigin.x, y: destinationOrigin.y, z: 0)
+        )
+    }
+
+    /// Metal rejects every use of a framebuffer-only texture other than as a render pass attachment
+    /// (a validation assertion that kills a debug process) — only canvas drawables can be one. The canvas
+    /// usage may lack the use, or the configure requesting it has not landed yet: a JS-thread configure
+    /// applies `framebufferOnly` on main asynchronously (`WGPUMetalLayerSurface`). Only the offending op
+    /// fails; the frame still renders and presents.
+    private static func ensureNotFramebufferOnly(_ texture: MTLTexture, _ use: String) throws {
+        guard texture.isFramebufferOnly else { return }
+        throw WGPUError.validation(
+            "\(use): the canvas texture is framebuffer-only — the canvas usage does not include this use, "
+                + "or the configure requesting it has not taken effect yet (it applies on the main thread "
+                + "asynchronously; a later frame will have it)"
         )
     }
 

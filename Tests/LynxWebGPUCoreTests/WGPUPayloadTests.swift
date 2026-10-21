@@ -79,7 +79,7 @@ final class WGPUPayloadTests: XCTestCase {
         let commands = try reader.requiredObjects("commands")
 
         XCTAssertEqual(try commands[0].requiredData("data"), bytes)
-        XCTAssertEqual(commands[0].int("bufferOffset", default: 0), 16)
+        XCTAssertEqual(try commands[0].int("bufferOffset", default: 0), 16)
 
         let attachment = try commands[1].requiredObjects("colorAttachments")[0]
         XCTAssertEqual(try attachment.requiredHandle("view"), WGPUHandle(7))
