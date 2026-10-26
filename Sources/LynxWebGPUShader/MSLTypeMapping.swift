@@ -166,8 +166,31 @@ enum MSLTypeMapping {
         "border_color", "lod_clamp", "mesh", "fast", "precise", "quad", "simd",
     ]
 
-    /// Names unusable as function names (`main` is not a C++ keyword but Metal rejects it).
-    private static let reservedFunctionNames: Set<String> = ["main"]
+    /// Names unusable as user function names: `main` (not a C++ keyword, but Metal rejects it) and
+    /// every function the `metal` namespace declares. The prelude's `using namespace metal;` makes a
+    /// file-scope `float max(float, float)` **ambiguous** with `metal::max` at every call, so a user
+    /// `fn max` (`fn max3`, `fn saturate`, `fn mix`, …) is renamed. WGSL lets a module shadow a
+    /// builtin this way, and calls go through `functionName` as declarations do, so the two stay
+    /// paired. Builtin calls never come here — a `max(…)` with no user `fn max` keeps its spelling.
+    private static let reservedFunctionNames: Set<String> = [
+        "main",
+        // <metal_math>
+        "abs", "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "ceil", "copysign", "cos",
+        "cosh", "cospi", "divide", "exp", "exp2", "exp10", "fdim", "floor", "fma", "fmax", "fmax3",
+        "fmedian3", "fmin", "fmin3", "fmod", "fract", "frexp", "ilogb", "ldexp", "log", "log2", "log10",
+        "max", "max3", "median3", "min", "min3", "modf", "nextafter", "pow", "powr", "rint", "round",
+        "rsqrt", "sin", "sincos", "sinh", "sinpi", "sqrt", "tan", "tanh", "tanpi", "trunc",
+        // <metal_integer>
+        "abs_diff", "addsat", "clz", "ctz", "extract_bits", "hadd", "insert_bits", "mad24", "madhi",
+        "madsat", "mul24", "mulhi", "popcount", "reverse_bits", "rhadd", "rotate", "subsat",
+        // <metal_common> · <metal_relational> · <metal_geometric> · <metal_matrix>
+        "clamp", "mix", "saturate", "sign", "smoothstep", "step", "all", "any", "isfinite", "isinf",
+        "isnan", "isnormal", "isordered", "isunordered", "select", "cross", "distance",
+        "distance_squared", "dot", "faceforward", "length", "length_squared", "normalize", "reflect",
+        "refract", "determinant", "transpose",
+        // <metal_graphics> · <metal_compute>
+        "dfdx", "dfdy", "fwidth", "discard_fragment", "threadgroup_barrier", "simdgroup_barrier",
+    ]
 
     /// Renames an entry point or function to a name that is safe in MSL.
     ///

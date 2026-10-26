@@ -98,6 +98,11 @@ struct MSLEmitter {
     private var breakFlag: String?
     private var output = ""
     private var indentLevel = 0
+    /// The type of each module constant whose type is declared or could be inferred, in declaration
+    /// order — what `inferredType(of:)` reads for an identifier, so `const TAU = PI * 2.0;` is typed
+    /// from `PI` rather than falling back to a `#define`. Built in declaration order, so a constant
+    /// only ever sees the ones before it (no cycle can recurse).
+    private var constantTypes: [String: WGSLType] = [:]
 
     init(module: WGSLModule, reflection: WGSLShaderReflection, bindings: WGSLBindingAssignment) {
         var module = module
@@ -133,6 +138,11 @@ struct MSLEmitter {
         self.structNames = Set(module.structs.map(\.name))
         self.needsBufferSizes = WGSLReflectionBuilder.functionsNeedingBufferSizes(in: module)
         self.storageGlobalNames = Set(module.globals.filter { $0.addressSpace == "storage" }.map(\.name))
+        for constant in module.constants {
+            if let type = constant.type ?? constant.value.flatMap(inferredType(of:)) {
+                constantTypes[constant.name] = type
+            }
+        }
     }
 
     // MARK: - Entry
@@ -404,6 +414,10 @@ struct MSLEmitter {
             return .scalar(text.hasSuffix("u") ? "u32" : "i32")
         case .boolLiteral:
             return .scalar("bool")
+        case .identifier(let name):
+            // A module constant declared earlier (`constantTypes`) — anything else is a local or a
+            // global, whose type this syntax-only guess does not track.
+            return constantTypes[name]
         case .paren(let inner), .unary(_, let inner):
             return inferredType(of: inner)
         case .binary(let op, let left, let right):
@@ -437,7 +451,10 @@ struct MSLEmitter {
         case .call(let callee, let typeArguments, let arguments):
             if structNames.contains(callee) { return .named(callee) }
             if Self.scalarResultBuiltins.contains(callee), let first = arguments.first.flatMap(inferredType(of:)) {
-                return Self.floatened(Self.componentScalar(of: first))
+                // `dot` keeps the component type (an integer vector gives an integer); the others
+                // take float vectors only.
+                let scalar = Self.componentScalar(of: first)
+                return callee == "dot" ? scalar : Self.floatened(scalar)
             }
             if Self.floatShapedBuiltins.contains(callee), let first = arguments.first.flatMap(inferredType(of:)) {
                 return Self.floatened(first)

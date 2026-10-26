@@ -2079,10 +2079,12 @@ final class WGSLTranspilerTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 3, "the const chain was re-evaluated per reference")
         XCTAssertEqual(auto[0].first?.binding, 1)
         XCTAssertEqual([size.x, size.y, size.z], [1, 1, 1])
-        // The MSL is deliberately not pushed through the Metal compiler here: an untyped module-scope
-        // `const` is emitted as a `#define`, so this chain expands exponentially in Metal's preprocessor
-        // (18 levels take 2.4 s, 26 levels about 25 minutes) — a separate problem from the evaluator's.
-        XCTAssertTrue(msl.contains("#define x26 (wgpu_div((x25 + x25), 2u))"), msl)
+        // Each link is typed from the one before it (`x0` is `u32`, so every `xN` is) — a `constant
+        // uint`, not a `#define`. As macros the chain expanded exponentially in Metal's preprocessor
+        // too (18 levels took 2.4 s, 26 levels about 25 minutes); typed, it compiles in no time.
+        XCTAssertTrue(msl.contains("constant uint x26 = wgpu_div((x25 + x25), 2u);"), msl)
+        XCTAssertFalse(msl.contains("#define x"), msl)
+        MetalCompilerHarness.assertCompiles(msl)
     }
 
     // MARK: - @workgroup_size
@@ -2406,6 +2408,10 @@ final class WGSLTranspilerTests: XCTestCase {
 
     /// A user function may be named like a builtin family — `textureBicubic`, `atomicIncrement`,
     /// even `max`. Dispatching on the name's prefix first rejected it as an unsupported builtin.
+    ///
+    /// A name the `metal` namespace also declares (`max`, `max3`, `saturate`) is renamed as well:
+    /// the prelude's `using namespace metal;` would otherwise make every call to the file-scope
+    /// declaration ambiguous ("call to 'max3' is ambiguous" from the Metal compiler).
     func test_aUserFunctionNamedLikeABuiltinFamilyIsCalledAsAFunction() throws {
         let msl = try translate("""
         @group(0) @binding(0) var t: texture_2d<f32>;
@@ -2414,15 +2420,24 @@ final class WGSLTranspilerTests: XCTestCase {
 
         fn textureBicubic(uv: vec2f) -> vec4f { return textureSample(t, s, uv); }
         fn atomicIncrement() -> u32 { return atomicAdd(&counter, 1u); }
+        fn max(a: f32, b: f32) -> f32 { return select(a, b, b > a); }
+        fn saturate(a: f32) -> f32 { return clamp(a, 0.0, 1.0); }
+        // Declared after `max`: functions go out in source order with no prototypes (C++ needs the
+        // callee first), and this `max` resolves to the user's, as WGSL's shadowing says.
         fn max3(a: f32, b: f32, c: f32) -> f32 { return max(max(a, b), c); }
 
         @fragment fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {
             let n = atomicIncrement();
-            return textureBicubic(uv) * max3(uv.x, uv.y, f32(n));
+            return textureBicubic(uv) * max3(uv.x, uv.y, f32(n)) + saturate(max(uv.x, uv.y));
         }
         """, entryPoints: ["fs"])
         XCTAssertTrue(msl.contains("textureBicubic("), msl)
         XCTAssertTrue(msl.contains("atomicIncrement("), msl)
+        for name in ["max3", "max", "saturate"] {
+            XCTAssertTrue(msl.contains("float wgpu_fn_\(name)("), "\(name) must be declared renamed\n\(msl)")
+            XCTAssertTrue(msl.contains("wgpu_fn_\(name)("), msl)
+            XCTAssertFalse(msl.contains("float \(name)("), "\(name) must not be declared at file scope\n\(msl)")
+        }
     }
 
     /// `- -b` glued together is C++'s pre-decrement.
@@ -2489,6 +2504,30 @@ final class WGSLTranspilerTests: XCTestCase {
         XCTAssertTrue(msl.contains("constant float half_turn = "), msl)
         XCTAssertTrue(msl.contains("constant int r = "), msl)
         XCTAssertFalse(msl.contains("#define scale"), msl)
+    }
+
+    /// A constant defined from another constant takes its type from it — `const TAU = PI * 2.0;`
+    /// stayed a `#define` because `PI` had no type in the syntax-only guess, and the macro then
+    /// rewrote a struct member named `TAU` (a Metal compile error).
+    func test_aModuleConstantDefinedFromAnotherConstantIsTypedToo() throws {
+        let msl = try translate("""
+        const PI = 3.14159;
+        const TAU = PI * 2.0;
+        const HALF = TAU / 4;
+        const N = max(2, 3) * 2;
+        struct S { TAU: f32 }
+
+        @fragment fn fs(@location(0) x: f32) -> @location(0) vec4f {
+            var s: S;
+            s.TAU = x;
+            var arr = array<f32, 8>();
+            return vec4f(s.TAU * TAU + HALF + arr[N]);
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("constant float TAU = "), msl)
+        XCTAssertTrue(msl.contains("constant float HALF = "), msl)
+        XCTAssertTrue(msl.contains("constant int N = "), msl)
+        XCTAssertFalse(msl.contains("#define"), msl)
     }
 
     /// `metal`, `matrix`, `float`… are plain identifiers in WGSL and collide with the namespace or

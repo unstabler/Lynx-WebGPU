@@ -257,7 +257,7 @@ Metal은 둘 다 느슨해서, 안 막으면 브라우저·Dawn에서만 거부�
 | `setBindGroup` | `index` · `bindGroup` · `dynamicOffsets[]` — 개수는 레이아웃의 `hasDynamicOffset` 항목 수와 같아야 하고(바인딩 번호 순), 각 값은 `minUniformBufferOffsetAlignment`/`minStorageBufferOffsetAlignment`의 배수, `offset + 동적 오프셋 + size ≤ 버퍼 크기` (size 생략 시 버퍼 끝까지라 0만 된다 — Dawn과 같은 규칙). 어긋나면 이 명령에서 검증 오류 |
 | `setVertexBuffer` | `slot` · `buffer` · `offset`(0) · `size?`(생략 시 버퍼 끝까지 — `offset + size ≤ 버퍼 크기`) |
 | `setIndexBuffer` | `buffer` · `format`(`"uint16"`\|`"uint32"`) · `offset`(0 — 인덱스 크기의 배수) · `size?`(생략 시 버퍼 끝까지). `drawIndexed`의 `firstIndex + indexCount`는 이 범위 안이어야 한다 |
-| `setViewport` | `x`(0) · `y`(0) · `width` · `height` · `minDepth`(0) · `maxDepth`(1) — 패스 어태치먼트 안, `0 ≤ minDepth ≤ maxDepth ≤ 1` |
+| `setViewport` | `x`(0) · `y`(0) · `width` · `height` · `minDepth`(0) · `maxDepth`(1) — 명세 범위 안: `0 ≤ width, height ≤ maxTextureDimension2D`, `x, y ≥ −2·maxTextureDimension2D`, `x + width`·`y + height ≤ 2·maxTextureDimension2D − 1`, `0 ≤ minDepth ≤ maxDepth ≤ 1`. **어태치먼트 밖으로 나가도 된다** (명세·Metal 모두 허용 — 시저와 다르다) |
 | `setScissorRect` | `x`(0) · `y`(0) · `width` · `height` — 패스 어태치먼트 안 (어긋나면 검증 오류. 리사이즈 직후 이전 크기로 계산한 시저가 여기 걸릴 수 있다) |
 | `setBlendConstant` | `color` |
 | `setStencilReference` | `reference`(0) — **WebIDL의 `u32` 변환(modulo)을 적용한다** |

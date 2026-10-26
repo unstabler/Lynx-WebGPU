@@ -1620,21 +1620,26 @@ final class CommandInterpreterTests: XCTestCase {
         ]
     }
 
-    /// A scissor or viewport past the attachments is a validation error, not the validation layer's
-    /// assertion. It is reachable from correct JS — the shim sizes them from the previous batch's
-    /// canvas report, and a layout shrink in between leaves them past the new drawable.
+    /// A scissor past the attachments is a validation error, not the validation layer's assertion. It
+    /// is reachable from correct JS — the shim sizes it from the previous batch's canvas report, and
+    /// a layout shrink in between leaves it past the new drawable. A viewport is bounded by the
+    /// spec's range (`maxTextureDimension2D`), **not** by the attachments: past them is legal in a
+    /// browser, and Metal accepts it too (only the scissor asserts).
     func test_aScissorOrViewportOutsideTheAttachmentsIsAValidationError() {
         let result = harness.execute(textureAndPass() + [
             ["op": "setScissorRect", "x": 0, "y": 0, "width": 1_000_000, "height": 1_000_000],
             ["op": "setScissorRect", "x": -1, "y": 0, "width": 1, "height": 1],
-            ["op": "setViewport", "x": 0, "y": 0, "width": 8, "height": 8, "minDepth": 0, "maxDepth": 1],
+            ["op": "setViewport", "x": 0, "y": 0, "width": 1_000_000, "height": 4, "minDepth": 0, "maxDepth": 1],
+            ["op": "setViewport", "x": -1_000_000, "y": 0, "width": 4, "height": 4, "minDepth": 0, "maxDepth": 1],
             ["op": "setViewport", "x": 0, "y": 0, "width": 4, "height": 4, "minDepth": 2, "maxDepth": 1],
             // Inside the attachment — fine.
             ["op": "setScissorRect", "x": 1, "y": 1, "width": 3, "height": 3],
             ["op": "setViewport", "x": 0, "y": 0, "width": 4, "height": 4, "minDepth": 0, "maxDepth": 1],
+            // Past the attachment but inside the spec's range — fine as well.
+            ["op": "setViewport", "x": -2, "y": -2, "width": 8, "height": 8, "minDepth": 0, "maxDepth": 1],
             ["op": "endPass"],
         ])
-        XCTAssertEqual(errors(result).count, 4, harness.describeErrors(result))
+        XCTAssertEqual(errors(result).count, 5, harness.describeErrors(result))
         for error in errors(result) { XCTAssertEqual(error["kind"] as? String, "validation") }
     }
 

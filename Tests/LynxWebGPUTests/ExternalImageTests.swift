@@ -480,7 +480,8 @@ final class ExternalImageTests: XCTestCase {
         XCTAssertTrue(harness.describeErrors(result).contains("compressed"), harness.describeErrors(result))
     }
 
-    /// A non-4-byte format is refused rather than going quietly wrong.
+    /// A format the upload cannot convert into is refused (`unsupported`) rather than receiving the
+    /// RGBA8 bytes as they are.
     func test_a16BitFormatIsRefused() throws {
         let png = try makePNG(width: 4, height: 4, top: (255, 0, 0, 255), bottom: (255, 0, 0, 255))
         try decode(handle: 40, data: png)
@@ -492,7 +493,12 @@ final class ExternalImageTests: XCTestCase {
              "source": ["source": 40], "destination": ["texture": 2]],
         ])
         XCTAssertEqual(result["ok"] as? Bool, false)
-        XCTAssertTrue(harness.describeErrors(result).contains("4-byte"), harness.describeErrors(result))
+        let errors = (result["errors"] as? [[String: Any]]) ?? []
+        XCTAssertEqual(errors.first?["kind"] as? String, "unsupported", harness.describeErrors(result))
+        XCTAssertTrue(
+            harness.describeErrors(result).contains("rgba8unorm(-srgb) and bgra8unorm(-srgb) only"),
+            harness.describeErrors(result)
+        )
     }
 
     func test_aMissingImageHandleIsAClearError() throws {

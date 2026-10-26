@@ -2445,20 +2445,30 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         }
     }
 
-    /// The spec's `setViewport` checks — finite values, inside the attachments, depth range in
-    /// [0, 1]. A viewport past the render target is a Metal validation assertion.
+    /// The spec's `setViewport` checks — finite values, a size within `maxTextureDimension2D`, an
+    /// origin within twice that on either side, and a depth range in [0, 1].
+    ///
+    /// A viewport is **not** bounded by the attachments: the spec lets it extend past them (the
+    /// fragments outside are simply not rasterized), and Metal's validation layer accepts that as
+    /// well — an origin of −4 and a 16384² extent on an 8² target encode and complete; only a scissor
+    /// past the target asserts (`validateScissorRect`). Bounding it here rejected JS a browser runs.
     private func validateViewport(_ command: WGPUSetViewportCommand) throws {
         let values = [command.x, command.y, command.width, command.height, command.minDepth, command.maxDepth]
         guard values.allSatisfy({ $0.isFinite }) else {
             throw WGPUError.validation("setViewport arguments must be finite numbers", path: command.path)
         }
-        guard specValidation, let size = passSize else { return }
-        guard command.x >= 0, command.y >= 0, command.width >= 0, command.height >= 0,
-              command.x + command.width <= Double(size.width),
-              command.y + command.height <= Double(size.height) else {
+        guard specValidation else { return }
+        let maxDimension = Double(limit("maxTextureDimension2D", default: 8192))
+        let range = maxDimension * 2
+        guard command.width >= 0, command.width <= maxDimension,
+              command.height >= 0, command.height <= maxDimension,
+              command.x >= -range, command.y >= -range,
+              command.x + command.width <= range - 1,
+              command.y + command.height <= range - 1 else {
             throw WGPUError.validation(
-                "the viewport (\(command.x), \(command.y)) \(command.width)x\(command.height) lies outside "
-                    + "the render pass attachments (\(size.width)x\(size.height))",
+                "the viewport (\(command.x), \(command.y)) \(command.width)x\(command.height) is outside the "
+                    + "spec's range — width and height at most maxTextureDimension2D (\(Int(maxDimension))), "
+                    + "x and y at least −\(Int(range)), and origin + size below \(Int(range))",
                 path: command.path
             )
         }
