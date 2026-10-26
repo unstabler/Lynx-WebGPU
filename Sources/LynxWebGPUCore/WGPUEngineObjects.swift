@@ -68,14 +68,21 @@ public final class WGPUEngineTextureView<B: WGPUBackend> {
     public let raw: B.TextureView
     public let format: WGPUTextureFormat
     public let sampleCount: Int
+    /// The extent of the view's base mip level — what a render pass measures its attachments,
+    /// viewport and scissor against. Zero when unknown.
+    public let width: Int
+    public let height: Int
     /// A view of a shared texture — inherits its read-only rule (no render attachment, no write-access
     /// storage binding).
     public let isShared: Bool
 
-    public init(raw: B.TextureView, format: WGPUTextureFormat, sampleCount: Int, isShared: Bool = false) {
+    public init(raw: B.TextureView, format: WGPUTextureFormat, sampleCount: Int,
+                width: Int = 0, height: Int = 0, isShared: Bool = false) {
         self.raw = raw
         self.format = format
         self.sampleCount = sampleCount
+        self.width = width
+        self.height = height
         self.isShared = isShared
     }
 }
