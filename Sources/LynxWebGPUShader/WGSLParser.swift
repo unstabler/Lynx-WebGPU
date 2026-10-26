@@ -115,25 +115,39 @@ struct WGSLParser {
     /// `v.x.x.…`, `m[0][0]…`) is built in a loop — so it never counts, while the tree it builds is as
     /// tall as the chain is long and **every later walk recurses once per node along it**
     /// (reflection, emission). A hundred-thousand-term chain overflowed the emitter's stack: a
-    /// SIGSEGV of the host from shader text in a bundle. So the finished tree's height is measured
-    /// (`WGSLExpression.height`, iteratively) and capped here. Real shaders are nowhere near it —
+    /// SIGSEGV of the host from shader text in a bundle.
+    ///
+    /// The cap is enforced **while the chain is built** (`parseBinary`, `parsePostfix`), not only on
+    /// the finished tree. The tree is an `indirect enum`, and releasing one recurses once per level
+    /// too (`swift_release` → the payload's destructor → the child's release). Measuring after the
+    /// fact and throwing still left a hundred-thousand-level tree to be freed on the way out of the
+    /// parser, and that release overflowed the 16 MB `WGSLDeepStack` (a SIGBUS from the original
+    /// report's input). So no tree taller than this is ever made. Real shaders are nowhere near it —
     /// 1024 chained operators is far beyond what hand-written or machine-generated code produces —
-    /// and 1024 recursive frames fit the 16 MB `WGSLDeepStack` with room to spare.
+    /// and 1024 recursive frames fit the deep stack with room to spare.
     static let maximumExpressionHeight = 1024
 
-    /// How many `parseExpression` calls are on the stack — the height check runs once, at the
+    /// How many `parseExpression` calls are on the stack — the finished-tree check runs once, at the
     /// outermost one, so a long chain is measured once rather than once per nested operand.
     private var expressionDepth = 0
 
-    /// Rejects a finished expression whose tree is taller than `maximumExpressionHeight`.
-    private func checkHeight(of expression: WGSLExpression, line: Int) throws {
-        guard expression.height <= Self.maximumExpressionHeight else {
+    /// Rejects a tree about to grow taller than `maximumExpressionHeight` — the chain loops call it
+    /// with the height the next node would have, **before** that node is made.
+    private func checkHeight(_ height: Int, line: Int) throws {
+        guard height <= Self.maximumExpressionHeight else {
             throw error(
                 "the expression is deeper than \(Self.maximumExpressionHeight) levels "
                 + "— a chain of that many operators, members or indices is not translatable",
                 line: line
             )
         }
+    }
+
+    /// Rejects a finished expression whose tree is taller than `maximumExpressionHeight` — the
+    /// backstop behind the running checks, for the levels a wrapper outside any loop adds (a
+    /// parenthesis, a prefix operator, a call around a chain that is itself at the limit).
+    private func checkHeight(of expression: WGSLExpression, line: Int) throws {
+        try checkHeight(expression.height, line: line)
     }
 
     /// Called on entry to every recursive production; pair it with `defer { nestingDepth -= 1 }`.
@@ -799,10 +813,18 @@ struct WGSLParser {
     /// parenthesis costs a handful of stack frames rather than a dozen (the depth limit has to fit a
     /// 512 KB thread stack). Operators of one level associate left.
     private mutating func parseBinary(minimumLevel: Int) throws -> WGSLExpression {
+        let line = current.line
         var left = try parseUnary()
+        // The running height of `left`. The cap is applied as the chain grows (see
+        // `maximumExpressionHeight`) so the tree never gets tall enough for its own release to
+        // recurse out of the stack. `height` walks iteratively, and each operand is measured once —
+        // when it joins the chain.
+        var leftHeight = left.height
         while let level = binaryOperatorLevel(), level >= minimumLevel {
             let op = advance().text
             let right = try parseBinary(minimumLevel: level + 1)
+            leftHeight = max(leftHeight, right.height) + 1
+            try checkHeight(leftHeight, line: line)
             left = .binary(op: op, left, right)
         }
         return left
@@ -839,13 +861,21 @@ struct WGSLParser {
     }
 
     private mutating func parsePostfix() throws -> WGSLExpression {
+        let line = current.line
         var expression = try parsePrimary()
+        // The running height of `expression` — the same cap, applied as the member/index chain grows
+        // (see `parseBinary`).
+        var height = expression.height
         while true {
             if match(".") {
+                height += 1
+                try checkHeight(height, line: line)
                 expression = .member(expression, try expectIdentifier("member name"))
             } else if match("[") {
                 let subscriptExpression = try parseExpression()
                 try expect("]", "index")
+                height = max(height, subscriptExpression.height) + 1
+                try checkHeight(height, line: line)
                 expression = .index(expression, subscriptExpression)
             } else {
                 return expression

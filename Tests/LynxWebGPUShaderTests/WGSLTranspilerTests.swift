@@ -2326,6 +2326,30 @@ final class WGSLTranspilerTests: XCTestCase {
         }
     }
 
+    /// The cap holds **while the chain is built**, not only on the finished tree. A tree that deep is
+    /// an `indirect enum` whose release recurses once per level — measuring it after the fact and
+    /// throwing still freed a hundred-thousand-level tree on the way out of the parser, and that
+    /// release overflowed the deep stack (a SIGBUS in `swift_release`). The input of the original
+    /// report must come back as an error, with the tree never made. (Only the parser ever sees such
+    /// input — nothing after it gets a tree.)
+    func test_aHundredThousandTermChainIsRejectedWithoutBuildingTheTree() {
+        let terms = 100_000
+        let sources = [
+            "fn f(a: f32) -> f32 {\n return " + Array(repeating: "a", count: terms).joined(separator: " + ") + ";\n}",
+            "fn g(v: vec4f) -> f32 {\n return v" + String(repeating: ".x", count: terms) + ";\n}",
+            "fn h(m: array<array<f32, 2>, 2>) -> f32 {\n return m" + String(repeating: "[0]", count: terms) + ";\n}",
+        ]
+        for source in sources {
+            var failure: WGPUError?
+            onSmallStack {
+                do { _ = try WGSLShaderModule(source: source) } catch { failure = error as? WGPUError }
+            }
+            XCTAssertEqual(failure?.kind, .validation, String(source.prefix(40)))
+            XCTAssertEqual(failure?.line, 2, String(source.prefix(40)))
+            XCTAssertTrue(failure?.message.contains("deeper than") ?? false, "\(String(describing: failure))")
+        }
+    }
+
     /// Inside the limit, a long chain keeps translating — the cap is far above any real shader, and
     /// the translation runs on `WGSLDeepStack` regardless of the caller's stack.
     func test_aLongFlatChainInsideTheHeightLimitTranslates() {

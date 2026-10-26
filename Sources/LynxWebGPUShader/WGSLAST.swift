@@ -87,8 +87,9 @@ extension WGSLExpression {
     /// Measured **with an explicit stack, not recursion**, so it can be asked of a tree that a
     /// recursive walk would overflow on. That is its purpose: the parser builds a flat chain
     /// (`a + a + …`, `v.x.x.…`, `m[0][0]…`) in a loop, so the nesting counter never sees it, yet every
-    /// later walk (reflection, emission) recurses once per node along it. The parser rejects a tree
-    /// taller than `WGSLParser.maximumExpressionHeight` before any of them runs.
+    /// later walk (reflection, emission) recurses once per node along it. The parser's chain loops
+    /// measure each operand as it joins and stop at `WGSLParser.maximumExpressionHeight`, so a
+    /// tree taller than that is never built (its release alone would recurse out of the stack).
     var height: Int {
         var deepest = 0
         var stack: [(node: WGSLExpression, depth: Int)] = [(self, 1)]
