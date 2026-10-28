@@ -325,6 +325,18 @@ final class SharedTextureTests: XCTestCase {
         XCTAssertTrue(message.contains("maxTextureDimension2D"), message)
     }
 
+    /// One huge size on a sliver of an image — the derived axis is past `Int`. It used to trap the
+    /// process on the cache's queue; it is now the same validation error, and nothing is cached.
+    func test_aHugeOneAxisResizeOnASliverIsAValidationError() throws {
+        provider.register(try Self.png(width: 1, height: 2000, top: (255, 0, 0, 255), bottom: (0, 0, 255, 255)),
+                          for: "sliver.png")
+        let result = importShared(into: a, key: "sliver@huge", name: "sliver.png", resizeWidth: (1 << 53) - 1)
+        XCTAssertEqual(result["ok"] as? Bool, false)
+        let message = ((result["errors"] as? [[String: Any]])?.first?["message"] as? String) ?? ""
+        XCTAssertTrue(message.contains("maxTextureDimension2D"), message)
+        XCTAssertEqual(cache.liveEntryCount, 0)
+    }
+
     /// The provider's scope applies to every import, cache hit or not.
     func test_theProviderIsAskedEvenOnACacheHit() throws {
         importShared(into: a)
