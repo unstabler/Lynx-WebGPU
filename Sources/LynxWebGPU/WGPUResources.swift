@@ -141,6 +141,9 @@ public final class WGPUTextureObject {
     public let sampleCount: Int
     /// Whether the texture came from a swapchain drawable (it must not be destroyed directly).
     let isDrawable: Bool
+    /// The process-wide shared texture this wraps (`importSharedTexture`), nil for every other texture.
+    /// Holding it is this context's share of the ownership — see `WGPUSharedTexture`.
+    let sharedOwner: WGPUSharedTexture?
 
     init(device: MTLDevice, descriptor: WGPUTextureDescriptor) throws {
         try WGPUTextureObject.validateCompressed(descriptor, on: device)
@@ -176,6 +179,7 @@ public final class WGPUTextureObject {
         self.size = descriptor.size
         self.sampleCount = descriptor.sampleCount
         self.isDrawable = false
+        self.sharedOwner = nil
     }
 
     /// Limits on block-compressed textures. **Metal handles these with an assertion and kills the
@@ -211,6 +215,19 @@ public final class WGPUTextureObject {
         self.size = WGPUExtent3D(width: drawableTexture.width, height: drawableTexture.height)
         self.sampleCount = drawableTexture.sampleCount
         self.isDrawable = true
+        self.sharedOwner = nil
+    }
+
+    /// Wraps a process-wide shared texture — to the backend an ordinary sampled texture (unlike a
+    /// drawable, nothing expires it). The engine registers it read-only (`registerSharedTexture`), and
+    /// dropping this object releases only this context's share.
+    init(shared: WGPUSharedTexture) {
+        self.texture = shared.texture
+        self.format = .rgba8unorm
+        self.size = WGPUExtent3D(width: shared.width, height: shared.height)
+        self.sampleCount = 1
+        self.isDrawable = false
+        self.sharedOwner = shared
     }
 
     /// Encodes the blit copying staging buffer CPU data into a texture **onto the batch's upload
@@ -270,6 +287,9 @@ public final class WGPUTextureViewObject {
     public let sampleCount: Int
     /// If this view came from a canvas drawable, it is a present target.
     let drawable: WGPUDrawable?
+    /// A view keeps the shared texture's cache entry alive too — destroying the texture while a view
+    /// remains must not let the next import decode a second copy.
+    let sharedOwner: WGPUSharedTexture?
 
     init(source: WGPUTextureObject, descriptor: WGPUTextureViewDescriptor, drawable: WGPUDrawable?) throws {
         let format = descriptor.format ?? source.format
@@ -297,6 +317,7 @@ public final class WGPUTextureViewObject {
         self.format = format
         self.sampleCount = source.sampleCount
         self.drawable = drawable
+        self.sharedOwner = source.sharedOwner
     }
 }
 

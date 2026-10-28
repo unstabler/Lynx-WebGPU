@@ -1175,9 +1175,7 @@ public final class WGPUMetalBackend: WGPUBackend {
     /// use the guarantee from the Metal feature set table (with the basis noted in the comments below).
     public func adapterInfo() -> [String: Any] {
         let threadgroup = device.maxThreadsPerThreadgroup
-        // Apple GPU family 3 and above (A9+) and Mac2 allow 2D textures up to 16384. Below that, 8192.
-        // This project's minimum (iOS 17 = A12+) is always the former, but we split for older macOS.
-        let maxTexture2D = device.supportsFamily(.apple3) || device.supportsFamily(.mac2) ? 16384 : 8192
+        let maxTexture2D = WGPUDeviceCapability.maxTextureDimension2D(device)
 
         let limits: [String: Any] = [
             // Textures
