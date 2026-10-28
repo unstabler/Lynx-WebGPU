@@ -20,6 +20,8 @@ export function installNativeMock(overrides = {}) {
     // Native puts a `Data` on and Lynx converts it to an ArrayBuffer — the mock gives an ArrayBuffer too.
     readBufferResult: overrides.readBufferResult ?? { ok: true, data: new ArrayBuffer(0) },
     loadAssetResult: overrides.loadAssetResult ?? { ok: true, data: new ArrayBuffer(0) },
+    /** The params of every `startFrameLoop` — a call while running is native swapping the link's rate. */
+    startFrameLoopCalls: [],
     stopFrameLoopCalls: 0,
     frameHandledCalls: 0,
     decodeImageCalls: [],
@@ -53,7 +55,8 @@ export function installNativeMock(overrides = {}) {
         state.decodeImageCalls.push(params);
         callback(resolve(state.decodeImageResult, params));
       },
-      startFrameLoop() {
+      startFrameLoop(params) {
+        state.startFrameLoopCalls.push(params);
         return { ok: true };
       },
       stopFrameLoop() {

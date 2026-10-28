@@ -220,10 +220,54 @@ function nativeModule() {
 let frameTickDepth = 0;
 
 /**
- * How many subscribers the frame ticker currently has. There is only one native ticker, so it stops only
- * when the last subscriber lets go — otherwise one side's `stop()` turns off the other (the rAF pump especially).
+ * One `startFrameLoop` subscription. (A class rather than a typedef so it stays out of the public `webgpu.d.ts`.)
  */
-let frameLoopSubscribers = 0;
+class FrameLoopSubscriber {
+  /**
+   * @param {(frame: {timestamp: number, delta: number}) => void} handler
+   * @param {number} fps
+   */
+  constructor(handler, fps) {
+    this.handler = handler;
+    this.fps = fps;
+    /**
+     * The timestamp of the tick this subscriber was last called with (`null` before the first call) — both
+     * its fps filter and its `delta` count from here, not from the driver's previous tick.
+     * @type {number | null}
+     */
+    this.lastDelivered = null;
+    /** Cleared by the stop function — a tick already iterating its snapshot skips it from then on. */
+    this.active = true;
+  }
+}
+
+/**
+ * Everyone subscribed to the frame loop — **one driver fans out to all of them.**
+ *
+ * There is only one native ticker per view and its rate is a single number. Letting each subscriber restart it
+ * at its own fps made the last caller win: a 30 fps background slowed a 60 fps burst on the same view down to 30,
+ * and a burst that started at 60 left the background at 60 after it ended. So the driver runs at the subscribers'
+ * **highest** fps, and each subscriber is called only once its own interval has passed (`frameLoopDue`).
+ *
+ * @type {FrameLoopSubscriber[]}
+ */
+let frameLoopSubscribers = [];
+
+/**
+ * What drives the ticks — the native ticker (through the `webgpu:frame` event) or the timer fallback — and the
+ * rate it runs at. `null` while nobody is subscribed: it stops only when the last subscriber lets go, so one
+ * side's `stop()` never turns off the other (the rAF pump especially).
+ *
+ * @type {{fps: number, retune: (fps: number) => void, stop: () => void} | null}
+ */
+let frameLoopDriver = null;
+
+/**
+ * How early a tick may land and still count as "the interval has passed" for a subscriber slower than the
+ * driver. Tick timestamps are not exact multiples of the interval — without it a 30 fps subscriber on a 60 fps
+ * link would miss the tick that lands a hair early and drop to 20. The browser preview uses the same 1 ms.
+ */
+const FRAME_INTERVAL_ALLOWANCE_MS = 1;
 
 /**
  * Whether the **native** ticker is driving the frames (as opposed to the timer fallback).
@@ -239,19 +283,55 @@ let nativeTickerActive = false;
 const framePresentDebt = new Set();
 
 /**
- * Wraps one frame loop callback. **The present goes out even if the callback throws** —
- * otherwise the screen stays frozen on that frame.
- * @param {(frame: {timestamp: number, delta: number}) => void} handler
- * @param {{timestamp: number, delta: number}} frame
+ * Whether `subscriber` is called on the tick at `timestamp`. The fastest subscribers (the driver runs at their
+ * fps) take every tick; a slower one waits until its own interval has passed since its last call.
+ *
+ * @param {FrameLoopSubscriber} subscriber
+ * @param {number} timestamp
+ * @param {number} driverFps
+ * @returns {boolean}
  */
-function runFrameTick(handler, frame) {
+function frameLoopDue(subscriber, timestamp, driverFps) {
+  if (subscriber.lastDelivered === null || subscriber.fps >= driverFps) return true;
+  return timestamp - subscriber.lastDelivered >= 1000 / subscriber.fps - FRAME_INTERVAL_ALLOWANCE_MS;
+}
+
+/**
+ * One driver tick, fanned out to every subscriber that is due.
+ *
+ * To native it stays **one** tick however many subscribers run in it: the deferred presents go out and the ack
+ * leaves once, at the end — on a tick nobody was due for too (the native gate waits for the ack either way).
+ * Each subscriber's `delta` counts from **its own** last call, so ticks skipped by the fps filter or by native
+ * backpressure are inside it.
+ *
+ * A subscriber added during the tick waits for the next one (as rAF does); one removed during the tick is not
+ * called. A throwing handler does not starve the others — **the present and the ack still go out**, and the
+ * first error is rethrown once the tick is wrapped up so it still surfaces.
+ *
+ * @param {number} timestamp the tick time in ms
+ * @returns {void}
+ */
+function dispatchFrameTick(timestamp) {
+  const driverFps = frameLoopDriver ? frameLoopDriver.fps : 0;
+  /** @type {{error: unknown} | null} */
+  let failure = null;
   frameTickDepth += 1;
   try {
-    handler(frame);
+    for (const subscriber of frameLoopSubscribers.slice()) {
+      if (!subscriber.active || !frameLoopDue(subscriber, timestamp, driverFps)) continue;
+      const delta = subscriber.lastDelivered === null ? 0 : timestamp - subscriber.lastDelivered;
+      subscriber.lastDelivered = timestamp;
+      try {
+        subscriber.handler({ timestamp, delta });
+      } catch (error) {
+        if (!failure) failure = { error };
+      }
+    }
   } finally {
     frameTickDepth -= 1;
     if (frameTickDepth === 0) endFrameTick();
   }
+  if (failure) throw failure.error;
 }
 
 /** The end of a tick — the deferred presents all go out here, then native is told the tick is done. */
@@ -2409,26 +2489,63 @@ export const gpu = {
  * A native CADisplayLink drives it, so frames are more even than with `setInterval`.
  * Calling the returned function stops the loop — it must be called when leaving the page.
  *
+ * Every subscriber keeps **its own** `fps`. The view has one display link, so it runs at the highest fps
+ * asked for and a slower subscriber skips ticks until its interval has passed — a 30 fps background and a
+ * 60 fps burst on the same view each get their own rate, and the link drops back to 30 when the burst stops.
+ * `delta` is the time since **this** subscriber was last called (0 on the first call), skipped ticks included.
+ *
  * @param {(frame: {timestamp: number, delta: number}) => void} handler
  * @param {{fps?: number}} [options]
  * @returns {() => void} the stop function
  */
 export function startFrameLoop(handler, options) {
-  const fps = (options && options.fps) || 60;
+  const fps = options && options.fps && options.fps > 0 ? options.fps : 60;
   const module = nativeModule();
-  // There is **only one** native ticker — without counting subscribers, one stopping kills the other with
-  // it. `installAnimationFrame`'s rAF pump sits on top of this, so a scene briefly running its own loop
-  // and turning it off silently stops rAF forever (experienced first hand).
-  frameLoopSubscribers += 1;
-  const releaseTicker = () => {
-    frameLoopSubscribers -= 1;
-    if (frameLoopSubscribers <= 0) {
-      frameLoopSubscribers = 0;
-      nativeTickerActive = false;
-      module.stopFrameLoop();
+  // There is **only one** native ticker — every subscriber shares it, and it stops only with the last one.
+  // `installAnimationFrame`'s rAF pump sits on top of this, so a scene briefly running its own loop and
+  // turning it off must not stop rAF with it (it once silently stopped rAF forever).
+  const subscriber = new FrameLoopSubscriber(handler, fps);
+  frameLoopSubscribers.push(subscriber);
+  if (frameLoopDriver) retuneFrameLoop(frameLoopDriver);
+  else frameLoopDriver = startFrameLoopDriver(module, fps);
+
+  return () => {
+    if (!subscriber.active) return;   // calling twice does not eat someone else's subscription
+    subscriber.active = false;
+    frameLoopSubscribers = frameLoopSubscribers.filter((entry) => entry !== subscriber);
+    const driver = frameLoopDriver;
+    if (!driver) return;
+    if (frameLoopSubscribers.length > 0) {
+      retuneFrameLoop(driver);
+    } else {
+      frameLoopDriver = null;
+      driver.stop();
     }
   };
+}
 
+/**
+ * Moves the driver to the subscribers' highest fps — **only when that changed**, since restarting the native
+ * ticker re-creates the display link.
+ *
+ * @param {{fps: number, retune: (fps: number) => void}} driver
+ * @returns {void}
+ */
+function retuneFrameLoop(driver) {
+  const fps = frameLoopSubscribers.reduce((highest, entry) => Math.max(highest, entry.fps), 0);
+  if (fps > 0 && fps !== driver.fps) driver.retune(fps);
+}
+
+/**
+ * Starts what drives the ticks: Lynx's `GlobalEventEmitter` carrying the native ticker's `webgpu:frame`, or
+ * a timer where there is no emitter (a test runner and the like). Either way **one** listener feeds
+ * `dispatchFrameTick`, whoever is subscribed.
+ *
+ * @param {WebGPUNativeModule} module
+ * @param {number} fps
+ * @returns {{fps: number, retune: (fps: number) => void, stop: () => void}}
+ */
+function startFrameLoopDriver(module, fps) {
   /** @type {LynxGlobalEventEmitter | null} */
   let emitter = null;
   try {
@@ -2440,34 +2557,46 @@ export function startFrameLoop(handler, options) {
   }
 
   if (emitter) {
+    const source = emitter;
+    // Only the timestamp is read — each subscriber measures its own delta.
     /** @param {{timestamp: number, delta: number} | undefined} frame */
-    const listener = (frame) => runFrameTick(handler, frame || { timestamp: 0, delta: 16 });
-    emitter.addListener('webgpu:frame', listener);
+    const listener = (frame) => dispatchFrameTick(frame ? frame.timestamp : 0);
+    source.addListener('webgpu:frame', listener);
     module.startFrameLoop({ fps });
     nativeTickerActive = true;
-    let stopped = false;
-    return () => {
-      if (stopped) return;   // calling twice does not eat someone else's subscription
-      stopped = true;
-      emitter.removeListener('webgpu:frame', listener);
-      releaseTicker();
+    const driver = {
+      fps,
+      /** @param {number} next */
+      retune(next) {
+        driver.fps = next;
+        // Restarting is safe — native swaps the link and drops the old tick's debt (`LynxWebGPUHost.startFrameLoop`).
+        module.startFrameLoop({ fps: next });
+      },
+      stop() {
+        source.removeListener('webgpu:frame', listener);
+        nativeTickerActive = false;
+        module.stopFrameLoop();
+      },
     };
+    return driver;
   }
 
-  // A fallback for environments with no GlobalEventEmitter (a test runner and the like).
-  let previous = Date.now();
-  const timer = setInterval(() => {
-    const now = Date.now();
-    runFrameTick(handler, { timestamp: now, delta: now - previous });
-    previous = now;
-  }, Math.max(1, Math.round(1000 / fps)));
-  let stopped = false;
-  return () => {
-    if (stopped) return;
-    stopped = true;
-    clearInterval(timer);
-    releaseTicker();
+  /** @param {number} rate */
+  const schedule = (rate) => setInterval(() => dispatchFrameTick(Date.now()), Math.max(1, Math.round(1000 / rate)));
+  let timer = schedule(fps);
+  const driver = {
+    fps,
+    /** @param {number} next */
+    retune(next) {
+      driver.fps = next;
+      clearInterval(timer);
+      timer = schedule(next);
+    },
+    stop() {
+      clearInterval(timer);
+    },
   };
+  return driver;
 }
 
 /**

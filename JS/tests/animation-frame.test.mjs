@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { installNativeMock } from './helpers.mjs';
-import { installAnimationFrame } from '../webgpu.js';
+import { installAnimationFrame, startFrameLoop } from '../webgpu.js';
 
 /** A mock that hand-pushes the `webgpu:frame` event `startFrameLoop` latches onto. */
 function installFrameEmitter() {
@@ -26,9 +26,11 @@ function installFrameEmitter() {
       },
     }),
   };
+  state.linkFps = 0;
   const module = globalThis.NativeModules.WebGPU;
-  module.startFrameLoop = () => { state.frameLoopRunning += 1; return { ok: true }; };
-  module.stopFrameLoop = () => { state.frameLoopRunning -= 1; return { ok: true }; };
+  // The native contract: one link per view — starting it again swaps its rate rather than adding a second link.
+  module.startFrameLoop = (params) => { state.frameLoopRunning = 1; state.linkFps = params.fps; return { ok: true }; };
+  module.stopFrameLoop = () => { state.frameLoopRunning = 0; state.linkFps = 0; return { ok: true }; };
 
   state.tick = (timestamp) => {
     for (const listener of listeners.slice()) listener({ timestamp, delta: 16 });
@@ -128,5 +130,38 @@ test('does not overwrite an existing rAF', () => {
 
   uninstall();
   delete globalThis.requestAnimationFrame;
+  delete globalThis.lynx;
+});
+
+test('rAF keeps its own rate beside a slower frame loop on the same view', () => {
+  const state = installFrameEmitter();
+  const uninstall = installAnimationFrame();
+
+  /** @type {number[]} */
+  const background = [];
+  const stopBackground = startFrameLoop(({ timestamp }) => background.push(timestamp), { fps: 30 });
+  assert.equal(state.linkFps, 30);
+
+  /** @type {number[]} */
+  const times = [];
+  const loop = (/** @type {number} */ time) => {
+    times.push(time);
+    if (times.length < 4) globalThis.requestAnimationFrame(loop);
+  };
+  globalThis.requestAnimationFrame(loop);
+  assert.equal(state.linkFps, 60, 'the rAF pump lifts the shared link to 60');
+
+  const ticks = [0, 1, 2, 3].map((index) => 1000 + index * (1000 / 60));
+  for (const timestamp of ticks) state.tick(timestamp);
+  assert.deepEqual(times, ticks, 'rAF runs on every tick');
+  assert.deepEqual(background, [ticks[0], ticks[2]], 'the 30 fps loop is not dragged up to 60');
+
+  // The library stopped scheduling — the pump lets go, and the link drops back for the loop that remains.
+  assert.equal(state.linkFps, 30, 'the link must not stay at 60 after rAF goes quiet');
+  assert.equal(state.frameLoopRunning, 1, 'the background loop still holds the link');
+
+  stopBackground();
+  assert.equal(state.frameLoopRunning, 0);
+  uninstall();
   delete globalThis.lynx;
 });

@@ -1304,6 +1304,11 @@ export declare const gpu: {
  * A native CADisplayLink drives it, so frames are more even than with `setInterval`.
  * Calling the returned function stops the loop — it must be called when leaving the page.
  *
+ * Every subscriber keeps **its own** `fps`. The view has one display link, so it runs at the highest fps
+ * asked for and a slower subscriber skips ticks until its interval has passed — a 30 fps background and a
+ * 60 fps burst on the same view each get their own rate, and the link drops back to 30 when the burst stops.
+ * `delta` is the time since **this** subscriber was last called (0 on the first call), skipped ticks included.
+ *
  * @param {(frame: {timestamp: number, delta: number}) => void} handler
  * @param {{fps?: number}} [options]
  * @returns {() => void} the stop function
