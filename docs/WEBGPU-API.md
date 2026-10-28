@@ -293,7 +293,7 @@ bitmap.close()   // 네이티브 픽셀을 놓아 준다
 | 옵션 | 뜻 |
 |---|---|
 | `flipY` | 위아래를 뒤집는다. 기본은 웹과 같은 좌상단 기준이다 |
-| `premultiplyAlpha` | `'premultiply'`면 색에 알파를 곱해 둔다. 기본(`'none'`)은 곱하지 않은 값 — 다만 디코딩 자체가 곱해진 값을 거치므로 **반투명 영역은 완전히 복원되지 않는다** |
+| `premultiplyAlpha` | 기본(`'default'`·생략)은 `'premultiply'`와 같다 — 색에 알파를 곱해 둔다. **Chromium과 같은 해석이다** (HTML 명세는 `'default'`를 구현에 맡긴다). `'none'`만 곱하지 않은 값이고, 디코딩 자체가 곱해진 값을 거치므로 **반투명 영역은 완전히 복원되지 않는다** |
 | `resizeWidth` / `resizeHeight` | 둘 다 주면 그 크기로 그린다 |
 
 소스는 `ArrayBuffer`/`TypedArray`(이미지 파일 바이트) 또는 **애셋 이름 문자열**이다.
@@ -305,7 +305,15 @@ bitmap.close()   // 네이티브 픽셀을 놓아 준다
   올릴 수 있고, `flipY`는 **복사 시점**에 위아래를 뒤집는다.
   `createImageBitmap`의 `flipY`(디코딩 시점)와는 다른 층이라 둘 다 켜면 제자리로 돌아온다.
   **웹 라이브러리는 이쪽을 쓴다** — three.js의 `Texture.flipY`가 기본 `true`다.
-- `destination`: `{ texture, mipLevel?, origin? }`.
+- `destination`: `{ texture, mipLevel?, origin?, premultipliedAlpha?, colorSpace? }`.
+  - `premultipliedAlpha`(기본 `false`)는 **텍스처에 써질** 알파 상태다. 비트맵은 자기 상태
+    (`createImageBitmap`의 `premultiplyAlpha`)를 기억하고, 둘이 다르면 복사하면서 곱하거나 나눈다.
+    그래서 기본끼리(premultiplied 비트맵 → straight 대상)는 브라우저처럼 **나눠서** 들어간다.
+  - 반투명 그림의 가장자리를 잃지 않으려면 **끝까지 premultiplied로** 둔다 — 기본 비트맵을
+    `premultipliedAlpha: true`로 복사하면 변환 없는 복사이고, 블렌드는 `one, one-minus-src-alpha`다.
+    나누는 쪽은 알파가 낮을수록 색 정보가 사라진다.
+  - `colorSpace`(기본 `'srgb'`)는 `'srgb'`만 받는다. `'display-p3'`는 **명세상 유효하지만**
+    디코더가 색 변환을 하지 않아 `GPUValidationError`(kind `unsupported`)로 거부되고 복사되지 않는다.
 - 대상은 **4바이트 컬러 포맷**이어야 한다 (`rgba8unorm` `bgra8unorm` `rgba8unorm-srgb` …).
   디코딩 결과가 RGBA8이므로, 그 밖은 조용히 어긋나느니 검증 오류로 거부한다.
   압축 텍스처도 같은 이유로 안 된다 — GPU에는 블록 인코더가 없다.
@@ -776,6 +784,7 @@ if (error) fallBackToSimplePipeline()
 | `GPURenderPassDescriptor.maxDrawCount` | 드라이버에 주는 검증 힌트다. 무시해도 그림은 같고, 넘겼을 때의 거부는 명세상 선택이다 |
 | `GPUCanvasContext.canvas` | 명세는 `HTMLCanvasElement`를 돌려준다 — Lynx에는 대응하는 엘리먼트 객체가 없다. `context.canvasId`(문자열)가 그 자리다 |
 | `setImmediates` (immediate data) | 명세에 최근 들어온 기능이고 `maxImmediateSize` 한계도 따라온다. 유니폼 버퍼로 대체할 수 있어 미룬다 |
+| `copyExternalImageToTexture`의 `colorSpace: 'display-p3'` | 디코더(ImageIO)가 색 관리 없이 device RGB로 그려서 옮길 원본 색 공간이 없다. 조용히 sRGB로 쓰지 않고 `unsupported`(JS에서는 `GPUValidationError`)로 거부한다. 넣으려면 디코드 때 원본 색 공간을 기록하고 복사 때 `CGColorSpace` 변환을 거쳐야 한다 (§3) |
 
 ### 선택 기능 (`adapter.features`에 광고하지 않는다)
 
@@ -815,8 +824,9 @@ if (error) fallBackToSimplePipeline()
 (`threelab` 데모 씬 — 씬 패스 → bloom 밉 체인 → 출력 패스가 한 프레임에 돌고 60fps·오류 0).
 그전에는 첫 제출이 드로어블을 내보내고 뷰를 만료시켜 남은 패스가 통째로 거부됐다.
 
-> 프레임 티커는 **참조로 센다.** 한 씬이 잠깐 `startFrameLoop`을 열었다 닫아도 rAF 펌프까지
-> 같이 멈추지 않는다 — 그러면 화면이 조용히 정지한다.
+> 프레임 티커는 **구독자 목록으로 나눠 준다.** 한 씬이 잠깐 `startFrameLoop`을 열었다 닫아도 rAF 펌프까지
+> 같이 멈추지 않는다 — 그러면 화면이 조용히 정지한다. 구독자가 몇이든 present와 ack는 틱마다 한 번이다
+> (`docs/JS-AUTHORING.md` §4).
 
 ### 기기에 따라 갈리는 것
 

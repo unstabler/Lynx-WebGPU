@@ -213,7 +213,7 @@ nil이면 그 검사는 백엔드 몫이다. `getBindGroupLayout`이 돌려주�
 |---|---|
 | `writeBuffer` | `buffer` · `data` · `bufferOffset`(0). 대상은 `COPY_DST`여야 하고 offset·크기는 **4의 배수**여야 한다 |
 | `writeTexture` | `texture` · `data` · `mipLevel`(0) · `origin` · `size`(extent) · `bytesPerRow`(포맷에서 유도) · `rowsPerImage`(블록 행 수) |
-| `copyExternalImageToTexture` | `source:{source(ImageBitmap 핸들), origin?, flipY?}` · `destination:{texture, mipLevel?, origin?}` · `copySize`(생략 시 이미지의 남은 전부) |
+| `copyExternalImageToTexture` | `source:{source(ImageBitmap 핸들), origin?, flipY?}` · `destination:{texture, mipLevel?, origin?, premultipliedAlpha(false), colorSpace("srgb")}` · `copySize`(생략 시 이미지의 남은 전부). `premultipliedAlpha`가 비트맵의 알파 상태와 다르면 복사하면서 곱하거나 나눈다. `colorSpace`는 명세의 두 값을 다 디코드하지만 `"srgb"`만 실행하고 `"display-p3"`는 `unsupported`로 거부한다 (디코더가 색 변환을 하지 않는다) |
 | `unmapBuffer` | `buffer` · `offset`(매핑 시작) · `data` — `mapAsync` 상태를 푼다. **쓰기 매핑**(`mapAsync(GPUMapMode.WRITE)`·네이티브 `mappedAtCreation`)이면 `data`가 그 매핑의 바이트이고 **버퍼 오프셋** `offset`에 써진 뒤 매핑이 풀린다 (JS 매핑은 사본이라 이게 없으면 쓴 내용이 사라진다). `data`는 매핑 구간 안이어야 하고 offset은 8의 배수·크기는 4의 배수 — 읽기 매핑이나 매핑 안 된 버퍼에 `data`를 실으면 거부된다 (`COPY_DST` 없이 쓰는 뒷문이 되므로). 명세의 `unmap`은 실패하지 않으므로 **write-back이 거부돼도 매핑은 풀린다** |
 
 `bytesPerRow`·`rowsPerImage`는 **블록 단위**다 (명세 `GPUTexelCopyBufferLayout`). 비압축
@@ -346,7 +346,7 @@ uncaptured 콜백이 실패한 wgpu 호출 **안에서 동기로** 싱크를 채
 | `readBuffer({buffer, offset?, size?}, cb)` | `mapAsync` + `getMappedRange`. **`MAP_WRITE` 버퍼는 쓰기 매핑**으로 연다 — 명세가 `MAP_READ \| MAP_WRITE`를 금하므로 usage로 모드가 정해진다. 결과는 버퍼의 현재 내용이고(명세의 쓰기 매핑 초기값), offset은 8의 배수·size는 4의 배수여야 한다. 쓴 바이트는 `unmapBuffer`의 `data`로 돌아온다 |
 | `loadAsset({name}, cb)` | 브라우저 `fetch()` 자리. 해석은 `WGPUAssetProvider`가 한다 |
 | `decodeImage({id, data?/name?, flipY?, premultiplyAlpha?, resizeWidth?, resizeHeight?}, cb)` | `createImageBitmap()` |
-| `startFrameLoop({fps})` / `stopFrameLoop()` | `webgpu:frame` 전역 이벤트 |
+| `startFrameLoop({fps})` / `stopFrameLoop()` | `webgpu:frame` 전역 이벤트 `{timestamp, delta}`(ms). 링크는 뷰에 하나라, 돌고 있을 때 다시 부르면 **fps만 바꿔 링크를 교체**한다. shim은 구독자 fps의 최댓값이 바뀔 때만 부른다. `delta`는 **직전에 JS로 보낸 틱부터** 잰다 — 게이트로 건너뛴 틱도 들어간다. start·stop에서 0부터 다시 잰다. shim은 이 delta를 쓰지 않고 구독자마다 직접 잰다 |
 | `frameHandled()` | 프레임 콜백 하나가 끝났다는 ack — 티커는 이걸 받아야 다음 틱을 보낸다 (rAF식 역압, `WGPUFrameTickGate`). shim이 틱 끝에 자동으로 부르므로 번들이 직접 부를 일은 없다. 유실 시 1초 타임아웃으로 풀린다 |
 | `reset()` | 모든 GPU 객체를 버린다 |
 
