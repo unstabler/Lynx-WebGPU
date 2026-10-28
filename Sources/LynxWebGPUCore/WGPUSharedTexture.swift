@@ -18,7 +18,7 @@ public struct WGPUSharedTextureRequest: Equatable {
     /// name, a file path or `file://` URL, or a bundle-relative path). JS sends it as `url`.
     public var name: String
     /// The requested size. Both given: exactly that size. One given: the other follows the source's
-    /// aspect ratio. Neither: the source's size. See `targetSize(sourceWidth:sourceHeight:)`.
+    /// aspect ratio, rounded up. Neither: the source's size. See `targetSize(sourceWidth:sourceHeight:)`.
     public var resizeWidth: Int?
     public var resizeHeight: Int?
     /// The Metal label of the texture, for GPU captures — the first request's label wins.
@@ -63,17 +63,18 @@ public struct WGPUSharedTextureRequest: Equatable {
     /// The pixel size to produce from a source of `sourceWidth`×`sourceHeight`.
     ///
     /// Both sizes given: that size, aspect ratio or not (keeping the ratio is the caller's call). One
-    /// given: the other is derived from the source's aspect ratio and rounded — the same rule as the
-    /// HTML `createImageBitmap`. Neither: the source's size.
+    /// given: the other is derived from the source's aspect ratio and **rounded up** — the HTML
+    /// `createImageBitmap` rule ("cropped to the source rectangle with formatting"), so a browser
+    /// running the same request gets the same size. Neither: the source's size.
     public func targetSize(sourceWidth: Int, sourceHeight: Int) -> (width: Int, height: Int) {
         switch (resizeWidth, resizeHeight) {
         case let (width?, height?):
             return (width, height)
         case let (width?, nil):
-            let height = (Double(sourceHeight) * Double(width) / Double(max(sourceWidth, 1))).rounded()
+            let height = (Double(sourceHeight) * Double(width) / Double(max(sourceWidth, 1))).rounded(.up)
             return (width, max(Int(height), 1))
         case let (nil, height?):
-            let width = (Double(sourceWidth) * Double(height) / Double(max(sourceHeight, 1))).rounded()
+            let width = (Double(sourceWidth) * Double(height) / Double(max(sourceHeight, 1))).rounded(.up)
             return (max(Int(width), 1), height)
         case (nil, nil):
             return (sourceWidth, sourceHeight)

@@ -62,20 +62,24 @@ final class SharedTextureRequestTests: XCTestCase {
         XCTAssertEqual(size.height, 300, "keeping the aspect ratio is the caller's call")
     }
 
-    func test_oneSizeGivenDerivesTheOtherFromTheAspectRatio() {
+    func test_oneSizeGivenDerivesTheOtherFromTheAspectRatioRoundedUp() {
         let byWidth = WGPUSharedTextureRequest(key: "k", name: "a", resizeWidth: 1000)
             .targetSize(sourceWidth: 3370, sourceHeight: 3917)
         XCTAssertEqual(byWidth.width, 1000)
-        XCTAssertEqual(byWidth.height, 1162, "3917 × 1000 / 3370 = 1162.3, rounded")
+        XCTAssertEqual(byWidth.height, 1163, "3917 × 1000 / 3370 = 1162.3, rounded up as HTML createImageBitmap does")
 
         let byHeight = WGPUSharedTextureRequest(key: "k", name: "a", resizeHeight: 1000)
             .targetSize(sourceWidth: 3370, sourceHeight: 3917)
-        XCTAssertEqual(byHeight.width, 860, "3370 × 1000 / 3917 = 860.4, rounded")
+        XCTAssertEqual(byHeight.width, 861, "3370 × 1000 / 3917 = 860.4, rounded up")
         XCTAssertEqual(byHeight.height, 1000)
 
         let sliver = WGPUSharedTextureRequest(key: "k", name: "a", resizeWidth: 1)
             .targetSize(sourceWidth: 4000, sourceHeight: 10)
-        XCTAssertEqual(sliver.height, 1, "a derived axis never rounds down to 0")
+        XCTAssertEqual(sliver.height, 1, "a derived axis never reaches 0")
+
+        let exact = WGPUSharedTextureRequest(key: "k", name: "a", resizeWidth: 10)
+            .targetSize(sourceWidth: 40, sourceHeight: 20)
+        XCTAssertEqual(exact.height, 5, "an exact quotient is not bumped up")
     }
 
     func test_noSizeGivenKeepsTheSourceSize() {

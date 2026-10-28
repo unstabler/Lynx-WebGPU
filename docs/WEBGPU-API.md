@@ -362,7 +362,7 @@ const view = clouds.createView()      // 여느 텍스처처럼 샘플링한다
 | 항목 | 동작 |
 |---|---|
 | `url` | `loadAsset`과 같은 규칙(등록한 이름 · 파일 경로·`file://` · 번들 경로)으로 호스트의 `assetProvider`가 해석한다. **캐시 히트여도 매번 거친다** — 그 페이지의 접근 범위를 지키려는 것이다 |
-| 크기 | `resizeWidth`·`resizeHeight` 둘 다 → 그 크기 그대로(비율은 호출자 몫). 하나만 → 나머지를 원본 비율로(반올림). 없음 → 원본 크기. `maxTextureDimension2D`를 넘으면 검증 오류 |
+| 크기 | `resizeWidth`·`resizeHeight` 둘 다 → 그 크기 그대로(비율은 호출자 몫). 하나만 → 나머지를 원본 비율로(올림 — HTML `createImageBitmap`과 같은 규칙). 없음 → 원본 크기. `maxTextureDimension2D`를 넘으면 검증 오류 |
 | 디코드 | ImageIO 썸네일 API로 목표 크기에 맞춰 **바로** 디코드한다. 원본 크기의 비트맵을 거치지 않으므로 메모리 피크가 목표 크기 쪽에 붙는다. EXIF 방향은 적용하지 않는다(`createImageBitmap`과 같다) |
 | 형식 | `rgba8unorm`, 알파는 **premultiplied**(블렌드는 `one`, `one-minus-src-alpha`). 색은 `createImageBitmap`처럼 변환 없이 device RGB로 그린다 |
 | usage | `TEXTURE_BINDING \| COPY_SRC`. **읽기 전용**이다 — `writeTexture`, 복사의 대상, 렌더 패스 어태치먼트, write·read-write 스토리지 바인딩, 포맷을 바꾸는 뷰는 검증 오류다. 다른 페이지의 그림이 바뀌기 때문이다 |

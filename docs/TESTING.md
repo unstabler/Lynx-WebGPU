@@ -342,7 +342,7 @@ try XCTSkipUnless(harness.supports(.indirectArguments), "this device does not su
 | 프레임 회계 | `WGPUFrameCoordinatorTests` | in-flight 한도 도달 시 차단·완료로 해제, 커밋보다 많은 완료에도 음수 금지, 미추적 캔버스는 항상 ready, 포화 캔버스 하나가 전체를 막음, 잊힌 캔버스 해제, 한도 변경(0 이하는 1로), 동시 통지의 일관성, `present:false`는 프레임 중간 제출, 빈 present 배치가 틱을 닫음 |
 | 프레임 틱 게이트 | `WGPUFrameTickGateTests` | 두 번째 틱은 ack를 기다림, 매 틱 ack면 건너뜀 없음, 잃어버린 ack는 타임아웃으로 만료(루프를 죽이지 않음), 늦은 ack는 한 번만 염, reset, 대기 없는 ack는 무동작 |
 | 픽셀 되읽기 해석 | `WGPUPixelReadbackTests` | half→float(서브노멀·Inf·NaN), **1.0 초과·음수 보존**, BGRA 순서, 없는 채널 기본값, 행 패딩, 팩된/정수 포맷 거부 |
-| 공유 텍스처 요청 | `SharedTextureRequestTests` | `{key, url, resizeWidth?, resizeHeight?, label?}` 파싱, 빈 키·url과 1 미만 리사이즈 거부(경로 포함), **리사이즈 규칙**(둘 다 그대로 · 하나는 비율로 반올림 · 0으로 내려가지 않음 · 없으면 원본), 같은 픽셀 판정(키·라벨 무관), 브리지 진입점의 **콜백 1회**, 공유 텍스처가 없는 런타임은 `unsupported` |
+| 공유 텍스처 요청 | `SharedTextureRequestTests` | `{key, url, resizeWidth?, resizeHeight?, label?}` 파싱, 빈 키·url과 1 미만 리사이즈 거부(경로 포함), **리사이즈 규칙**(둘 다 그대로 · 하나는 비율로 올림(HTML과 같다) · 나누어떨어지면 그대로 · 0이 되지 않음 · 없으면 원본), 같은 픽셀 판정(키·라벨 무관), 브리지 진입점의 **콜백 1회**, 공유 텍스처가 없는 런타임은 `unsupported` |
 | JS↔Swift 상수 | `JSConstantParityTests` | `JS/webgpu.js`의 사용 플래그·스테이지·컬러마스크가 Swift OptionSet과 같은 값인지 |
 | in-flight 프레임 | `SurfaceInFlightTests` | 카운터 계약(3에서 포화·완료로 해제), 컨텍스트 집계, 해석기 커밋/완료 통지(표면당 1회), CAMetalLayer 헤드리스 왕복 |
 | 프레임 경계 | `JS/tests/frame-boundary.test.mjs` | present는 **틱의 끝**에 한 번(명세 "updating the rendering") · 마무리 배치는 명령이 없어도 나감 · 작업 없는 틱은 브리지 미통과 · 루프 밖 submit은 그 자리에서 present · 콜백이 던져도 present는 나가고 오류는 안 삼킴 · **티커 참조 계수**(남의 stop에 안 끌려감) · `getCurrentTexture`는 만료 전까지 **같은 텍스처**(present·configure·리사이즈에서 만료, 설정 전엔 `InvalidStateError`) |
