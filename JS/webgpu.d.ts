@@ -1433,5 +1433,46 @@ export declare function createImageBitmap(source: ArrayBuffer | ArrayBufferView 
     resizeWidth?: number;
     resizeHeight?: number;
 }): Promise<GPUImageBitmap>;
+/**
+ * Imports a **process-wide shared texture** — one GPU texture per key, shared by every page on the device.
+ *
+ * Each LynxView runs its own context and JS runtime, so an image several pages draw would otherwise sit in
+ * GPU memory once per page (and a large one decoded, cropped and staged once per page on the way). Here
+ * native decodes and uploads it once per key — straight at the requested size, with no pixels crossing the
+ * bridge, no `ImageBitmap` and no staging copy — and every page on the same Metal device that asks for the
+ * key gets the same texture.
+ *
+ * ```js
+ * const clouds = await importSharedTexture(device, {
+ *   key: 'clouds-v3@1024w', url: 'file:///…/clouds.png', resizeWidth: 1024,
+ * })
+ * const view = clouds.createView()   // sample it like any texture
+ * ```
+ *
+ * - **The key is your promise about the pixels.** The same key must always mean the same image at the same
+ *   size: a key already in use returns the existing texture whatever `url` and size say (debug builds log a
+ *   warning). Put the source's identity and version, and the resize, into the key.
+ * - `url` resolves like `loadAsset` (a registered name, a file path or `file://` URL, a bundle path), through
+ *   the host's asset provider — on every call, so its access scope holds for a cache hit too.
+ * - Size: `resizeWidth` and `resizeHeight` both given → exactly that; one given → the other follows the
+ *   image's aspect ratio; neither → the image's own size.
+ * - The texture is `rgba8unorm` with **premultiplied** alpha (blend with `one, one-minus-src-alpha`), usage
+ *   `TEXTURE_BINDING | COPY_SRC`, and **read-only**: writes, render attachments, write-access storage
+ *   bindings and format-changing views are validation errors.
+ * - `texture.destroy()`, `device.destroy()` and GC release only this page's reference — the texture lives
+ *   on for the other pages and goes when the last one lets go.
+ * - A runtime without shared textures rejects with its `unsupported` error (the default Metal runtime has them).
+ *
+ * @param {GPUDevice} device
+ * @param {{key: string, url: string, resizeWidth?: number, resizeHeight?: number, label?: string}} descriptor
+ * @returns {Promise<GPUTexture>}
+ */
+export declare function importSharedTexture(device: GPUDevice, descriptor: {
+    key: string;
+    url: string;
+    resizeWidth?: number;
+    resizeHeight?: number;
+    label?: string;
+}): Promise<GPUTexture>;
 export { GPUImageBitmap, GPUBuffer, GPUTexture, GPUTextureView, GPUSampler, GPUDevice, GPUCanvasContext, GPURenderBundle, GPURenderBundleEncoder, GPUQuerySet, GPUError, GPUValidationError, GPUOutOfMemoryError, GPUInternalError, };
 export default gpu;

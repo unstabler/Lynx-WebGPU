@@ -26,6 +26,9 @@ export function installNativeMock(overrides = {}) {
     frameHandledCalls: 0,
     decodeImageCalls: [],
     decodeImageResult: overrides.decodeImageResult ?? { ok: true, width: 4, height: 4 },
+    importSharedTextureCalls: [],
+    importSharedTextureResult:
+      overrides.importSharedTextureResult ?? { ok: true, width: 4, height: 4, format: 'rgba8unorm' },
   };
 
   const resolve = (value, argument) => (typeof value === 'function' ? value(argument) : value);
@@ -54,6 +57,10 @@ export function installNativeMock(overrides = {}) {
       decodeImage(params, callback) {
         state.decodeImageCalls.push(params);
         callback(resolve(state.decodeImageResult, params));
+      },
+      importSharedTexture(params, callback) {
+        state.importSharedTextureCalls.push(params);
+        callback(resolve(state.importSharedTextureResult, params));
       },
       startFrameLoop(params) {
         state.startFrameLoopCalls.push(params);

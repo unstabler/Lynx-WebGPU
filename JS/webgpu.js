@@ -2807,6 +2807,77 @@ export async function createImageBitmap(source, options) {
   return new GPUImageBitmap(id, result.width, result.height, recorder);
 }
 
+/**
+ * Imports a **process-wide shared texture** — one GPU texture per key, shared by every page on the device.
+ *
+ * Each LynxView runs its own context and JS runtime, so an image several pages draw would otherwise sit in
+ * GPU memory once per page (and a large one decoded, cropped and staged once per page on the way). Here
+ * native decodes and uploads it once per key — straight at the requested size, with no pixels crossing the
+ * bridge, no `ImageBitmap` and no staging copy — and every page on the same Metal device that asks for the
+ * key gets the same texture.
+ *
+ * ```js
+ * const clouds = await importSharedTexture(device, {
+ *   key: 'clouds-v3@1024w', url: 'file:///…/clouds.png', resizeWidth: 1024,
+ * })
+ * const view = clouds.createView()   // sample it like any texture
+ * ```
+ *
+ * - **The key is your promise about the pixels.** The same key must always mean the same image at the same
+ *   size: a key already in use returns the existing texture whatever `url` and size say (debug builds log a
+ *   warning). Put the source's identity and version, and the resize, into the key.
+ * - `url` resolves like `loadAsset` (a registered name, a file path or `file://` URL, a bundle path), through
+ *   the host's asset provider — on every call, so its access scope holds for a cache hit too.
+ * - Size: `resizeWidth` and `resizeHeight` both given → exactly that; one given → the other follows the
+ *   image's aspect ratio; neither → the image's own size.
+ * - The texture is `rgba8unorm` with **premultiplied** alpha (blend with `one, one-minus-src-alpha`), usage
+ *   `TEXTURE_BINDING | COPY_SRC`, and **read-only**: writes, render attachments, write-access storage
+ *   bindings and format-changing views are validation errors.
+ * - `texture.destroy()`, `device.destroy()` and GC release only this page's reference — the texture lives
+ *   on for the other pages and goes when the last one lets go.
+ * - A runtime without shared textures rejects with its `unsupported` error (the default Metal runtime has them).
+ *
+ * @param {GPUDevice} device
+ * @param {{key: string, url: string, resizeWidth?: number, resizeHeight?: number, label?: string}} descriptor
+ * @returns {Promise<GPUTexture>}
+ */
+export async function importSharedTexture(device, descriptor) {
+  const settings = descriptor || /** @type {{key: string, url: string}} */ ({});
+  if (typeof settings.key !== 'string' || settings.key === '') {
+    throw new TypeError('importSharedTexture needs a non-empty key');
+  }
+  if (typeof settings.url !== 'string' || settings.url === '') {
+    throw new TypeError('importSharedTexture needs a non-empty url');
+  }
+  const module = nativeModule();
+  if (typeof module.importSharedTexture !== 'function') {
+    throw new Error('this host has no importSharedTexture — the native side of Lynx-WebGPU needs updating');
+  }
+  // The handle comes from the module-wide counter, as for every object; native registers the texture under it.
+  const id = allocateHandle();
+  /** @type {{id: number, key: string, url: string, resizeWidth?: number, resizeHeight?: number, label?: string}} */
+  const params = { id, key: settings.key, url: settings.url };
+  if (settings.resizeWidth !== undefined) params.resizeWidth = settings.resizeWidth;
+  if (settings.resizeHeight !== undefined) params.resizeHeight = settings.resizeHeight;
+  if (settings.label !== undefined) params.label = settings.label;
+
+  const result = await /** @type {Promise<WGPUSharedTextureResult | undefined>} */ (
+    new Promise((resolve) => {
+      module.importSharedTexture(params, resolve);
+    })
+  );
+  if (!result || result.ok === false) {
+    const errors = (result && result.errors) || [];
+    throw new Error(errors.length ? errors[0].message : `could not import the shared texture '${settings.key}'`);
+  }
+  return new GPUTexture(device, id, {
+    size: { width: result.width, height: result.height },
+    format: result.format,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
+    label: settings.label,
+  });
+}
+
 export {
   GPUImageBitmap,
   GPUBuffer, GPUTexture, GPUTextureView, GPUSampler, GPUDevice, GPUCanvasContext,
