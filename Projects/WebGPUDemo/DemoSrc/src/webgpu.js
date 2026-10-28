@@ -1770,9 +1770,18 @@ class GPUQueue {
    * and separate — turning both on flips twice and lands back where it started). Web libraries use this
    * one: three.js's `Texture.flipY` defaults to `true`.
    *
+   * `destination.premultipliedAlpha` (default `false`) is the alpha state **written into the texture**, as in
+   * the spec. The bitmap remembers its own state (`createImageBitmap`'s `premultiplyAlpha`), and the copy
+   * multiplies or divides when the two differ — so the default bitmap (premultiplied) copied with the default
+   * destination (straight) comes out un-premultiplied, the same as in a browser.
+   *
+   * `destination.colorSpace` (default `'srgb'`) is carried to native, which takes only `'srgb'` — the decoder
+   * does no color conversion. `'display-p3'` comes back as a `GPUValidationError` through the usual error
+   * channel (error scopes, `uncapturederror`), and the copy is not made.
+   *
    * @param {{source: GPUImageBitmap, origin?: GPUOrigin3DDict, flipY?: boolean}} source
    * @param {{texture: GPUTexture, mipLevel?: number, origin?: GPUOrigin3DDict,
-   *          premultipliedAlpha?: boolean, colorSpace?: string}} destination
+   *          premultipliedAlpha?: boolean, colorSpace?: 'srgb' | 'display-p3'}} destination
    * @param {GPUExtent3D} [copySize] omitted, the whole image
    * @returns {void}
    */
@@ -1788,6 +1797,8 @@ class GPUQueue {
         texture: destination.texture.id,
         mipLevel: destination.mipLevel || 0,
         origin: destination.origin,
+        premultipliedAlpha: !!destination.premultipliedAlpha,
+        colorSpace: destination.colorSpace === undefined ? 'srgb' : destination.colorSpace,
       },
       copySize,
     });
@@ -2748,6 +2759,15 @@ class GPUImageBitmap {
  * bitmap.close()
  * ```
  *
+ * `premultiplyAlpha` follows Chromium: `'default'` (and leaving it out) is the same as `'premultiply'`, and
+ * only `'none'` keeps straight alpha. The HTML spec leaves `'default'` to the implementation; matching the
+ * browser keeps a scene's alpha the same here and in a browser preview.
+ *
+ * ImageIO only draws premultiplied, so straight alpha — `'none'` here, or a copy with the default
+ * `premultipliedAlpha: false` — is recovered by dividing, which loses color where alpha is low. Translucent
+ * art that must keep its edges goes premultiplied end to end: the default bitmap copied with
+ * `premultipliedAlpha: true` is a plain copy, blended with `one, one-minus-src-alpha`.
+ *
  * @param {ArrayBuffer | ArrayBufferView | string} source the image bytes, or an asset name
  * @param {{flipY?: boolean, premultiplyAlpha?: 'none' | 'premultiply' | 'default',
  *          resizeWidth?: number, resizeHeight?: number}} [options]
@@ -2767,7 +2787,8 @@ export async function createImageBitmap(source, options) {
   const params = {
     id,
     flipY: !!settings.flipY,
-    premultiplyAlpha: settings.premultiplyAlpha === 'premultiply',
+    // `'default'` premultiplies, as in Chromium (`ImageBitmap::ParseOptions`) — only `'none'` keeps straight alpha.
+    premultiplyAlpha: settings.premultiplyAlpha !== 'none',
     resizeWidth: settings.resizeWidth,
     resizeHeight: settings.resizeHeight,
   };
