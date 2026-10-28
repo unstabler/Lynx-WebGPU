@@ -82,21 +82,6 @@ final class SharedTextureRequestTests: XCTestCase {
         XCTAssertEqual(exact.height, 5, "an exact quotient is not bumped up")
     }
 
-    /// A resize near the 2^53 the payload reader accepts, on an aspect ratio past 1024:1, derives an
-    /// axis beyond `Int` — it saturates rather than trapping, and the runtime's size limit rejects it.
-    func test_aDerivedAxisPastIntSaturatesInsteadOfTrapping() {
-        let largest = (1 << 53) - 1
-        let tall = WGPUSharedTextureRequest(key: "k", name: "a", resizeWidth: largest)
-            .targetSize(sourceWidth: 1, sourceHeight: 2000)
-        XCTAssertEqual(tall.width, largest)
-        XCTAssertEqual(tall.height, Int.max, "2000 × (2^53 − 1) is past Int.max")
-
-        let wide = WGPUSharedTextureRequest(key: "k", name: "a", resizeHeight: largest)
-            .targetSize(sourceWidth: 2000, sourceHeight: 1)
-        XCTAssertEqual(wide.width, Int.max)
-        XCTAssertEqual(wide.height, largest)
-    }
-
     func test_noSizeGivenKeepsTheSourceSize() {
         let size = WGPUSharedTextureRequest(key: "k", name: "a").targetSize(sourceWidth: 1807, sourceHeight: 3917)
         XCTAssertEqual(size.width, 1807)

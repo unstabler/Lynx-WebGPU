@@ -67,27 +67,22 @@ public struct WGPUSharedTextureRequest: Equatable {
     /// `createImageBitmap` rule ("cropped to the source rectangle with formatting"), so a browser
     /// running the same request gets the same size. Neither: the source's size.
     ///
-    /// The result is not bounded here — the runtime rejects a size past its texture limit.
+    /// The caller bounds a requested axis by its texture limit **before** calling, which keeps a derived
+    /// axis (at most the source's side × that limit) inside `Int`, and checks the result against the same
+    /// limit after — `WGPUSharedTextureUpload` does both.
     public func targetSize(sourceWidth: Int, sourceHeight: Int) -> (width: Int, height: Int) {
         switch (resizeWidth, resizeHeight) {
         case let (width?, height?):
             return (width, height)
         case let (width?, nil):
             let height = (Double(sourceHeight) * Double(width) / Double(max(sourceWidth, 1))).rounded(.up)
-            return (width, Self.derivedAxis(height))
+            return (width, max(Int(height), 1))
         case let (nil, height?):
             let width = (Double(sourceWidth) * Double(height) / Double(max(sourceHeight, 1))).rounded(.up)
-            return (Self.derivedAxis(width), height)
+            return (max(Int(width), 1), height)
         case (nil, nil):
             return (sourceWidth, sourceHeight)
         }
-    }
-
-    /// A derived axis as an `Int` — at least 1, and **saturating** at `Int.max`. A resize near the
-    /// 2^53 the payload reader accepts, on a source with an aspect ratio past 1024:1, derives a value
-    /// beyond `Int`, and `Int(_:)` traps on that; saturated, it reaches the runtime's size check.
-    private static func derivedAxis(_ value: Double) -> Int {
-        value < Double(Int.max) ? max(Int(value), 1) : Int.max
     }
 }
 
