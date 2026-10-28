@@ -2079,10 +2079,12 @@ final class WGSLTranspilerTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 3, "the const chain was re-evaluated per reference")
         XCTAssertEqual(auto[0].first?.binding, 1)
         XCTAssertEqual([size.x, size.y, size.z], [1, 1, 1])
-        // The MSL is deliberately not pushed through the Metal compiler here: an untyped module-scope
-        // `const` is emitted as a `#define`, so this chain expands exponentially in Metal's preprocessor
-        // (18 levels take 2.4 s, 26 levels about 25 minutes) — a separate problem from the evaluator's.
-        XCTAssertTrue(msl.contains("#define x26 (wgpu_div((x25 + x25), 2u))"), msl)
+        // Each link is typed from the one before it (`x0` is `u32`, so every `xN` is) — a `constant
+        // uint`, not a `#define`. As macros the chain expanded exponentially in Metal's preprocessor
+        // too (18 levels took 2.4 s, 26 levels about 25 minutes); typed, it compiles in no time.
+        XCTAssertTrue(msl.contains("constant uint x26 = wgpu_div((x25 + x25), 2u);"), msl)
+        XCTAssertFalse(msl.contains("#define x"), msl)
+        MetalCompilerHarness.assertCompiles(msl)
     }
 
     // MARK: - @workgroup_size
@@ -2373,6 +2375,193 @@ final class WGSLTranspilerTests: XCTestCase {
         }
         XCTAssertNil(outcome.error, "\(String(describing: outcome.error))")
         XCTAssertNotNil(outcome.msl)
+    }
+
+    // MARK: - Review follow-ups
+
+    /// A struct held by both a uniform and a storage buffer is laid out once, by the spec's
+    /// address-space-independent rules. The uniform rounding (stride and size up to 16) applied to
+    /// both made `array<Pair>` stride 16 in MSL while JS filled it at 8 — silent misreads.
+    func test_aStructSharedByUniformAndStorageKeepsTheSpecLayout() throws {
+        let msl = try translate("""
+        struct Pair { a: f32, b: f32 }
+        @group(0) @binding(0) var<uniform> one: Pair;
+        @group(0) @binding(1) var<storage, read> many: array<Pair>;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            let n = arrayLength(&many);
+            let x = one.a + many[n - 1u].b;
+        }
+        """, entryPoints: ["main"])
+        XCTAssertTrue(msl.contains("struct alignas(4) Pair {\n    float a;\n    float b;\n};"), msl)
+    }
+
+    /// WGSL `round` is round-half-to-even — MSL's `round` is not, `rint` is.
+    func test_roundIsEmittedAsRint() throws {
+        let msl = try translate("""
+        @fragment fn fs(@location(0) x: f32) -> @location(0) vec4f { return vec4f(round(x)); }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("rint("), msl)
+        XCTAssertFalse(msl.contains("round("), msl)
+    }
+
+    /// A user function may be named like a builtin family — `textureBicubic`, `atomicIncrement`,
+    /// even `max`. Dispatching on the name's prefix first rejected it as an unsupported builtin.
+    ///
+    /// A name the `metal` namespace also declares (`max`, `max3`, `saturate`) is renamed as well:
+    /// the prelude's `using namespace metal;` would otherwise make every call to the file-scope
+    /// declaration ambiguous ("call to 'max3' is ambiguous" from the Metal compiler).
+    func test_aUserFunctionNamedLikeABuiltinFamilyIsCalledAsAFunction() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var t: texture_2d<f32>;
+        @group(0) @binding(1) var s: sampler;
+        @group(0) @binding(2) var<storage, read_write> counter: atomic<u32>;
+
+        fn textureBicubic(uv: vec2f) -> vec4f { return textureSample(t, s, uv); }
+        fn atomicIncrement() -> u32 { return atomicAdd(&counter, 1u); }
+        fn max(a: f32, b: f32) -> f32 { return select(a, b, b > a); }
+        fn saturate(a: f32) -> f32 { return clamp(a, 0.0, 1.0); }
+        // Declared after `max`: functions go out in source order with no prototypes (C++ needs the
+        // callee first), and this `max` resolves to the user's, as WGSL's shadowing says.
+        fn max3(a: f32, b: f32, c: f32) -> f32 { return max(max(a, b), c); }
+
+        @fragment fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+            let n = atomicIncrement();
+            return textureBicubic(uv) * max3(uv.x, uv.y, f32(n)) + saturate(max(uv.x, uv.y));
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("textureBicubic("), msl)
+        XCTAssertTrue(msl.contains("atomicIncrement("), msl)
+        for name in ["max3", "max", "saturate"] {
+            XCTAssertTrue(msl.contains("float wgpu_fn_\(name)("), "\(name) must be declared renamed\n\(msl)")
+            XCTAssertTrue(msl.contains("wgpu_fn_\(name)("), msl)
+            XCTAssertFalse(msl.contains("float \(name)("), "\(name) must not be declared at file scope\n\(msl)")
+        }
+    }
+
+    /// `- -b` glued together is C++'s pre-decrement.
+    func test_stackedPrefixOperatorsAreSeparated() throws {
+        let msl = try translate("""
+        @fragment fn fs(@location(0) x: f32) -> @location(0) vec4f {
+            var b = x;
+            let y = - -b;
+            return vec4f(y, - - -b, 0.0, 1.0);
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("- -b"), msl)
+        XCTAssertFalse(msl.contains("--b"), msl)
+    }
+
+    /// `loop { … continuing { … } }` with `continue` and `break if` — the shape Naga and Tint emit
+    /// for every `for`/`while` that continues. The body goes into a `do { } while (false)` so a
+    /// `continue` falls into the continuing block, and the body's `break` sets a flag checked after it.
+    func test_aLoopWithContinuingContinueAndBreakIfTranslates() throws {
+        let msl = try translate("""
+        @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            var i = 0u;
+            var acc = 0u;
+            loop {
+                if i == 7u { break; }
+                if (i % 2u) == 0u { continue; }
+                switch i {
+                    case 5u: { break; }
+                    default: { acc = acc + i; }
+                }
+                continuing {
+                    i = i + 1u;
+                    break if i >= 10u;
+                }
+            }
+            out[0] = acc;
+        }
+        """, entryPoints: ["main"])
+        XCTAssertTrue(msl.contains("do\n"), msl)
+        XCTAssertTrue(msl.contains("} while (false);"), msl)
+        XCTAssertTrue(msl.contains("wgpu_break_"), msl)
+        // The switch's own break stays a plain break (it leaves the switch, not the loop).
+        XCTAssertTrue(msl.contains("case 5u:"), msl)
+    }
+
+    /// A typeless module constant became a `#define`, and a struct member of the same name was
+    /// rewritten into the expression. Arithmetic now infers a type, so it is a typed constant.
+    func test_anArithmeticModuleConstantIsATypedConstantNotAMacro() throws {
+        let msl = try translate("""
+        const scale = 1.0 / 255.0;
+        const half_turn = radians(180.0);
+        const r = 2 * 3;
+        struct Material { scale: f32, r: i32 }
+        @group(0) @binding(0) var<uniform> m: Material;
+
+        @fragment fn fs(@location(0) color: vec4f) -> @location(0) vec4f {
+            return vec4f(color.r * m.scale * scale * half_turn, f32(m.r + r), 0.0, 1.0);
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("constant float scale = "), msl)
+        XCTAssertTrue(msl.contains("constant float half_turn = "), msl)
+        XCTAssertTrue(msl.contains("constant int r = "), msl)
+        XCTAssertFalse(msl.contains("#define scale"), msl)
+    }
+
+    /// A constant defined from another constant takes its type from it — `const TAU = PI * 2.0;`
+    /// stayed a `#define` because `PI` had no type in the syntax-only guess, and the macro then
+    /// rewrote a struct member named `TAU` (a Metal compile error).
+    func test_aModuleConstantDefinedFromAnotherConstantIsTypedToo() throws {
+        let msl = try translate("""
+        const PI = 3.14159;
+        const TAU = PI * 2.0;
+        const HALF = TAU / 4;
+        const N = max(2, 3) * 2;
+        struct S { TAU: f32 }
+
+        @fragment fn fs(@location(0) x: f32) -> @location(0) vec4f {
+            var s: S;
+            s.TAU = x;
+            var arr = array<f32, 8>();
+            return vec4f(s.TAU * TAU + HALF + arr[N]);
+        }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("constant float TAU = "), msl)
+        XCTAssertTrue(msl.contains("constant float HALF = "), msl)
+        XCTAssertTrue(msl.contains("constant int N = "), msl)
+        XCTAssertFalse(msl.contains("#define"), msl)
+    }
+
+    /// `metal`, `matrix`, `float`… are plain identifiers in WGSL and collide with the namespace or
+    /// the scalar types under `using namespace metal;`.
+    func test_metalNamespaceAndScalarNamesAreRenamed() throws {
+        let msl = try translate("""
+        const metal: f32 = 0.5;
+        struct matrix { float: f32 }
+        @group(0) @binding(0) var<uniform> u: matrix;
+        @fragment fn fs() -> @location(0) vec4f { return vec4f(metal * u.float); }
+        """, entryPoints: ["fs"])
+        XCTAssertTrue(msl.contains("wgpu_id_metal"), msl)
+        XCTAssertTrue(msl.contains("wgpu_id_matrix"), msl)
+        XCTAssertTrue(msl.contains("wgpu_id_float"), msl)
+    }
+
+    /// A pipeline layout that calls a binding a buffer where the shader declares a texture used to
+    /// get `[[texture(k)]]` with `k` from the buffer counter — the wrong resource, no error.
+    func test_aLayoutSlotKindDisagreeingWithTheShaderIsRejected() throws {
+        let module = try WGSLShaderModule(source: """
+        @group(0) @binding(0) var t: texture_2d<f32>;
+        @group(0) @binding(1) var s: sampler;
+        @fragment fn fs(@location(0) uv: vec2f) -> @location(0) vec4f { return textureSample(t, s, uv); }
+        """)
+        let bindings = try WGSLBindingAssigner.assign(groups: [[
+            WGPUBindGroupLayoutEntry(binding: 0, visibility: .fragment,
+                                     layout: .buffer(WGPUBufferBindingLayout(type: .uniform))),
+            WGPUBindGroupLayoutEntry(binding: 1, visibility: .fragment,
+                                     layout: .sampler(WGPUSamplerBindingLayout(type: .filtering))),
+        ]])
+        XCTAssertThrowsError(try module.translateToMSL(entryPoints: ["fs"], bindings: bindings)) { error in
+            let message = (error as? WGPUError)?.message ?? "\(error)"
+            XCTAssertTrue(message.contains("pipeline layout"), message)
+        }
     }
 }
 
