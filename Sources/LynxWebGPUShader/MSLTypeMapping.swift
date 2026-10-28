@@ -149,8 +149,12 @@ enum MSLTypeMapping {
         "inline", "static", "extern", "register", "volatile", "mutable", "explicit",
         "export", "typedef", "sizeof", "alignof", "decltype", "auto", "constexpr", "nullptr",
         "goto", "do", "typeid", "and", "or", "not", "xor", "compl", "bitand", "bitor",
-        // MSL scalar/vector type names
-        "half", "uchar", "ushort", "size_t", "ptrdiff_t",
+        // MSL scalar/vector type names (`float`/`int`/`uint` are plain identifiers in WGSL, whose
+        // scalars are `f32`/`i32`/`u32` — a module-scope `const float = …` must not redefine the type).
+        "half", "uchar", "ushort", "size_t", "ptrdiff_t", "float", "int", "uint", "double", "bool",
+        // The namespace itself and its templates: a module-scope `const metal: f32` or a `struct
+        // matrix` collide with `metal::` under the prelude's `using namespace metal;`.
+        "metal", "matrix", "vec",
         // Names declared in the `metal` namespace — sampler options and sampling-coordinate structs.
         // The prelude's `using namespace metal;` makes a module-scope `constant int bias` ambiguous
         // with `metal::bias` at every use ("reference to 'bias' is ambiguous"). A function-local name
@@ -162,8 +166,31 @@ enum MSLTypeMapping {
         "border_color", "lod_clamp", "mesh", "fast", "precise", "quad", "simd",
     ]
 
-    /// Names unusable as function names (`main` is not a C++ keyword but Metal rejects it).
-    private static let reservedFunctionNames: Set<String> = ["main"]
+    /// Names unusable as user function names: `main` (not a C++ keyword, but Metal rejects it) and
+    /// every function the `metal` namespace declares. The prelude's `using namespace metal;` makes a
+    /// file-scope `float max(float, float)` **ambiguous** with `metal::max` at every call, so a user
+    /// `fn max` (`fn max3`, `fn saturate`, `fn mix`, …) is renamed. WGSL lets a module shadow a
+    /// builtin this way, and calls go through `functionName` as declarations do, so the two stay
+    /// paired. Builtin calls never come here — a `max(…)` with no user `fn max` keeps its spelling.
+    private static let reservedFunctionNames: Set<String> = [
+        "main",
+        // <metal_math>
+        "abs", "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "ceil", "copysign", "cos",
+        "cosh", "cospi", "divide", "exp", "exp2", "exp10", "fdim", "floor", "fma", "fmax", "fmax3",
+        "fmedian3", "fmin", "fmin3", "fmod", "fract", "frexp", "ilogb", "ldexp", "log", "log2", "log10",
+        "max", "max3", "median3", "min", "min3", "modf", "nextafter", "pow", "powr", "rint", "round",
+        "rsqrt", "sin", "sincos", "sinh", "sinpi", "sqrt", "tan", "tanh", "tanpi", "trunc",
+        // <metal_integer>
+        "abs_diff", "addsat", "clz", "ctz", "extract_bits", "hadd", "insert_bits", "mad24", "madhi",
+        "madsat", "mul24", "mulhi", "popcount", "reverse_bits", "rhadd", "rotate", "subsat",
+        // <metal_common> · <metal_relational> · <metal_geometric> · <metal_matrix>
+        "clamp", "mix", "saturate", "sign", "smoothstep", "step", "all", "any", "isfinite", "isinf",
+        "isnan", "isnormal", "isordered", "isunordered", "select", "cross", "distance",
+        "distance_squared", "dot", "faceforward", "length", "length_squared", "normalize", "reflect",
+        "refract", "determinant", "transpose",
+        // <metal_graphics> · <metal_compute>
+        "dfdx", "dfdy", "fwidth", "discard_fragment", "threadgroup_barrier", "simdgroup_barrier",
+    ]
 
     /// Renames an entry point or function to a name that is safe in MSL.
     ///
@@ -202,6 +229,9 @@ enum MSLTypeMapping {
 
     /// Those that differ only in name.
     static let renamedBuiltins: [String: String] = [
+        // WGSL `round` is round-half-to-even; MSL `round` is half away from zero (`round(2.5)` → 3,
+        // `round(-0.5)` → -1). `rint` is the even one — the same choice Tint makes.
+        "round": "rint",
         "inverseSqrt": "rsqrt",
         "dpdx": "dfdx",
         "dpdxCoarse": "dfdx",
