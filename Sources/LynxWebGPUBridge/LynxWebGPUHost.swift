@@ -50,23 +50,26 @@ public final class LynxWebGPUHost: NSObject {
     public func attach(to lynxView: LynxView) {
         self.lynxView = lynxView
         LynxWebGPUHostRegistry.register(self, for: lynxView)
+        // `deltaSeconds` counts from the last tick that went out to JS — the ticker moves its origin only
+        // when this returns true, so the ticks skipped below are inside the next delta.
         ticker.onFrame = { [weak self] timestamp, deltaSeconds in
-            guard let self else { return }
+            guard let self else { return false }
             // The pump goes **before** the readiness gate — on a runtime whose completion notices come
             // from the pump (Dawn's processEvents), putting it after the gate means saturation never clears.
             self.runtime.processEvents()
             // When the GPU is behind by the in-flight limit, skip this tick. Sending the event here
             // would have JS build a frame and stall **the entire JS thread** at nextDrawable() —
             // dropping the frame is better. Once a completion returns it resumes from the next tick.
-            guard self.runtime.isReadyForNextFrame else { return }
+            guard self.runtime.isReadyForNextFrame else { return false }
             // When the JS thread is the slow side, skip the tick until the previous frame event
             // is acknowledged (rAF semantics) — at most one frame event waits in the JS queue,
             // and input events interleave between frames instead of queuing behind stale ticks.
-            guard self.tickGate.shouldSend(at: timestamp) else { return }
+            guard self.tickGate.shouldSend(at: timestamp) else { return false }
             self.lynxView?.sendGlobalEvent("webgpu:frame", withParams: [[
                 "timestamp": timestamp * 1000,
                 "delta": deltaSeconds * 1000,
             ]])
+            return true
         }
     }
 
@@ -96,10 +99,12 @@ public final class LynxWebGPUHost: NSObject {
         // The debtor of a previous loop's tick may be gone (its listener was removed) — carrying
         // the old debt over would stall the new loop's first tick by a full timeout.
         tickGate.reset()
+        // Also resets the delta's origin (the last tick sent to JS) — the new link's first delta is 0.
         ticker.start(preferredFramesPerSecond: preferredFramesPerSecond)
     }
 
     /// Stops the frame loop. `detach()` already calls it, so leaving a page needs no separate call.
+    /// The delta's origin is reset with it.
     public func stopFrameLoop() {
         ticker.stop()
         tickGate.reset()
