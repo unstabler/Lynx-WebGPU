@@ -302,6 +302,78 @@ final class ExternalImageTests: XCTestCase {
         try harness.assertPixel(x: 32, y: 32, equals: (255, 0, 0, 255))
     }
 
+    // MARK: - Alpha state (spec `GPUCopyExternalImageDestInfo.premultipliedAlpha`)
+
+    /// A translucent color whose premultiplied form differs in every color channel.
+    private static let translucent: (UInt8, UInt8, UInt8, UInt8) = (200, 100, 40, 128)
+    /// `translucent` as stored — straight, and premultiplied (each channel × 128/255).
+    private static let straightTexel = (r: 200, g: 100, b: 40, a: 128)
+    private static let premultipliedTexel = (r: 100, g: 50, b: 20, a: 128)
+
+    /// Decodes `translucent` with the given bitmap alpha state, copies it with the given destination flag,
+    /// and checks the texel that landed in the texture (the shader samples it straight onto the canvas).
+    private func assertCopiedAlpha(
+        bitmapPremultiplied: Bool, destinationPremultiplied: Bool,
+        equals expected: (r: Int, g: Int, b: Int, a: Int), _ message: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let png = try makePNG(width: 4, height: 4, top: Self.translucent, bottom: Self.translucent)
+        try decode(handle: 40, data: png, options: .init(premultiplyAlpha: bitmapPremultiplied))
+
+        drawImage(bitmap: 40, texture: (4, 4), copy: [
+            "op": "copyExternalImageToTexture",
+            "source": ["source": 40],
+            "destination": ["texture": 2, "premultipliedAlpha": destinationPremultiplied],
+        ])
+
+        try harness.assertPixel(x: 32, y: 32, equals: expected, message, file: file, line: line)
+        // The image is one color, so a far corner must read the same — a mismatch there means only part of
+        // the copy was converted (and the green clear color never matches either point).
+        try harness.assertPixel(x: 1, y: 62, equals: expected, "\(message) (corner)", file: file, line: line)
+    }
+
+    func test_aStraightBitmapIntoAStraightDestinationIsCopiedAsIs() throws {
+        try assertCopiedAlpha(bitmapPremultiplied: false, destinationPremultiplied: false,
+                              equals: Self.straightTexel, "straight stays straight")
+    }
+
+    func test_aStraightBitmapIntoAPremultipliedDestinationIsMultiplied() throws {
+        try assertCopiedAlpha(bitmapPremultiplied: false, destinationPremultiplied: true,
+                              equals: Self.premultipliedTexel, "the copy must multiply alpha in")
+    }
+
+    /// The default web path — `createImageBitmap` premultiplies, the destination defaults to straight.
+    func test_aPremultipliedBitmapIntoAStraightDestinationIsDivided() throws {
+        try assertCopiedAlpha(bitmapPremultiplied: true, destinationPremultiplied: false,
+                              equals: Self.straightTexel, "the copy must undo the premultiplication")
+    }
+
+    /// Premultiplied end to end is a plain copy — the path that keeps low-alpha edges intact.
+    func test_aPremultipliedBitmapIntoAPremultipliedDestinationIsCopiedAsIs() throws {
+        try assertCopiedAlpha(bitmapPremultiplied: true, destinationPremultiplied: true,
+                              equals: Self.premultipliedTexel, "premultiplied stays premultiplied")
+    }
+
+    /// Only sRGB is carried out — the decoder does no color conversion. Display P3 is a valid spec value,
+    /// so it comes back as `unsupported` (a `GPUValidationError` in JS) and nothing is written.
+    func test_aDisplayP3DestinationIsRefusedWithItsPath() throws {
+        let png = try makePNG(width: 4, height: 4, top: (255, 0, 0, 255), bottom: (255, 0, 0, 255))
+        try decode(handle: 40, data: png)
+
+        let result = harness.execute([
+            ["op": "createTexture", "id": 2, "size": ["width": 4, "height": 4],
+             "format": "rgba8unorm", "usage": TestUsage.textureBinding | TestUsage.textureCopyDst],
+            ["op": "copyExternalImageToTexture",
+             "source": ["source": 40],
+             "destination": ["texture": 2, "colorSpace": "display-p3"]],
+        ])
+        let errors = harness.describeErrors(result)
+        XCTAssertEqual(result["ok"] as? Bool, false)
+        XCTAssertTrue(errors.contains("[unsupported]"), errors)
+        XCTAssertTrue(errors.contains("destination.colorSpace"), errors)
+        XCTAssertTrue(errors.contains("srgb"), errors)
+    }
+
     func test_rejectsACopyPastTheImage() throws {
         let png = try makePNG(width: 4, height: 4, top: (255, 0, 0, 255), bottom: (255, 0, 0, 255))
         try decode(handle: 40, data: png)

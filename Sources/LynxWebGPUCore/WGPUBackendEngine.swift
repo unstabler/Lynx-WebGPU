@@ -749,7 +749,8 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     /// Uploads an already-decoded image (`ImageBitmap`) into a texture — the spec's
     /// `queue.copyExternalImageToTexture()`.
     ///
-    /// The pixels are already RGBA8, so all that happens here is cropping and converging on the `writeTexture` verb.
+    /// The pixels are already RGBA8, so all that happens here is cropping (converting the alpha state when the
+    /// destination asks for the other one) and converging on the `writeTexture` verb.
     private func copyExternalImageToTexture(_ command: WGPUCopyExternalImageCommand) throws {
         let bitmap = try registry.lookup(
             command.source.image, as: WGPUImageBitmapObject.self, kind: "ImageBitmap",
@@ -770,6 +771,16 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             throw WGPUError.validation(
                 "the destination of copyExternalImageToTexture must be a 4-byte color format "
                 + "(\(target.format.rawValue)) — upload anything else directly with writeTexture"
+            )
+        }
+        // Spec `GPUCopyExternalImageDestInfo.colorSpace`. The decoder draws into device RGB with no color
+        // management, so there is nothing to convert from — a Display P3 destination would need a color
+        // conversion pass this implementation does not have. Refused rather than written as if it were sRGB.
+        guard command.colorSpace == .srgb else {
+            throw WGPUError.unsupported(
+                "copyExternalImageToTexture supports only colorSpace 'srgb' (got '\(command.colorSpace.rawValue)') "
+                + "— decoded images are not color-converted",
+                path: command.destination.fieldPath("colorSpace")
             )
         }
 
@@ -829,6 +840,17 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         // one — three.js's `Texture.flipY` defaults to true, so ignoring it flips textures silently.)
         let flipY = command.source.flipY
 
+        // Spec `GPUCopyExternalImageDestInfo.premultipliedAlpha` — the alpha state **written**. The bitmap
+        // records its own (`createImageBitmap`'s `premultiplyAlpha`); when the two differ each row is
+        // converted as it is copied. When they match it is a plain copy, so premultiplied values survive
+        // even where a channel exceeds alpha, as the spec requires.
+        let alphaConversion: WGPUAlphaConversion?
+        switch (bitmap.premultiplied, command.premultipliedAlpha) {
+        case (false, true): alphaConversion = .premultiply
+        case (true, false): alphaConversion = .unpremultiply
+        default: alphaConversion = nil
+        }
+
         // Copy only what is needed. Using the full width would make bytesPerRow wrong for a partial copy.
         let rowBytes = size.width * 4
         var slice = Data(count: rowBytes * size.height)
@@ -840,7 +862,9 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
                     let sourceRow = flipY ? (sourceOrigin.y + size.height - 1 - row)
                                           : (sourceOrigin.y + row)
                     let from = sourceRow * bitmap.bytesPerRow + sourceOrigin.x * 4
-                    memcpy(destinationBase + row * rowBytes, sourceBase + from, rowBytes)
+                    let to = destinationBase + row * rowBytes
+                    memcpy(to, sourceBase + from, rowBytes)
+                    alphaConversion?.apply(to: UnsafeMutableRawBufferPointer(start: to, count: rowBytes))
                 }
             }
         }

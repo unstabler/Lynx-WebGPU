@@ -379,7 +379,8 @@ public enum WGPUCanvasAlphaMode: String, CaseIterable, Sendable {
     case premultiplied
 }
 
-/// `GPUCanvasConfiguration.colorSpace` — the two the spec defines.
+/// `PredefinedColorSpace` — the two the spec defines. `GPUCanvasConfiguration.colorSpace` and
+/// `GPUCopyExternalImageDestInfo.colorSpace` take it.
 public enum WGPUPredefinedColorSpace: String, CaseIterable, Sendable {
     case srgb
     case displayP3 = "display-p3"

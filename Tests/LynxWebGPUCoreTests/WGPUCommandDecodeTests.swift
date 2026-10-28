@@ -250,6 +250,38 @@ final class WGPUCommandDecodeTests: XCTestCase {
         }
     }
 
+    /// Spec `GPUCopyExternalImageDestInfo` — the two members past the texel copy info, with their spec defaults.
+    func test_copyExternalImageDecodesTheDestinationAlphaAndColorSpace() throws {
+        let omitted = try WGPUCommand(from: WGPUValueReader([
+            "op": "copyExternalImageToTexture", "source": ["source": 1], "destination": ["texture": 2],
+        ]))
+        guard case .copyExternalImageToTexture(let defaults) = omitted else {
+            return XCTFail("not the copyExternalImageToTexture case: \(omitted.opName)")
+        }
+        XCTAssertFalse(defaults.premultipliedAlpha, "the spec default is straight alpha")
+        XCTAssertEqual(defaults.colorSpace, .srgb)
+
+        let given = try WGPUCommand(from: WGPUValueReader([
+            "op": "copyExternalImageToTexture", "source": ["source": 1],
+            "destination": ["texture": 2, "premultipliedAlpha": true, "colorSpace": "display-p3"],
+        ]))
+        guard case .copyExternalImageToTexture(let command) = given else {
+            return XCTFail("not the copyExternalImageToTexture case: \(given.opName)")
+        }
+        XCTAssertTrue(command.premultipliedAlpha)
+        XCTAssertEqual(command.colorSpace, .displayP3, "decoded over the whole spec enum — the engine decides")
+        XCTAssertEqual(command.destination.texture, WGPUHandle(2))
+    }
+
+    func test_copyExternalImageRejectsAnUnknownColorSpace() {
+        XCTAssertThrowsError(try WGPUCommand(from: WGPUValueReader([
+            "op": "copyExternalImageToTexture", "source": ["source": 1],
+            "destination": ["texture": 2, "colorSpace": "rec2020"],
+        ]))) { error in
+            XCTAssertEqual((error as? WGPUError)?.kind, .validation)
+        }
+    }
+
     func test_unmapBufferRejectsUndecodableData() {
         XCTAssertThrowsError(try WGPUCommand(from: WGPUValueReader([
             "op": "unmapBuffer", "buffer": 4, "data": "not base64!",

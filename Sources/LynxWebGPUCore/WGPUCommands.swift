@@ -194,16 +194,30 @@ public struct WGPUExternalImageSource: WGPUCommandFields {
 }
 
 /// `queue.copyExternalImageToTexture()`.
+///
+/// The spec's destination is `GPUCopyExternalImageDestInfo` — `GPUTexelCopyTextureInfo` plus two members.
+/// The texture end is decoded as the shared `WGPUTexelCopyTextureInfo` and the two extra members sit on
+/// the command, read from the same `destination` object.
 public struct WGPUCopyExternalImageCommand: WGPUCommandFields {
     public let source: WGPUExternalImageSource
     public let destination: WGPUTexelCopyTextureInfo
+    /// Spec `GPUCopyExternalImageDestInfo.premultipliedAlpha` (default false) — whether the texels
+    /// **written** carry premultiplied alpha. The bitmap carries its own state; the copy converts when
+    /// the two differ.
+    public let premultipliedAlpha: Bool
+    /// Spec `GPUCopyExternalImageDestInfo.colorSpace` (default `srgb`). Decoded over the whole spec enum;
+    /// the engine carries out only `srgb`.
+    public let colorSpace: WGPUPredefinedColorSpace
     /// Omitted means **the whole remainder of the image** — that needs the image size, so it stays nil.
     public let copySize: WGPUExtent3D?
     public let path: String
 
     public init(from reader: WGPUValueReader) throws {
         source = try WGPUExternalImageSource(from: try reader.requiredObject("source"))
-        destination = try WGPUTexelCopyTextureInfo(from: try reader.requiredObject("destination"))
+        let destinationReader = try reader.requiredObject("destination")
+        destination = try WGPUTexelCopyTextureInfo(from: destinationReader)
+        premultipliedAlpha = destinationReader.bool("premultipliedAlpha", default: false)
+        colorSpace = try destinationReader.enumValue("colorSpace", default: WGPUPredefinedColorSpace.srgb)
         copySize = try reader.extent("copySize")
         path = reader.path
     }
