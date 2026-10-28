@@ -41,7 +41,7 @@ Lynx 연동 레이어(`LynxWebGPUHost` · `WebGPUNativeModule` · `WebGPUCanvasU
 
 ```swift
 packages: [
-    .remote(url: "https://github.com/xenonClient/Lynx-WebGPU", requirement: .upToNextMajor(from: "0.5.4")),
+    .remote(url: "https://github.com/xenonClient/Lynx-WebGPU", requirement: .upToNextMajor(from: "0.6.0")),
     // Lynx는 **앱이 고른다.** 아래는 데모가 쓰는 배포본일 뿐이고, 다른 저장소·다른 버전으로
     // 바꿔도 브리지 소스는 그대로 컴파일된다.
     .remote(url: "https://github.com/xenonClient/Lynx-XCFramework", requirement: .exact("4.0.0")),
@@ -131,6 +131,28 @@ final class GPUPageViewController: UIViewController {
 3. `host.attach(to:)` — LynxView 연결 (**빠뜨리면** 캔버스 등록과 프레임 이벤트가 동작하지 않는다)
 
 페이지를 떠날 때 `host.detach()`를 부르지 않으면 `CADisplayLink`가 계속 돌고 GPU 객체가 남는다.
+
+### 여러 LynxView가 텍스처를 나눠 쓰려면 — 장치를 하나로
+
+`importSharedTexture`(`docs/WEBGPU-API.md` §3)는 큰 이미지를 페이지끼리 나눠 쓰는 경로다. 텍스처는
+**장치마다** 따로라서, 공유하려면 모든 컨텍스트에 같은 `MTLDevice`를 넣는다:
+
+```swift
+enum GPU { static let device = MTLCreateSystemDefaultDevice()! }   // 앱에 하나
+host = LynxWebGPUHost(runtime: try! LynxWebGPUContext(device: GPU.device))
+```
+
+장치를 넘기지 않으면 컨텍스트마다 `MTLCreateSystemDefaultDevice()`를 부른다. 그 객체가 늘 같은지는
+Apple이 문서로 약속하지 않았으므로(이 저장소의 macOS 테스트 머신에서는 같았다) 공유가 목적이면
+명시적으로 넘긴다. 다른 장치를 쓰는 컨텍스트는 캐시 항목이 따로라 서로 섞이지 않는다.
+
+- 캐시(`WGPUSharedTextureCache.shared`)는 `LynxWebGPU` 모듈에 있다. 앱의 여러 모듈이 이 패키지를 쓰면
+  `LynxWebGPU`를 **동적 프레임워크로 한 번만** 링크해야 프로세스에 캐시가 하나다. 모듈마다 정적으로
+  들어가면 사본마다 캐시가 갈라진다.
+- `url`은 그 호스트의 `assetProvider`가 해석하고, 캐시 히트여도 매번 거친다 — `allowedRoots`는
+  그대로 적용된다. 다만 키 공간은 프로세스에 하나라서, 다른 페이지가 만든 키를 아는 번들은 그
+  텍스처를 받는다.
+- Dawn처럼 공유 텍스처가 없는 런타임은 `unsupported`로 답한다(`WebGPURuntime.importSharedTexture`의 기본 구현).
 
 ### 프레임 루프는 누가 시작하나 — `attach`만으로는 돌지 않는다
 

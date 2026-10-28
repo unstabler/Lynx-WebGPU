@@ -42,9 +42,22 @@ test('the options are moved across under the native names', async () => {
 
   const params = state.decodeImageCalls[0];
   assert.equal(params.flipY, true);
-  assert.equal(params.premultiplyAlpha, true, "only 'premultiply' is true");
+  assert.equal(params.premultiplyAlpha, true);
   assert.equal(params.resizeWidth, 8);
   assert.equal(params.resizeHeight, 4);
+});
+
+test("premultiplyAlpha of 'default' or left out premultiplies — as Chromium does", async () => {
+  // Chromium's ImageBitmap::ParseOptions maps 'default' and 'premultiply' alike to premultiplied (the HTML spec
+  // leaves 'default' to the implementation). Un-premultiplying here made the app and a browser preview disagree.
+  const state = installNativeMock();
+  await makeDevice();
+
+  await createImageBitmap('a.png');
+  await createImageBitmap('a.png', {});
+  await createImageBitmap('a.png', { premultiplyAlpha: 'default' });
+
+  assert.deepEqual(state.decodeImageCalls.map((params) => params.premultiplyAlpha), [true, true, true]);
 });
 
 test("premultiplyAlpha of 'none' does not multiply", async () => {
@@ -107,6 +120,27 @@ test('copy-time flipY rides along — this is what three.js uses', async () => {
   const copies = commandsOf(state).filter((c) => c.op === 'copyExternalImageToTexture');
   assert.equal(copies[0].source.flipY, true);
   assert.equal(copies[1].source.flipY, false, 'omitted, it does not flip');
+});
+
+test("the destination's premultipliedAlpha and colorSpace ride along, with the spec defaults", async () => {
+  // They used to be dropped — native copied the bitmap's alpha state as is, whatever the destination asked for.
+  const state = installNativeMock({ decodeImageResult: { ok: true, width: 8, height: 8 } });
+  const device = await makeDevice();
+  const bitmap = await createImageBitmap('a.png');
+  const texture = device.createTexture({ size: [8, 8], format: 'rgba8unorm', usage: 0x06 });
+
+  device.queue.copyExternalImageToTexture({ source: bitmap }, { texture });
+  device.queue.copyExternalImageToTexture({ source: bitmap }, { texture, premultipliedAlpha: true });
+  device.queue.copyExternalImageToTexture({ source: bitmap }, { texture, colorSpace: 'display-p3' });
+  device.queue.submit([]);
+
+  const copies = commandsOf(state).filter((c) => c.op === 'copyExternalImageToTexture');
+  assert.equal(copies[0].destination.premultipliedAlpha, false, 'the spec default is straight alpha');
+  assert.equal(copies[0].destination.colorSpace, 'srgb', 'the spec default color space');
+  assert.equal(copies[1].destination.premultipliedAlpha, true);
+  // Native rejects it as a validation error — the shim forwards it so the error lands in order in the
+  // error scopes, as one from native would.
+  assert.equal(copies[2].destination.colorSpace, 'display-p3');
 });
 
 test('a partial copy puts its origin and mipLevel on', async () => {

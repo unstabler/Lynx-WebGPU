@@ -35,7 +35,7 @@ Browser WebGPU code and WGSL shaders port over almost verbatim.
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/xenonClient/Lynx-WebGPU", from: "0.5.4")
+.package(url: "https://github.com/xenonClient/Lynx-WebGPU", from: "0.6.0")
 ```
 
 That gives you the **engine** (`LynxWebGPU`). Types that touch Lynx — such as `LynxWebGPUHost` below —
@@ -119,6 +119,10 @@ lifetimes. `submit()` returns a live-object count (`objects`) and the native sid
 catch missing destroys; when the engine supports `FinalizationRegistry`, a GC-driven auto-release safety net
 kicks in.
 
+**Large images are shared across pages** — `importSharedTexture` decodes and uploads an image once per key, and
+every LynxView on the same device shares that texture. The thumbnail API decodes straight to the target size, so
+no full-size bitmap ever sits in memory, and the texture is read-only, so no page can change another's picture.
+
 ## Compatibility with real-world WebGPU shaders
 
 We ran all 69 WGSL shaders from the official [webgpu-samples](https://github.com/webgpu/webgpu-samples)
@@ -140,7 +144,7 @@ The measurement harness ships in the repo, so the numbers can be re-taken anytim
 
 ## Verification
 
-486 Swift + 150 JS tests run in under half a minute — no simulator, no device.
+541 Swift + 175 JS tests run in under half a minute — no simulator, no device.
 
 - Transpiler tests push the generated MSL through the **actual Metal compiler**.
 - Render tests draw into offscreen textures and **assert pixel values** (triangle, uniforms, indexed draw,

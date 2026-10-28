@@ -19,7 +19,7 @@ Lynx 연동: `docs/LYNX-INTEGRATION.md` · 커맨드 스트림 명세: `docs/COM
 ```zsh
 # macOS 개발 루프 — Lynx 없이 엔진/트랜스파일러만 빌드·테스트 (가장 빠르다)
 swift build
-swift test                                   # 486개 테스트, ~25초 (셰이더 테스트가 Metal 컴파일러를 부른다)
+swift test                                   # 541개 테스트, ~25초 (셰이더 테스트가 Metal 컴파일러를 부른다)
 swift test --filter LynxWebGPUShaderTests    # WGSL → MSL 트랜스파일러만
 swift test --filter RenderPipelineTests      # GPU 오프스크린 렌더 검증
 swift test --filter ConformanceTests         # 적합성 스위트(31검사) — 런타임 무관 계약
@@ -38,7 +38,7 @@ arch -arm64 xcodebuild -workspace LynxWebGPUDemo.xcworkspace -scheme DawnCheck \
 xcrun simctl launch <device> org.lynxwebgpu.dawndemo -demo triangle   # DawnDemo 스킴 빌드 후 화면 확인
 
 # JS 클라이언트(shim) — 런타임 의존성 0. TypeScript는 **검사·선언 생성 전용**이다 (빌드 산출물 없음)
-cd JS && npm test            # node 내장 러너, 150개
+cd JS && npm test            # node 내장 러너, 175개
 cd JS && npm run typecheck   # JSDoc 기준 타입 검사 (tsc --noEmit)
 cd JS && npm run types       # webgpu.d.ts 를 JSDoc에서 다시 생성
 
@@ -124,12 +124,15 @@ Sources/
 │                         디스패치·검증·오류 스코프·프레임 수명·매핑 게이트·직렬화 락) ·
 │                         WGPUEngineObjects(핸들 메타데이터 래퍼) · WGPUImageDecoder(ImageIO)
 │                         WGPUFrameCoordinator(present 시점·in-flight 회계 — 백엔드 무관)
+│                         WGPUSharedTexture(공유 텍스처 요청·리사이즈 규칙·브리지 진입점)
 ├── LynxWebGPUShader/   — WGSLLexer → WGSLParser → WGSLReflection → MSLEmitter
 │                         WGSLLayout(vec3 배치 보정) · WGSLBindings(Metal 인덱스 배정)
 │                         MSLPrelude(타입 추론을 C++ 템플릿에 위임하는 셰이더 프렐류드)
 ├── LynxWebGPU/         — WGPUMetalMapping / WGPUResources / WGPUPipeline / WGPUSurface
 │                         WGPUMetalBackend(= WGPUBackend의 Metal 구현 — 인코딩 동사만)
 │                         LynxWebGPUContext(= 엔진 + Metal 백엔드 조합 — WebGPURuntime 기본 구현)
+│                         WGPUSharedTextureCache(프로세스 전역 · (장치, 키)마다 하나 · 약한 참조) ·
+│                         WGPUSharedTextureUpload(썸네일 디코드 → 공유 버퍼 → 전용 큐 blit)
 ├── LynxWebGPUConformance/ — WebGPUConformance(스위트 입구) · ConformanceHarness ·
 │                         Checks(렌더·동치성·오류 19) · LifecycleChecks(경계 계약 10)
 │                         **커맨드 스트림과 `WebGPURuntime`만 쓴다** — 백엔드 내부를 보는

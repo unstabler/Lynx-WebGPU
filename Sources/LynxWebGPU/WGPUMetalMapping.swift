@@ -385,6 +385,15 @@ public enum WGPUDeviceCapability {
         device.supportsFamily(.apple3) || device.supportsFamily(.mac2)
     }
 
+    /// The largest 2D texture side — `GPUSupportedLimits.maxTextureDimension2D` reports it, and a shared
+    /// texture is sized against it before Metal sees the descriptor.
+    ///
+    /// Apple GPU family 3 and above (A9+) and Mac family 2 allow 16384. Below that, 8192. This project's
+    /// minimum (iOS 17 = A12+) is always the former, but older macOS splits.
+    public static func maxTextureDimension2D(_ device: MTLDevice) -> Int {
+        device.supportsFamily(.apple3) || device.supportsFamily(.mac2) ? 16384 : 8192
+    }
+
     /// The compression family a format belongs to — the classification itself is a spec fact, so it
     /// lives in Core (`WGPUTextureCompressionFamily`; the engine's creation check uses the same one).
     /// An alias and a forwarder keep the old spelling working.

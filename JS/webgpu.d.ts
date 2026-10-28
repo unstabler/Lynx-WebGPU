@@ -203,6 +203,25 @@ declare class GPUOutOfMemoryError extends GPUError {
 }
 declare class GPUInternalError extends GPUError {
 }
+/**
+ * The error the `createRenderPipelineAsync` family rejects with (the spec's `GPUPipelineError`).
+ *
+ * The spec's `reason` is only `'validation' | 'internal'`, so the four command error kinds fold into those —
+ * a shader translation/compilation failure (`backend`) is `internal` and the rest are `validation`.
+ * The same rule as the `pushErrorScope` filter correspondence.
+ *
+ * @param {WGPUError} error
+ * @returns {Error & {reason: string}}
+ */
+/**
+ * The slot where the spec says to throw an `OperationError` (argument validation in `getMappedRange`, etc.).
+ *
+ * Matching the name is the point — web code branches on `error.name`.
+ */
+declare class OperationError extends Error {
+    /** @param {string} message */
+    constructor(message: string);
+}
 declare class Recorder {
     /** @type {GPUCommand[]} */
     pending: GPUCommand[];
@@ -373,12 +392,12 @@ declare class GPUBuffer extends GPUObjectBase {
     /**
      * Unmaps.
      *
-     * For `mappedAtCreation`, this is where the actual creation command (initial data included) is recorded;
-     * for something mapped by `mapAsync` it tells native "queue operations may use it now" —
-     * a buffer being mapped is rejected by queue operations per the spec, so **this must be called once you are done.**
+     * It tells native "queue operations may use it now" — a buffer being mapped is rejected by queue
+     * operations per the spec, so **this must be called once you are done.**
      *
-     * A `GPUMapMode.WRITE` mapping **carries its bytes back** here (`unmapBuffer`'s `offset` + `data`) —
-     * the mapping is a JS copy, so without that everything written into it would vanish silently.
+     * A write mapping — `mappedAtCreation` or `GPUMapMode.WRITE` — **carries its bytes back** here
+     * (`unmapBuffer`'s `offset` + `data`): the mapping is a JS copy, so without that everything
+     * written into it would vanish silently.
      *
      * @returns {void}
      */
@@ -559,10 +578,12 @@ declare class GPUPassEncoderBase {
     /**
      * @param {number} index
      * @param {GPUBindGroup} bindGroup
-     * @param {number[]} [dynamicOffsets]
+     * @param {number[] | Uint32Array} [dynamicOffsets]
+     * @param {number} [dynamicOffsetsDataStart] with a `Uint32Array`: the first offset to use (spec overload)
+     * @param {number} [dynamicOffsetsDataLength] with a `Uint32Array`: how many offsets to use
      * @returns {void}
      */
-    setBindGroup(index: number, bindGroup: GPUBindGroup, dynamicOffsets?: number[]): void;
+    setBindGroup(index: number, bindGroup: GPUBindGroup, dynamicOffsets?: number[] | Uint32Array, dynamicOffsetsDataStart?: number, dynamicOffsetsDataLength?: number): void;
 }
 /**
  * The commands a render pass and a render bundle can **both** use.
@@ -576,16 +597,18 @@ declare class GPURenderCommandsBase extends GPUPassEncoderBase {
      * @param {number} slot
      * @param {GPUBuffer} buffer
      * @param {number} [offset]
+     * @param {number} [size] the bytes bound from `offset` (spec: the rest of the buffer when omitted)
      * @returns {void}
      */
-    setVertexBuffer(slot: number, buffer: GPUBuffer, offset?: number): void;
+    setVertexBuffer(slot: number, buffer: GPUBuffer, offset?: number, size?: number): void;
     /**
      * @param {GPUBuffer} buffer
      * @param {'uint16' | 'uint32'} format
      * @param {number} [offset]
+     * @param {number} [size] the bytes bound from `offset` — bounds what `drawIndexed` may read
      * @returns {void}
      */
-    setIndexBuffer(buffer: GPUBuffer, format: 'uint16' | 'uint32', offset?: number): void;
+    setIndexBuffer(buffer: GPUBuffer, format: 'uint16' | 'uint32', offset?: number, size?: number): void;
     /**
      * @param {number} vertexCount
      * @param {number} [instanceCount]
@@ -886,15 +909,16 @@ declare class GPUQueue {
      * @param {GPUBuffer} buffer
      * @param {number} bufferOffset
      * @param {GPUDataSource} data
-     * @param {number} [dataOffset] the start position in elements
-     * @param {number} [size] the number of elements
+     * @param {number} [dataOffset] the start position — in elements of a TypedArray, in **bytes** of an `ArrayBuffer`/`DataView` (spec)
+     * @param {number} [size] the count — elements of a TypedArray, bytes of an `ArrayBuffer`/`DataView`
      * @returns {void}
      */
     writeBuffer(buffer: GPUBuffer, bufferOffset: number, data: GPUDataSource, dataOffset?: number, size?: number): void;
     /**
      * @param {{texture: GPUTexture, mipLevel?: number, origin?: GPUOrigin3DDict}} destination
      * @param {GPUDataSource} data
-     * @param {{bytesPerRow: number, rowsPerImage?: number}} dataLayout
+     * @param {{offset?: number, bytesPerRow?: number, rowsPerImage?: number}} dataLayout `offset` is the
+     *   byte the upload starts at inside `data` (spec `GPUTexelCopyBufferLayout.offset`)
      * @param {GPUExtent3D} size
      * @returns {void}
      */
@@ -903,7 +927,8 @@ declare class GPUQueue {
         mipLevel?: number;
         origin?: GPUOrigin3DDict;
     }, data: GPUDataSource, dataLayout: {
-        bytesPerRow: number;
+        offset?: number;
+        bytesPerRow?: number;
         rowsPerImage?: number;
     }, size: GPUExtent3D): void;
     /**
@@ -917,9 +942,18 @@ declare class GPUQueue {
      * and separate — turning both on flips twice and lands back where it started). Web libraries use this
      * one: three.js's `Texture.flipY` defaults to `true`.
      *
+     * `destination.premultipliedAlpha` (default `false`) is the alpha state **written into the texture**, as in
+     * the spec. The bitmap remembers its own state (`createImageBitmap`'s `premultiplyAlpha`), and the copy
+     * multiplies or divides when the two differ — so the default bitmap (premultiplied) copied with the default
+     * destination (straight) comes out un-premultiplied, the same as in a browser.
+     *
+     * `destination.colorSpace` (default `'srgb'`) is carried to native, which takes only `'srgb'` — the decoder
+     * does no color conversion. `'display-p3'` comes back as a `GPUValidationError` through the usual error
+     * channel (error scopes, `uncapturederror`), and the copy is not made.
+     *
      * @param {{source: GPUImageBitmap, origin?: GPUOrigin3DDict, flipY?: boolean}} source
      * @param {{texture: GPUTexture, mipLevel?: number, origin?: GPUOrigin3DDict,
-     *          premultipliedAlpha?: boolean, colorSpace?: string}} destination
+     *          premultipliedAlpha?: boolean, colorSpace?: 'srgb' | 'display-p3'}} destination
      * @param {GPUExtent3D} [copySize] omitted, the whole image
      * @returns {void}
      */
@@ -932,7 +966,7 @@ declare class GPUQueue {
         mipLevel?: number;
         origin?: GPUOrigin3DDict;
         premultipliedAlpha?: boolean;
-        colorSpace?: string;
+        colorSpace?: 'srgb' | 'display-p3';
     }, copySize?: GPUExtent3D): void;
     /**
      * Merges the commands the encoders gathered into the stream and sends them to native **in one go**.
@@ -940,12 +974,26 @@ declare class GPUQueue {
      * @returns {WGPUExecuteResult}
      */
     submit(commandBuffers: GPUCommandBuffer[]): WGPUExecuteResult;
-    /** @returns {Promise<void>} */
+    /**
+     * **Resolves once the work has been handed to native, not when the GPU finishes it.** The command
+     * stream has no completion channel (`docs/COMMAND-STREAM.md`), so code pacing readbacks or frames
+     * on this promise runs earlier than in a browser — `mapAsync()` is the call that does wait for the
+     * GPU (`docs/WEBGPU-API.md` §8).
+     * @returns {Promise<void>}
+     */
     onSubmittedWorkDone(): Promise<void>;
 }
 declare class GPUDevice {
     adapter: GPUAdapter;
+    /** The runtime this device was created on — its registry is shared by every device on it. */
+    _runtime: WebGPUNativeModule;
+    /**
+     * The adapter's limits, overridden by what `requestDevice({requiredLimits})` asked for (already
+     * validated against the adapter there). The spec starts from the defaults instead; starting from
+     * the adapter's values keeps code written against this shim working.
+     */
     limits: Record<string, number>;
+    _destroyed: boolean;
     /** The spec's `GPUDevice.adapterInfo` — it looks straight at the adapter's. */
     adapterInfo: GPUAdapterInfoView;
     /**
@@ -953,17 +1001,16 @@ declare class GPUDevice {
      * adapter supports it, `has()` is false unless it was asked for via `requiredFeatures`). Web code such
      * as three.js uses the pattern of requesting exactly what it picked from the adapter and re-checking here.
      */
-    features: {
-        has: (name: string) => boolean;
-        size: number;
-        values: () => string[];
-    };
+    features: GPUSupportedFeatures;
+    /** @type {(info: GPUDeviceLostInfo) => void} */
+    _resolveLost: (info: GPUDeviceLostInfo) => void;
     /**
      * Device loss notification (the counterpart of `device.lost.then(...)`).
      *
-     * This implementation does not report loss, so it stays **pending forever** — the scenarios where a
-     * Metal device disappears (an eGPU being unplugged, say) do not exist on iOS, and when the process
-     * dies JS dies with it. The property has to exist for bootstraps like `WebGPUBackend.init()` to pass without a TypeError.
+     * This implementation does not report GPU loss, so it stays pending — the scenarios where a Metal
+     * device disappears (an eGPU being unplugged, say) do not exist on iOS, and when the process dies
+     * JS dies with it. It does settle with `reason: 'destroyed'` on `destroy()`, as the spec requires.
+     * The property has to exist for bootstraps like `WebGPUBackend.init()` to pass without a TypeError.
      * @type {Promise<GPUDeviceLostInfo>}
      */
     lost: Promise<GPUDeviceLostInfo>;
@@ -988,8 +1035,9 @@ declare class GPUDevice {
     /**
      * @param {GPUAdapter} adapter
      * @param {string[]} [requiredFeatures] the feature names already validated in `requestDevice()`
+     * @param {Record<string, number>} [requiredLimits] the limits already validated in `requestDevice()`
      */
-    constructor(adapter: GPUAdapter, requiredFeatures?: string[]);
+    constructor(adapter: GPUAdapter, requiredFeatures?: string[], requiredLimits?: Record<string, number>);
     /**
      * The command execution error handler (`{kind, message, path}`). Unregistered, errors go to console.error.
      *
@@ -1159,7 +1207,14 @@ declare class GPUDevice {
      * @returns {GPUQuerySet}
      */
     createQuerySet(descriptor: GPUQuerySetDescriptor): GPUQuerySet;
-    /** Throws away every GPU object (called when leaving the page). @returns {void} */
+    /**
+     * Destroys the device (called when leaving the page). `lost` settles with `reason: 'destroyed'`.
+     *
+     * The native registry is one per runtime, not per device (handles are issued module-wide), so it
+     * is cleared **only when no device remains** — destroying one of two devices used to erase the
+     * other's objects as well. A destroyed device's own objects stay native until the last device goes.
+     * @returns {void}
+     */
     destroy(): void;
 }
 declare class GPUCanvasContext {
@@ -1240,6 +1295,40 @@ declare class GPUCanvasContext {
         height: number;
     };
 }
+/**
+ * The spec's `GPUSupportedFeatures` — a read-only setlike.
+ *
+ * Web code iterates it (`for…of`, spread, `.forEach`, `.keys()`), which the earlier plain
+ * `{has, size, values}` object broke with a TypeError. Built without `Set` so it does not depend on
+ * the engine providing one.
+ */
+export declare class GPUSupportedFeatures {
+    /** @type {string[]} */
+    _names: string[];
+    /** @param {string[]} names */
+    constructor(names: string[]);
+    /** @returns {number} */
+    get size(): number;
+    /**
+     * @param {string} name
+     * @returns {boolean}
+     */
+    has(name: string): boolean;
+    /** @returns {IterableIterator<string>} */
+    values(): IterableIterator<string>;
+    /** @returns {IterableIterator<string>} */
+    keys(): IterableIterator<string>;
+    /** @returns {IterableIterator<[string, string]>} */
+    entries(): IterableIterator<[string, string]>;
+    /**
+     * @param {(value: string, key: string, set: GPUSupportedFeatures) => void} callback
+     * @param {any} [thisArg]
+     * @returns {void}
+     */
+    forEach(callback: (value: string, key: string, set: GPUSupportedFeatures) => void, thisArg?: any): void;
+    /** @returns {IterableIterator<string>} */
+    [Symbol.iterator](): IterableIterator<string>;
+}
 declare class GPUAdapter {
     /**
      * The spec's `GPUAdapterInfo`. The `name`, `backend` and `hasUnifiedMemory` below are **this
@@ -1256,11 +1345,7 @@ declare class GPUAdapter {
      * Device-dependent features — only `has` is imitated so that the same branch as on the web
      * (`adapter.features.has('timestamp-query')`) works (the engine may not have `Set`).
      */
-    features: {
-        has: (name: string) => boolean;
-        size: number;
-        values: () => string[];
-    };
+    features: GPUSupportedFeatures;
     /** @param {WGPUAdapterInfo} info */
     constructor(info: WGPUAdapterInfo);
     /**
@@ -1303,6 +1388,11 @@ export declare const gpu: {
  *
  * A native CADisplayLink drives it, so frames are more even than with `setInterval`.
  * Calling the returned function stops the loop — it must be called when leaving the page.
+ *
+ * Every subscriber keeps **its own** `fps`. The view has one display link, so it runs at the highest fps
+ * asked for and a slower subscriber skips ticks until its interval has passed — a 30 fps background and a
+ * 60 fps burst on the same view each get their own rate, and the link drops back to 30 when the burst stops.
+ * `delta` is the time since **this** subscriber was last called (0 on the first call), skipped ticks included.
  *
  * @param {(frame: {timestamp: number, delta: number}) => void} handler
  * @param {{fps?: number}} [options]
@@ -1399,6 +1489,15 @@ declare class GPUImageBitmap {
  * bitmap.close()
  * ```
  *
+ * `premultiplyAlpha` follows Chromium: `'default'` (and leaving it out) is the same as `'premultiply'`, and
+ * only `'none'` keeps straight alpha. The HTML spec leaves `'default'` to the implementation; matching the
+ * browser keeps a scene's alpha the same here and in a browser preview.
+ *
+ * ImageIO only draws premultiplied, so straight alpha — `'none'` here, or a copy with the default
+ * `premultipliedAlpha: false` — is recovered by dividing, which loses color where alpha is low. Translucent
+ * art that must keep its edges goes premultiplied end to end: the default bitmap copied with
+ * `premultipliedAlpha: true` is a plain copy, blended with `one, one-minus-src-alpha`.
+ *
  * @param {ArrayBuffer | ArrayBufferView | string} source the image bytes, or an asset name
  * @param {{flipY?: boolean, premultiplyAlpha?: 'none' | 'premultiply' | 'default',
  *          resizeWidth?: number, resizeHeight?: number}} [options]
@@ -1410,5 +1509,46 @@ export declare function createImageBitmap(source: ArrayBuffer | ArrayBufferView 
     resizeWidth?: number;
     resizeHeight?: number;
 }): Promise<GPUImageBitmap>;
-export { GPUImageBitmap, GPUBuffer, GPUTexture, GPUTextureView, GPUSampler, GPUDevice, GPUCanvasContext, GPURenderBundle, GPURenderBundleEncoder, GPUQuerySet, GPUError, GPUValidationError, GPUOutOfMemoryError, GPUInternalError, };
+/**
+ * Imports a **process-wide shared texture** — one GPU texture per key, shared by every page on the device.
+ *
+ * Each LynxView runs its own context and JS runtime, so an image several pages draw would otherwise sit in
+ * GPU memory once per page (and a large one decoded, cropped and staged once per page on the way). Here
+ * native decodes and uploads it once per key — straight at the requested size, with no pixels crossing the
+ * bridge, no `ImageBitmap` and no staging copy — and every page on the same Metal device that asks for the
+ * key gets the same texture.
+ *
+ * ```js
+ * const clouds = await importSharedTexture(device, {
+ *   key: 'clouds-v3@1024w', url: 'file:///…/clouds.png', resizeWidth: 1024,
+ * })
+ * const view = clouds.createView()   // sample it like any texture
+ * ```
+ *
+ * - **The key is your promise about the pixels.** The same key must always mean the same image at the same
+ *   size: a key already in use returns the existing texture whatever `url` and size say (debug builds log a
+ *   warning). Put the source's identity and version, and the resize, into the key.
+ * - `url` resolves like `loadAsset` (a registered name, a file path or `file://` URL, a bundle path), through
+ *   the host's asset provider — on every call, so its access scope holds for a cache hit too.
+ * - Size: `resizeWidth` and `resizeHeight` both given → exactly that; one given → the other follows the
+ *   image's aspect ratio; neither → the image's own size.
+ * - The texture is `rgba8unorm` with **premultiplied** alpha (blend with `one, one-minus-src-alpha`), usage
+ *   `TEXTURE_BINDING | COPY_SRC`, and **read-only**: writes, render attachments, write-access storage
+ *   bindings and format-changing views are validation errors.
+ * - `texture.destroy()`, `device.destroy()` and GC release only this page's reference — the texture lives
+ *   on for the other pages and goes when the last one lets go.
+ * - A runtime without shared textures rejects with its `unsupported` error (the default Metal runtime has them).
+ *
+ * @param {GPUDevice} device
+ * @param {{key: string, url: string, resizeWidth?: number, resizeHeight?: number, label?: string}} descriptor
+ * @returns {Promise<GPUTexture>}
+ */
+export declare function importSharedTexture(device: GPUDevice, descriptor: {
+    key: string;
+    url: string;
+    resizeWidth?: number;
+    resizeHeight?: number;
+    label?: string;
+}): Promise<GPUTexture>;
+export { GPUImageBitmap, GPUBuffer, GPUTexture, GPUTextureView, GPUSampler, GPUDevice, GPUCanvasContext, GPURenderBundle, GPURenderBundleEncoder, GPUQuerySet, GPUError, GPUValidationError, GPUOutOfMemoryError, GPUInternalError, OperationError, };
 export default gpu;

@@ -21,7 +21,7 @@ GPU 코드는 "돌려 보고 눈으로 확인"에 기대기 쉽다. 이 저장�
 ## 2. 실행
 
 ```zsh
-swift test                                      # 전체 (486개, 약 25초 — 셰이더 테스트가 Metal 컴파일러를 부른다)
+swift test                                      # 전체 (541개, 약 25초 — 셰이더 테스트가 Metal 컴파일러를 부른다)
 swift test --filter LynxWebGPUCoreTests         # 디스크립터/핸들
 swift test --filter LynxWebGPUShaderTests       # 트랜스파일러 (+ Metal 컴파일 검증)
 swift test --filter LynxWebGPUTests             # GPU 렌더 + 해석기
@@ -32,7 +32,7 @@ JS 클라이언트(shim) 테스트 — 의존성 없이 node 내장 러너로 �
 `NativeModules.WebGPU`를 목으로 바꿔 커맨드 페이로드·왕복 횟수를 단언한다:
 
 ```zsh
-cd JS && npm test            # NODE_OPTIONS=--expose-gc node --test 'tests/*.test.mjs' — 파일 25개 · 케이스 150개
+cd JS && npm test            # NODE_OPTIONS=--expose-gc node --test 'tests/*.test.mjs' — 파일 27개 · 케이스 175개
 cd JS && npm run typecheck   # JSDoc 기준 타입 검사
 ```
 
@@ -329,7 +329,7 @@ try XCTSkipUnless(harness.supports(.indirectArguments), "this device does not su
 - 비동기 경로(`readBuffer`)는 `XCTestExpectation`으로 검증한다.
 - 테스트 더블은 손으로 만든다 (모킹 라이브러리 없음).
 
-## 6. 커버리지 대상 (Swift 486 + JS 150 — 테스트 **케이스** 수다)
+## 6. 커버리지 대상 (Swift 541 + JS 175 — 테스트 **케이스** 수다)
 
 | 영역 | 파일 | 주요 케이스 |
 |---|---|---|
@@ -337,11 +337,12 @@ try XCTSkipUnless(harness.supports(.indirectArguments), "this device does not su
 | 호스트 페이로드 | `WGPUPayloadTests` + `HostPayloadTests` | 실체화한 페이로드가 **원본을 비워도** 같은 값을 읽는지, **중첩 컨테이너까지** 옮겨졌는지(실체화를 건너뛰면 원본을 그대로 본다는 대조군), 구조·잎 타입 보존, **`Data`는 참조로만 옮김**(프레임마다 딥카피 금지), 빈 컨테이너 통과, **ObjC 트리로 들어온 페이로드가 프레임을 그려 내는지** |
 | 디스크립터 | `WGPUDescriptorTests` | 크기 유추, 범위 검증, 명세 기본값, auto/명시 레이아웃, 블렌드 기본값 |
 | 핸들 레지스트리 | `WGPUObjectRegistryTests` | 등록/조회/해제, 타입 불일치 진단, **증식 경고 임계(4096 → 두 배씩)**, **살아 있는 핸들 덮어쓰기 감지**(해제 뒤 재사용은 겹침이 아니다) |
-| 커맨드 디코딩 | `WGPUCommandDecodeTests` | **51개 op 전수 디코딩과 op 이름 왕복**, 알 수 없는 op은 경로 달린 `unsupported`, 깨진 filter의 `pushErrorScope`도 케이스는 만들어짐, 번들의 커맨드 리더 보존, **정수 EnforceRange**(동적 오프셋·그 밖의 op 전반), `dispatchWorkgroups`의 0 유지·생략 시 1·음수 거부, `unmapBuffer`의 write-back 필드(offset+data · data 없음 · 깨진 data 거부) |
+| 커맨드 디코딩 | `WGPUCommandDecodeTests` | **51개 op 전수 디코딩과 op 이름 왕복**, 알 수 없는 op은 경로 달린 `unsupported`, 깨진 filter의 `pushErrorScope`도 케이스는 만들어짐, 번들의 커맨드 리더 보존, **정수 EnforceRange**(동적 오프셋·그 밖의 op 전반), `dispatchWorkgroups`의 0 유지·생략 시 1·음수 거부, `unmapBuffer`의 write-back 필드(offset+data · data 없음 · 깨진 data 거부), `copyExternalImageToTexture` destination의 `premultipliedAlpha`·`colorSpace`(기본값 · 디코드 · 모르는 색 공간 거부) |
 | 오류 스코프 스택 · 배치 응답 | `WGPUErrorScopeStackTests` | 빈 스택 pop은 unmatched, 필터 매칭/비매칭, 안쪽 우선, 잡은 첫 오류 하나만, placeholder는 깊이만, 네 오류 종류 → 세 필터, discardAll, pop 응답 모양, **깨끗한 배치의 필수 키 셋**, 잡힌 오류는 `errorScopes`로만, pop 순서 유지, `canvases`의 크기, 지연 오류 큐 drain과 스레드 안전 |
 | 프레임 회계 | `WGPUFrameCoordinatorTests` | in-flight 한도 도달 시 차단·완료로 해제, 커밋보다 많은 완료에도 음수 금지, 미추적 캔버스는 항상 ready, 포화 캔버스 하나가 전체를 막음, 잊힌 캔버스 해제, 한도 변경(0 이하는 1로), 동시 통지의 일관성, `present:false`는 프레임 중간 제출, 빈 present 배치가 틱을 닫음 |
 | 프레임 틱 게이트 | `WGPUFrameTickGateTests` | 두 번째 틱은 ack를 기다림, 매 틱 ack면 건너뜀 없음, 잃어버린 ack는 타임아웃으로 만료(루프를 죽이지 않음), 늦은 ack는 한 번만 염, reset, 대기 없는 ack는 무동작 |
 | 픽셀 되읽기 해석 | `WGPUPixelReadbackTests` | half→float(서브노멀·Inf·NaN), **1.0 초과·음수 보존**, BGRA 순서, 없는 채널 기본값, 행 패딩, 팩된/정수 포맷 거부 |
+| 공유 텍스처 요청 | `SharedTextureRequestTests` | `{key, url, resizeWidth?, resizeHeight?, label?}` 파싱, 빈 키·url과 1 미만 리사이즈 거부(경로 포함), **리사이즈 규칙**(둘 다 그대로 · 하나는 비율로 올림(HTML과 같다) · 나누어떨어지면 그대로 · 0이 되지 않음 · 없으면 원본), 같은 픽셀 판정(키·라벨 무관), 브리지 진입점의 **콜백 1회**, 공유 텍스처가 없는 런타임은 `unsupported` |
 | JS↔Swift 상수 | `JSConstantParityTests` | `JS/webgpu.js`의 사용 플래그·스테이지·컬러마스크가 Swift OptionSet과 같은 값인지 |
 | in-flight 프레임 | `SurfaceInFlightTests` | 카운터 계약(3에서 포화·완료로 해제), 컨텍스트 집계, 해석기 커밋/완료 통지(표면당 1회), CAMetalLayer 헤드리스 왕복 |
 | 프레임 경계 | `JS/tests/frame-boundary.test.mjs` | present는 **틱의 끝**에 한 번(명세 "updating the rendering") · 마무리 배치는 명령이 없어도 나감 · 작업 없는 틱은 브리지 미통과 · 루프 밖 submit은 그 자리에서 present · 콜백이 던져도 present는 나가고 오류는 안 삼킴 · **티커 참조 계수**(남의 stop에 안 끌려감) · `getCurrentTexture`는 만료 전까지 **같은 텍스처**(present·configure·리사이즈에서 만료, 설정 전엔 `InvalidStateError`) |
@@ -354,7 +355,9 @@ try XCTSkipUnless(harness.supports(.indirectArguments), "this device does not su
 | 오프스크린 되읽기 | `OffscreenReadbackTests` | 포맷별 행 간격·길이(1~16B/픽셀), **depth/stencil 거부**, configure 전 거부 |
 | 커맨드 해석기 | `CommandInterpreterTests` | 알 수 없는 명령, 없는 핸들, 오류 누적, 패스 상태, 캔버스 진단, 셰이더 실패 시 MSL 첨부, 드로어블 핸들 수명, **프레임 경계가 배치가 아니라 present인지**, 복사/읽기, 범위 검증, reset, 어댑터 정보, **큐 쓰기의 큐 타임라인 순서(앞선 제출 뒤·같은 배치 인코더 작업 앞·열린 패스 안에서도 수락)**, **배열 레이어 업로드**, **버퍼 매핑 상태(매핑 중 큐 작업 거부·중복 매핑 거부·unmap 후 복귀)**, **`MAP_WRITE` 쓰기 매핑의 write-back**(unmap → copy → 읽기 왕복·부분 매핑·매핑 밖/읽기 매핑의 `data` 거부), **`MAP_READ`/`MAP_WRITE` usage 조합**, **파이프라인 없는 간접 드로우/디스패치의 op별 메시지**, **`present: false` 내부 제출은 커맨드 버퍼가 있어도 드로어블·프레임 핸들을 유지**, **진입점 해석(생략 시 그 스테이지의 유일한 것·후보 둘 이상이면 거부·스테이지 불일치 거부)**, **limits 명세 적합성(전 항목 존재·명세 기본값 이상·정렬은 256 이하)**, **빈 배치의 present**(틱의 마무리 — 드로어블이 없으면 무동작), **한 프레임의 여러 제출이 드로어블 뷰를 공유**, **`clearBuffer`(구간·size 생략·COPY_DST/4의 배수/범위 검증)**, **`copyBufferToBuffer`(size 생략 = 남은 전부·범위/음수 거부·0바이트 no-op)**, **디버그 마커**(패스 안팎 스코프·짝 없는 pop·열린 채 끝난 그룹을 프로세스를 죽이지 않고 오류로), **셰이더 진단**(파싱 실패해도 모듈은 생성·줄 번호가 숫자로·깨진 모듈로 만든 파이프라인이 원인을 다시 알리는지·MSL 모듈은 비어 있고 유효), **마커만 있는 배치**, **명세 `GPUAdapterInfo`**(모르는 자리는 빈 문자열) |
 | 블록 압축 포맷 | `WGPUCompressedFormatTests` (GPU 불필요) + `CompressedTextureTests` | 블록 크기를 이름에서 읽는지(ASTC 전수), 블록당 바이트 8/16, **올림으로 세는 행 계산**, 손으로 인코딩한 BC1·ASTC 블록을 올려 **픽셀 단언**, 렌더 타깃/블록 경계 거부, `adapter.features`가 실제 기기 능력과 일치 |
-| 외부 이미지 | `ExternalImageTests` | PNG 디코딩(채널 순서·상하 방향·flipY·premultiply·resize), 깨진 데이터 거부, `copyExternalImageToTexture`(전체·부분·copySize 생략), **복사 시점 `flipY`**(디코딩 시점과 다른 층 — 둘 다 켜면 제자리, 부분 복사에서는 영역 안에서만), 4바이트 아닌 포맷과 압축 텍스처 거부, `destroy` 후 참조 |
+| 외부 이미지 | `ExternalImageTests` | PNG 디코딩(채널 순서·상하 방향·flipY·premultiply·resize), 깨진 데이터 거부, `copyExternalImageToTexture`(전체·부분·copySize 생략), **복사 시점 `flipY`**(디코딩 시점과 다른 층 — 둘 다 켜면 제자리, 부분 복사에서는 영역 안에서만), 4바이트 아닌 포맷과 압축 텍스처 거부, `destroy` 후 참조, **알파 상태 변환**(비트맵 premul/straight × destination `premultipliedAlpha` 네 조합의 텍셀 값), `colorSpace: 'display-p3'` 거부 |
+| 공유 텍스처 캐시 | `SharedTextureCacheTests` | 재요청은 같은 `MTLTexture`·make 1회, **동시 요청 합치기**(두 번째가 첫 make를 기다림), 실패는 모든 대기자에게 같은 오류·항목 없음·다음 요청이 재시도, **마지막 소유자와 함께 사라지는 항목**, 키 충돌 경고(라벨만 다르면 경고 없음 · 첫 내용 유지), 장치가 다르면 별개(장치가 둘 이상일 때만) |
+| 공유 텍스처 | `SharedTextureTests` | 컨텍스트 둘(= 뷰 둘)이 **디코드 1번·텍스처 1개**를 나눠 쓰고 둘 다 그린다, **한쪽 reset 뒤에도 다른 쪽이 샘플링**, 모두 놓으면 항목이 사라짐, 남은 뷰가 항목을 지킴, **쓰기 6가지 거부**(writeTexture · 복사 대상 둘 · 색 어태치먼트 · write-only 스토리지 · 포맷 바꾸는 뷰)와 read-only 스토리지 허용 · 거부 뒤에도 픽셀 그대로, 리사이즈(정확한 크기 · 비율 · 축소 후 방향), **premultiplied 텍셀**, 없는 애셋·깨진 바이트·장치 한계 초과, 캐시 히트에도 provider 범위 적용 |
 | 애셋 제공자 | `AssetProviderTests` | 이름 등록·해제·파일보다 우선, 절대 경로·file URL, 없는 파일은 backend 오류, 허용 디렉토리 안/밖·상위로 오르는 경로·접두사만 같은 형제 디렉토리 차단, 번들 이름·하위 디렉토리, 번들 이름의 상위 경로·빈 이름 거부, 기본 제공자의 https 거부와 교체 제공자의 허용/차단, 오류 종류가 JS 페이로드까지 유지, 이름 없는 요청은 제공자 전에 거부 |
 | 스테이징 풀 | `StagingPoolTests` | 크기 클래스 반올림, 같은 인스턴스 재사용, 최적합 선택, 총량 상한, 프레임 반복 시 풀 크기 불변 |
 | 하네스 자신 | `RenderHarnessTests` | **동치성 단언이 다름을 실제로 잡는지**(§4-2), 동기 리드백의 실패 보고 |

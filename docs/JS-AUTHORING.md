@@ -64,7 +64,7 @@ context.configure({ device, format })
 
 ```js
 const stop = startFrameLoop(({ timestamp, delta }) => {
-  // delta: 직전 프레임과의 간격(ms)
+  // delta: 이 핸들러가 직전에 불린 뒤로 지난 시간(ms). 첫 호출은 0
   render(delta)
 }, { fps: 60 })
 
@@ -74,6 +74,19 @@ stop()
 
 `stop()`을 부르지 않으면 디스플레이 링크가 계속 돌며 배터리를 먹는다.
 ReactLynx라면 `useEffect`의 정리 함수에서 부를 것.
+
+한 뷰에서 여러 번 불러도 된다. **구독자마다 자기 `fps`를 지킨다**:
+
+- 디스플레이 링크는 뷰에 하나라, 구독자 `fps`의 **최댓값**으로 돈다. 최댓값이 바뀔 때만 다시 건다.
+  30fps 배경 옆에서 60fps 버스트가 돌면 링크는 60이고, 버스트가 `stop()`하면 30으로 돌아간다.
+- 링크보다 느린 구독자는 자기 간격(`1000 / fps` ms)이 지난 틱에만 불린다. 틱 시각은 간격의 정확한
+  배수가 아니어서 1ms 일찍 온 틱도 친다 (브라우저 프리뷰와 같다). 60fps 링크 위의 45fps는 30fps가 된다.
+- `delta`는 **그 구독자가** 직전에 불린 틱부터 잰다. fps로 거른 틱, GPU·JS가 밀려 네이티브가
+  보내지 않은 틱의 시간도 들어간다. 그래서 `delta`를 더해 만든 시간이 실제 시간과 어긋나지 않는다.
+- 한 틱에 구독자가 몇이든 present와 네이티브 ack(`frameHandled`)는 **한 번**이다.
+- 한 핸들러가 던져도 나머지는 불리고, 첫 오류는 틱을 마무리한 뒤 다시 던져진다.
+- 핸들러 안에서 자기나 다른 구독을 `stop()`하면 그 틱에서 아직 안 불린 쪽은 불리지 않는다.
+  핸들러 안에서 새로 구독하면 다음 틱부터 불린다 (rAF와 같다).
 
 ## 5. 성능 — 프레임당 브리지 왕복 1회
 
@@ -189,6 +202,21 @@ device.queue.writeBuffer(uniformBuffer, 0, data)
 엔진이 `FinalizationRegistry`를 지원하면 GC로 사라진 래퍼의 destroy를 자동으로 끼워 넣는
 안전망이 켜진다. 단 PrimJS 지원 여부에 기대지 말 것 — **명시적 destroy가 정답**이고,
 자동 해제는 놓친 것을 주워 담는 보조 장치다.
+
+### 큰 이미지 — 페이지 사이에서 나눠 쓰기
+
+배경처럼 큰 이미지를 여러 페이지가 함께 그리면 `createImageBitmap` 경로는 페이지마다 따로 올린다.
+`importSharedTexture(device, {key, url, resizeWidth?, resizeHeight?})`는 네이티브가 키마다 한 번
+디코드·업로드하고 페이지끼리 나눠 쓴다 (`docs/WEBGPU-API.md` §3). 쓸 때 지킬 것은 셋이다:
+
+- **키에 픽셀을 바꾸는 것을 전부 넣는다** — 원본의 식별자·버전, 리사이즈. 같은 키는 처음 만든
+  텍스처를 돌려준다.
+- **읽기 전용이다.** 이 텍스처에 그리거나 복사해 넣고 싶으면 일반 텍스처를 따로 만들어
+  `copyTextureToTexture`로 옮긴다(`COPY_SRC`가 있다).
+- **알파는 premultiplied다.** 블렌드는 `one`, `one-minus-src-alpha`로 건다.
+
+해제는 다른 텍스처와 같다. `destroy()`나 `device.destroy()`는 이 페이지의 참조만 놓으므로,
+다른 페이지가 쓰는 중이어도 안심하고 부르면 된다.
 
 ### 렌더 번들이 참조하는 리소스
 

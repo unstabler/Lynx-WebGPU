@@ -20,10 +20,15 @@ export function installNativeMock(overrides = {}) {
     // Native puts a `Data` on and Lynx converts it to an ArrayBuffer — the mock gives an ArrayBuffer too.
     readBufferResult: overrides.readBufferResult ?? { ok: true, data: new ArrayBuffer(0) },
     loadAssetResult: overrides.loadAssetResult ?? { ok: true, data: new ArrayBuffer(0) },
+    /** The params of every `startFrameLoop` — a call while running is native swapping the link's rate. */
+    startFrameLoopCalls: [],
     stopFrameLoopCalls: 0,
     frameHandledCalls: 0,
     decodeImageCalls: [],
     decodeImageResult: overrides.decodeImageResult ?? { ok: true, width: 4, height: 4 },
+    importSharedTextureCalls: [],
+    importSharedTextureResult:
+      overrides.importSharedTextureResult ?? { ok: true, width: 4, height: 4, format: 'rgba8unorm' },
   };
 
   const resolve = (value, argument) => (typeof value === 'function' ? value(argument) : value);
@@ -53,7 +58,12 @@ export function installNativeMock(overrides = {}) {
         state.decodeImageCalls.push(params);
         callback(resolve(state.decodeImageResult, params));
       },
-      startFrameLoop() {
+      importSharedTexture(params, callback) {
+        state.importSharedTextureCalls.push(params);
+        callback(resolve(state.importSharedTextureResult, params));
+      },
+      startFrameLoop(params) {
+        state.startFrameLoopCalls.push(params);
         return { ok: true };
       },
       stopFrameLoop() {

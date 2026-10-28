@@ -51,6 +51,17 @@ public enum WGPUImageDecoder {
         guard width > 0, height > 0 else {
             throw WGPUError.validation("image size is zero (\(width)x\(height))")
         }
+        // Before any allocation: `width * 4 * height` overflows `Int` for a 2^31 resize (a trap), and
+        // `Data(count:)` of a huge-but-representable size fails fatally rather than throwing. A
+        // texture that large could not be created anyway.
+        if let limit = options.maxDimension {
+            guard width <= limit, height <= limit else {
+                throw WGPUError.validation(
+                    "the image is larger than the device can hold in a texture "
+                    + "(\(width)x\(height), limit \(limit)x\(limit))"
+                )
+            }
+        }
         return try draw(image, width: width, height: height, options: options)
     }
 
@@ -88,27 +99,44 @@ public enum WGPUImageDecoder {
         guard drawn else {
             throw WGPUError.outOfMemory("could not create the image bitmap context (\(width)x\(height))")
         }
-        if !options.premultiplyAlpha { unpremultiply(&pixels) }
+        if !options.premultiplyAlpha {
+            pixels.withUnsafeMutableBytes { WGPUAlphaConversion.unpremultiply.apply(to: $0) }
+        }
         return WGPUImageBitmapObject(
             width: width, height: height, pixels: pixels,
             bytesPerRow: bytesPerRow, premultiplied: options.premultiplyAlpha
         )
     }
 
-    /// Undoes premultiplied alpha (`premultiplyAlpha: 'none'`).
-    ///
-    /// The lower the alpha the less information survives, so it is **not fully recoverable** — the
-    /// browser is no different. When exact values matter, upload the unpremultiplied original with
-    /// `writeTexture` in the first place.
-    private static func unpremultiply(_ pixels: inout Data) {
-        pixels.withUnsafeMutableBytes { raw in
-            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
-            for offset in stride(from: 0, to: raw.count, by: 4) {
-                let alpha = Int(base[offset + 3])
-                guard alpha > 0, alpha < 255 else { continue }
-                for channel in 0..<3 {
-                    let value = (Int(base[offset + channel]) * 255 + alpha / 2) / alpha
-                    base[offset + channel] = UInt8(min(255, value))
+}
+
+/// Converts RGBA8 pixels between premultiplied and straight alpha, in place.
+///
+/// Shared by the decoder (`premultiplyAlpha: 'none'` undoes the premultiplied draw) and by
+/// `copyExternalImageToTexture` (the destination's `premultipliedAlpha` differs from the bitmap's).
+enum WGPUAlphaConversion {
+    /// Straight → premultiplied: each color channel times alpha, rounded.
+    case premultiply
+    /// Premultiplied → straight. The lower the alpha the less information survives, so it is **not
+    /// fully recoverable** — when exact values matter, keep the data premultiplied end to end, or
+    /// upload the straight original with `writeTexture` in the first place.
+    case unpremultiply
+
+    /// - Parameter pixels: RGBA8 (or BGRA8 — only the alpha position matters), 4 bytes per pixel.
+    func apply(to pixels: UnsafeMutableRawBufferPointer) {
+        guard let base = pixels.bindMemory(to: UInt8.self).baseAddress else { return }
+        for offset in stride(from: 0, to: pixels.count, by: 4) {
+            let alpha = Int(base[offset + 3])
+            guard alpha < 255 else { continue }
+            for channel in 0..<3 {
+                let value = Int(base[offset + channel])
+                switch self {
+                case .premultiply:
+                    base[offset + channel] = UInt8((value * alpha + 127) / 255)
+                case .unpremultiply:
+                    // Fully transparent has no color to recover — it stays as it is.
+                    guard alpha > 0 else { continue }
+                    base[offset + channel] = UInt8(min(255, (value * 255 + alpha / 2) / alpha))
                 }
             }
         }

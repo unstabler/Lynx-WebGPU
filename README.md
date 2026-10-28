@@ -35,7 +35,7 @@ startFrameLoop(() => {
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/xenonClient/Lynx-WebGPU", from: "0.5.4")
+.package(url: "https://github.com/xenonClient/Lynx-WebGPU", from: "0.6.0")
 ```
 
 이것으로 **엔진**(`LynxWebGPU`)이 들어온다. 아래 `LynxWebGPUHost`처럼 Lynx와 맞물리는 타입은
@@ -115,6 +115,10 @@ JS 스레드(터치·타이머 포함)로 번지지 않는다.
 `submit()` 반환의 `objects`(live 객체 수)와 네이티브 경고 로그(4096개 초과)로 destroy 누락을
 잡고, 엔진이 `FinalizationRegistry`를 지원하면 GC 자동 해제 안전망이 켜진다.
 
+**큰 이미지는 페이지 사이에서 나눠 쓴다** — `importSharedTexture`는 키마다 이미지를 한 번 디코드·업로드하고,
+같은 장치의 모든 LynxView가 그 텍스처를 나눠 쓴다. 썸네일 API로 목표 크기에 맞춰 바로 디코드하므로 원본
+크기의 비트맵이 메모리에 생기지 않는다. 텍스처는 읽기 전용이라 한 페이지가 다른 페이지의 그림을 바꿀 수 없다.
+
 ## 실제 WebGPU 셰이더 호환성
 
 공식 [webgpu-samples](https://github.com/webgpu/webgpu-samples)의 WGSL 69개를 **손대지 않고** 통과시켜
@@ -135,7 +139,7 @@ JS 스레드(터치·타이머 포함)로 번지지 않는다.
 
 ## 검증
 
-Swift 486개 + JS 150개 테스트가 30초 안에 돈다 — 시뮬레이터도 기기도 필요 없다.
+Swift 541개 + JS 175개 테스트가 30초 안에 돈다 — 시뮬레이터도 기기도 필요 없다.
 
 - 트랜스파일러 테스트는 생성된 MSL을 **실제 Metal 컴파일러로** 통과시킨다.
 - 렌더 테스트는 오프스크린 텍스처에 그린 뒤 **픽셀 값을 단언**한다 (삼각형, 유니폼, 인덱스 드로우,

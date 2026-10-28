@@ -293,7 +293,7 @@ bitmap.close()   // 네이티브 픽셀을 놓아 준다
 | 옵션 | 뜻 |
 |---|---|
 | `flipY` | 위아래를 뒤집는다. 기본은 웹과 같은 좌상단 기준이다 |
-| `premultiplyAlpha` | `'premultiply'`면 색에 알파를 곱해 둔다. 기본(`'none'`)은 곱하지 않은 값 — 다만 디코딩 자체가 곱해진 값을 거치므로 **반투명 영역은 완전히 복원되지 않는다** |
+| `premultiplyAlpha` | 기본(`'default'`·생략)은 `'premultiply'`와 같다 — 색에 알파를 곱해 둔다. **Chromium과 같은 해석이다** (HTML 명세는 `'default'`를 구현에 맡긴다). `'none'`만 곱하지 않은 값이고, 디코딩 자체가 곱해진 값을 거치므로 **반투명 영역은 완전히 복원되지 않는다** |
 | `resizeWidth` / `resizeHeight` | 둘 다 주면 그 크기로 그린다 |
 
 소스는 `ArrayBuffer`/`TypedArray`(이미지 파일 바이트) 또는 **애셋 이름 문자열**이다.
@@ -305,7 +305,15 @@ bitmap.close()   // 네이티브 픽셀을 놓아 준다
   올릴 수 있고, `flipY`는 **복사 시점**에 위아래를 뒤집는다.
   `createImageBitmap`의 `flipY`(디코딩 시점)와는 다른 층이라 둘 다 켜면 제자리로 돌아온다.
   **웹 라이브러리는 이쪽을 쓴다** — three.js의 `Texture.flipY`가 기본 `true`다.
-- `destination`: `{ texture, mipLevel?, origin? }`.
+- `destination`: `{ texture, mipLevel?, origin?, premultipliedAlpha?, colorSpace? }`.
+  - `premultipliedAlpha`(기본 `false`)는 **텍스처에 써질** 알파 상태다. 비트맵은 자기 상태
+    (`createImageBitmap`의 `premultiplyAlpha`)를 기억하고, 둘이 다르면 복사하면서 곱하거나 나눈다.
+    그래서 기본끼리(premultiplied 비트맵 → straight 대상)는 브라우저처럼 **나눠서** 들어간다.
+  - 반투명 그림의 가장자리를 잃지 않으려면 **끝까지 premultiplied로** 둔다 — 기본 비트맵을
+    `premultipliedAlpha: true`로 복사하면 변환 없는 복사이고, 블렌드는 `one, one-minus-src-alpha`다.
+    나누는 쪽은 알파가 낮을수록 색 정보가 사라진다.
+  - `colorSpace`(기본 `'srgb'`)는 `'srgb'`만 받는다. `'display-p3'`는 **명세상 유효하지만**
+    디코더가 색 변환을 하지 않아 `GPUValidationError`(kind `unsupported`)로 거부되고 복사되지 않는다.
 - 대상은 **4바이트 컬러 포맷**이어야 한다 (`rgba8unorm` `bgra8unorm` `rgba8unorm-srgb` …).
   디코딩 결과가 RGBA8이므로, 그 밖은 조용히 어긋나느니 검증 오류로 거부한다.
   압축 텍스처도 같은 이유로 안 된다 — GPU에는 블록 인코더가 없다.
@@ -324,6 +332,43 @@ bitmap.close()   // 네이티브 픽셀을 놓아 준다
 
 `createSampler` 옵션: `addressModeU/V/W` `magFilter` `minFilter` `mipmapFilter` `lodMinClamp`
 `lodMaxClamp` `compare` `maxAnisotropy`.
+
+### 공유 텍스처 (`importSharedTexture`) — 이 구현의 확장
+
+큰 이미지를 여러 페이지(LynxView)가 함께 쓸 때 GPU 메모리에 한 번만 올리는 경로다. 브라우저
+WebGPU에는 없는 함수다. LynxView마다 컨텍스트와 JS 런타임이 따로라서, `createImageBitmap` +
+`copyExternalImageToTexture`로 올리면 페이지 수만큼 올라간다. 올리는 동안에도 디코드된 비트맵,
+잘라낸 사본, 스테이징 버퍼가 겹친다. 이 함수는 네이티브가 이미지를 **키마다 한 번** 디코드해서
+올리고, 같은 Metal 장치의 모든 페이지가 그 텍스처를 나눠 쓴다.
+
+```js
+import { importSharedTexture } from './webgpu.js'
+
+const clouds = await importSharedTexture(device, {
+  key: 'clouds-v3@1024w',             // 같은 키 = 같은 픽셀 (아래 계약)
+  url: 'file:///…/clouds.png',        // loadAsset과 같은 규칙으로 해석된다
+  resizeWidth: 1024,                  // 높이는 원본 비율로
+})
+const view = clouds.createView()      // 여느 텍스처처럼 샘플링한다
+```
+
+**키는 호출자가 픽셀을 보증하는 약속이다.** 같은 키는 언제나 같은 이미지, 같은 크기여야 한다.
+이미 쓰이는 키로 다시 부르면 `url`과 크기가 무엇이든 **처음 만든 텍스처**가 돌아온다(디버그 빌드는
+경고 로그를 남긴다). 그래서 픽셀을 바꾸는 것은 전부 키에 넣는다 — 원본의 식별자와 버전, 리사이즈.
+키 공간은 같은 장치를 쓰는 프로세스 전체에서 하나다. `url` 접근 검사는 요청한 `url`에만 걸리므로,
+다른 페이지가 만든 키를 아는 번들은 그 텍스처를 받는다 — 신뢰 범위가 다른 번들을 한 프로세스에서
+돌린다면 이 점을 감안한다.
+
+| 항목 | 동작 |
+|---|---|
+| `url` | `loadAsset`과 같은 규칙(등록한 이름 · 파일 경로·`file://` · 번들 경로)으로 호스트의 `assetProvider`가 해석한다. **캐시 히트여도 매번 거친다** — 그 페이지의 접근 범위를 지키려는 것이다 |
+| 크기 | `resizeWidth`·`resizeHeight` 둘 다 → 그 크기 그대로(비율은 호출자 몫). 하나만 → 나머지를 원본 비율로(올림 — HTML `createImageBitmap`과 같은 규칙). 없음 → 원본 크기. `maxTextureDimension2D`를 넘으면 검증 오류 |
+| 디코드 | ImageIO 썸네일 API로 목표 크기에 맞춰 **바로** 디코드한다. 원본 크기의 비트맵을 거치지 않으므로 메모리 피크가 목표 크기 쪽에 붙는다. EXIF 방향은 적용하지 않는다(`createImageBitmap`과 같다) |
+| 형식 | `rgba8unorm`, 알파는 **premultiplied**(블렌드는 `one`, `one-minus-src-alpha`). 색은 `createImageBitmap`처럼 변환 없이 device RGB로 그린다 |
+| usage | `TEXTURE_BINDING \| COPY_SRC`. **읽기 전용**이다 — `writeTexture`, 복사의 대상, 렌더 패스 어태치먼트, write·read-write 스토리지 바인딩, 포맷을 바꾸는 뷰는 검증 오류다. 다른 페이지의 그림이 바뀌기 때문이다 |
+| 수명 | `texture.destroy()`, `device.destroy()`, GC는 **이 페이지의 참조만** 놓는다. 다른 페이지는 계속 샘플링하고, 마지막 참조가 사라지면 네이티브 캐시도 놓는다 |
+| 장치 | 텍스처는 장치마다 따로다. 페이지끼리 나눠 쓰려면 호스트가 모든 `LynxWebGPUContext`에 **같은 `MTLDevice`**를 넣는다 (`docs/LYNX-INTEGRATION.md` §3) |
+| 다른 런타임 | Dawn처럼 공유 텍스처가 없는 런타임은 `unsupported` 오류로 reject한다 — 그때는 `createImageBitmap` 경로로 올린다 |
 
 ### 셰이더 모듈
 
@@ -771,11 +816,16 @@ if (error) fallBackToSimplePipeline()
 | `GPUExternalTexture` (`importExternalTexture`) | Lynx에 **비디오** 엘리먼트 핸들이 없다. 다만 WGSL `texture_external` + `textureSampleBaseClampToEdge`는 **지원**하므로, 프레임을 텍스처로 올려 그 자리에 `GPUTextureView`를 묶으면 된다. 정지 이미지는 `createImageBitmap()`이 그 길이다 (§3) |
 | `writeTimestamp` | Metal은 패스 경계에서만 카운터를 샘플링한다 — `timestampWrites`(§6)를 쓸 것 |
 | `device.lost`의 **유실 통지** | iOS/macOS에는 디바이스 손실에 해당하는 사건이 사실상 없다. **속성 자체는 있다** — 웹 코드(`Three.js WebGPUBackend.init()` 등)가 `device.lost.then(...)`을 걸어도 TypeError가 나지 않도록 영원히 pending인 Promise를 준다. **GPU 실행 자체의 실패**(`.outOfMemory`·`.timeout` 등)는 다음 `submit()` 응답에 `backend` 오류로 실려 나온다 |
-| `setBindGroup`의 `Uint32Array` 오버로드 | 동적 오프셋을 `(data, start, length)`로 넘기는 형태. 배열 형태(`setBindGroup(i, group, [o1, o2])`)와 결과가 같고, 브리지를 건널 때 어차피 배열로 펴진다 — 두 경로를 두면 검증만 두 배가 된다 |
+| `queue.onSubmittedWorkDone()`의 **시점** | 명세는 GPU가 제출된 작업을 끝냈을 때 resolve한다. 커맨드 스트림에는 완료 통지 통로가 없어 **네이티브에 넘긴 직후** resolve한다 — 이 Promise로 리드백·프레임을 페이싱하는 코드는 브라우저보다 일찍 돈다. GPU를 실제로 기다리는 호출은 `mapAsync()`다 |
+| `device.destroy()`의 **범위** | 네이티브 레지스트리는 런타임당 하나라(핸들을 모듈 전체에서 발급) 디바이스별로 지울 수 없다. **마지막 디바이스가 destroy될 때** 전부 지우고, 그 전까지는 destroy된 디바이스의 객체가 네이티브에 남는다. `device.lost`는 명세대로 `reason: 'destroyed'`로 settle된다 |
+| `copyExternalImageToTexture`의 `premultipliedAlpha` · `colorSpace`, 대상 포맷 | 대상은 `rgba8unorm(-srgb)`·`bgra8unorm(-srgb)`만 받는다 (BGRA는 채널을 바꿔 올린다). 명세의 다른 포맷으로의 색 변환과 프리멀티플라이·색공간 변환은 하지 않는다 — 다른 포맷은 `unsupported` 오류, 두 옵션은 무시된다. 프리멀티플라이는 `createImageBitmap({premultiplyAlpha})`에서 정한다 |
+| `colorAttachments`의 `null` 슬롯 · `setBindGroup(i, null)` | 명세는 희소 어태치먼트(`[null, {...}]`)와 바인드 그룹 해제를 허용한다. 둘 다 받지 않는다 — shim에서 TypeError, 스트림에서는 검증 오류 |
+| `requestDevice({requiredLimits})`의 **반영 방식** | 어댑터 한계를 넘는 요청은 명세대로 `OperationError`로 거부한다. 다만 `device.limits`는 명세의 "기본값에서 시작"이 아니라 **어댑터 값에서 시작해 요청한 항목만 덮어쓴다** — 이 shim에 맞춰 쓴 코드가 어댑터 값을 기대하기 때문이다 |
 | `GPURenderPassColorAttachment.depthSlice` | 3D 텍스처의 한 슬라이스를 렌더 타깃으로 삼는 값. 지금은 **읽지 않으므로 항상 0번 슬라이스**에 그린다. 3D 렌더 타깃을 쓰게 되면 그때 넣는다 (2D 배열은 `baseArrayLayer`로 이미 된다) |
 | `GPURenderPassDescriptor.maxDrawCount` | 드라이버에 주는 검증 힌트다. 무시해도 그림은 같고, 넘겼을 때의 거부는 명세상 선택이다 |
 | `GPUCanvasContext.canvas` | 명세는 `HTMLCanvasElement`를 돌려준다 — Lynx에는 대응하는 엘리먼트 객체가 없다. `context.canvasId`(문자열)가 그 자리다 |
 | `setImmediates` (immediate data) | 명세에 최근 들어온 기능이고 `maxImmediateSize` 한계도 따라온다. 유니폼 버퍼로 대체할 수 있어 미룬다 |
+| `copyExternalImageToTexture`의 `colorSpace: 'display-p3'` | 디코더(ImageIO)가 색 관리 없이 device RGB로 그려서 옮길 원본 색 공간이 없다. 조용히 sRGB로 쓰지 않고 `unsupported`(JS에서는 `GPUValidationError`)로 거부한다. 넣으려면 디코드 때 원본 색 공간을 기록하고 복사 때 `CGColorSpace` 변환을 거쳐야 한다 (§3) |
 
 ### 선택 기능 (`adapter.features`에 광고하지 않는다)
 
@@ -815,8 +865,9 @@ if (error) fallBackToSimplePipeline()
 (`threelab` 데모 씬 — 씬 패스 → bloom 밉 체인 → 출력 패스가 한 프레임에 돌고 60fps·오류 0).
 그전에는 첫 제출이 드로어블을 내보내고 뷰를 만료시켜 남은 패스가 통째로 거부됐다.
 
-> 프레임 티커는 **참조로 센다.** 한 씬이 잠깐 `startFrameLoop`을 열었다 닫아도 rAF 펌프까지
-> 같이 멈추지 않는다 — 그러면 화면이 조용히 정지한다.
+> 프레임 티커는 **구독자 목록으로 나눠 준다.** 한 씬이 잠깐 `startFrameLoop`을 열었다 닫아도 rAF 펌프까지
+> 같이 멈추지 않는다 — 그러면 화면이 조용히 정지한다. 구독자가 몇이든 present와 ack는 틱마다 한 번이다
+> (`docs/JS-AUTHORING.md` §4).
 
 ### 기기에 따라 갈리는 것
 

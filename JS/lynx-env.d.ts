@@ -110,6 +110,15 @@ interface WGPUDecodeImageResult {
   errors?: WGPUErrorPayload[];
 }
 
+/** The value the `importSharedTexture` callback receives — the texture stays native; only its shape comes across. */
+interface WGPUSharedTextureResult {
+  ok?: boolean;
+  width: number;
+  height: number;
+  format: string;
+  errors?: WGPUErrorPayload[];
+}
+
 /** `NativeModules.WebGPU` — the entrance to the command stream. */
 interface WebGPUNativeModule {
   /** `present: false` = an internal mid-frame submission — it defers the drawable present and handle expiry. */
@@ -136,6 +145,17 @@ interface WebGPUNativeModule {
       resizeHeight?: number;
     },
     callback: (result: WGPUDecodeImageResult | undefined) => void
+  ): void;
+  importSharedTexture(
+    params: {
+      id: number;
+      key: string;
+      url: string;
+      resizeWidth?: number;
+      resizeHeight?: number;
+      label?: string;
+    },
+    callback: (result: WGPUSharedTextureResult | undefined) => void
   ): void;
   startFrameLoop(params: { fps: number }): unknown;
   stopFrameLoop(): unknown;

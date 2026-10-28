@@ -263,6 +263,7 @@ JS 스레드와 메인 스레드가 공유하므로, 컴파일러 격리 대신 
 | `WGPUObjectRegistry` (핸들 → 객체) | `NSLock` | JS(생성/조회), 메인(해제) |
 | `LynxWebGPUContext.surfaces` | `NSLock` | JS(조회), 메인(등록/해제) |
 | 커맨드 실행 | `executionLock` — 한 번에 하나 | JS |
+| 표면 동사 (`attachCanvas` · `attachOffscreenCanvas` · `resizeCanvas` · `detachCanvas` · `readCanvasPixels`) | 같은 `executionLock` — `WGPUBackend`의 "모든 동사는 실행 락 아래" 계약. 메인이 JS 배치 하나를 기다릴 수 있다 (`processEvents`만 `try()`로 건너뛴다) | 메인(등록·레이아웃·해제), JS·테스트(픽셀 읽기) |
 | `WGPUMetalLayerSurface.cachedSize` | `NSLock` | 메인(쓰기), JS(읽기) |
 | `WGPUFrameCoordinator` (캔버스별 in-flight) | `NSLock` | JS(커밋), GPU 완료 핸들러(완료), 메인(조회) |
 | `WGPUShaderModuleObject.libraryCache` | `NSLock` | JS |
@@ -272,7 +273,10 @@ JS 스레드와 메인 스레드가 공유하므로, 컴파일러 격리 대신 
 ## 8. 의도적으로 하지 않은 것
 
 - **런타임 검증 전부** — WebGPU 명세의 사용 플래그·포맷 호환성 검사를 다 하지는 않는다.
-  핸들 존재/타입, 범위, 파이프라인 상태처럼 **크래시로 이어지는 것**은 막고, 나머지는 Metal 검증 레이어에 맡긴다.
+  **Metal 검증 레이어가 단언(abort)으로 답하는 것은 전부 엔진이 먼저 막는다** — 핸들, 복사
+  영역, 드로우 인자, 뷰포트·시저, 서브리소스 범위, 패스 구조, 파이프라인↔패스 호환성, limits.
+  검증 레이어가 오류로 보고하는 나머지(사용 플래그 조합 등)는 거기에 맡긴다.
 - **WGSL 타입 추론기** — 구문 번역기다. MSL이 C++ 기반이라 대부분의 연산자·생성자 의미가 그대로 옮겨진다.
   옮길 수 없는 것은 조용히 틀리게 만들지 않고 명시적으로 거부한다 (`docs/WGSL.md` §4).
-- **간접 드로우 / 쿼리 / 타임스탬프** — 필요해지면 커맨드 몇 개를 더하면 된다 (`.claude/skills/webgpu-command`).
+- **GPU 완료 통지** — 스트림에 완료 콜백 통로가 없다. `onSubmittedWorkDone()`은 넘긴 직후
+  resolve되고, 실제로 GPU를 기다리는 것은 `mapAsync()`뿐이다 (`docs/WEBGPU-API.md` §8).

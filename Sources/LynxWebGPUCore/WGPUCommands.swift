@@ -157,6 +157,8 @@ public struct WGPUWriteBufferCommand: WGPUCommandFields {
 public struct WGPUWriteTextureCommand: WGPUCommandFields {
     public let texture: WGPUHandle
     public let data: Data
+    /// `GPUTexelCopyBufferLayout.offset` — the byte in `data` the upload starts at.
+    public let offset: Int
     public let mipLevel: Int
     public let origin: WGPUOrigin3D
     public let size: WGPUExtent3D
@@ -167,6 +169,7 @@ public struct WGPUWriteTextureCommand: WGPUCommandFields {
     public init(from reader: WGPUValueReader) throws {
         texture = try reader.requiredHandle("texture")
         data = try reader.requiredData("data")
+        offset = try reader.int("offset", default: 0)
         mipLevel = try reader.int("mipLevel", default: 0)
         origin = try reader.origin("origin")
         size = try reader.requiredExtent("size")
@@ -194,16 +197,30 @@ public struct WGPUExternalImageSource: WGPUCommandFields {
 }
 
 /// `queue.copyExternalImageToTexture()`.
+///
+/// The spec's destination is `GPUCopyExternalImageDestInfo` — `GPUTexelCopyTextureInfo` plus two members.
+/// The texture end is decoded as the shared `WGPUTexelCopyTextureInfo` and the two extra members sit on
+/// the command, read from the same `destination` object.
 public struct WGPUCopyExternalImageCommand: WGPUCommandFields {
     public let source: WGPUExternalImageSource
     public let destination: WGPUTexelCopyTextureInfo
+    /// Spec `GPUCopyExternalImageDestInfo.premultipliedAlpha` (default false) — whether the texels
+    /// **written** carry premultiplied alpha. The bitmap carries its own state; the copy converts when
+    /// the two differ.
+    public let premultipliedAlpha: Bool
+    /// Spec `GPUCopyExternalImageDestInfo.colorSpace` (default `srgb`). Decoded over the whole spec enum;
+    /// the engine carries out only `srgb`.
+    public let colorSpace: WGPUPredefinedColorSpace
     /// Omitted means **the whole remainder of the image** — that needs the image size, so it stays nil.
     public let copySize: WGPUExtent3D?
     public let path: String
 
     public init(from reader: WGPUValueReader) throws {
         source = try WGPUExternalImageSource(from: try reader.requiredObject("source"))
-        destination = try WGPUTexelCopyTextureInfo(from: try reader.requiredObject("destination"))
+        let destinationReader = try reader.requiredObject("destination")
+        destination = try WGPUTexelCopyTextureInfo(from: destinationReader)
+        premultipliedAlpha = destinationReader.bool("premultipliedAlpha", default: false)
+        colorSpace = try destinationReader.enumValue("colorSpace", default: WGPUPredefinedColorSpace.srgb)
         copySize = try reader.extent("copySize")
         path = reader.path
     }
@@ -317,12 +334,15 @@ public struct WGPUSetVertexBufferCommand: WGPUCommandFields {
     public let slot: Int
     public let buffer: WGPUHandle
     public let offset: Int
+    /// The spec's fourth argument — the bytes bound from `offset`; nil means the rest of the buffer.
+    public let size: Int?
     public let path: String
 
     public init(from reader: WGPUValueReader) throws {
         slot = try reader.requiredInt("slot")
         buffer = try reader.requiredHandle("buffer")
         offset = try reader.int("offset", default: 0)
+        size = try reader.optionalInt("size")
         path = reader.path
     }
 }
@@ -332,6 +352,9 @@ public struct WGPUSetIndexBufferCommand: WGPUCommandFields {
     public let buffer: WGPUHandle
     public let format: WGPUIndexFormat
     public let offset: Int
+    /// The spec's fourth argument — the bytes bound from `offset`; nil means the rest of the buffer.
+    /// Bounds what `drawIndexed` may read.
+    public let size: Int?
     public let path: String
 
     /// Bytes per index — used to turn `firstIndex` into a byte offset.
@@ -341,6 +364,7 @@ public struct WGPUSetIndexBufferCommand: WGPUCommandFields {
         buffer = try reader.requiredHandle("buffer")
         format = try reader.requiredEnum("format", WGPUIndexFormat.self)
         offset = try reader.int("offset", default: 0)
+        size = try reader.optionalInt("size")
         path = reader.path
     }
 }

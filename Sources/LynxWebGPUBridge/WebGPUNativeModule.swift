@@ -25,6 +25,7 @@ public final class WebGPUNativeModule: NSObject, LynxModule {
             "readBuffer": NSStringFromSelector(#selector(readBuffer(_:callback:))),
             "loadAsset": NSStringFromSelector(#selector(loadAsset(_:callback:))),
             "decodeImage": NSStringFromSelector(#selector(decodeImage(_:callback:))),
+            "importSharedTexture": NSStringFromSelector(#selector(importSharedTexture(_:callback:))),
             "startFrameLoop": NSStringFromSelector(#selector(startFrameLoop(_:))),
             "stopFrameLoop": NSStringFromSelector(#selector(stopFrameLoop)),
             "frameHandled": NSStringFromSelector(#selector(frameHandled)),
@@ -150,6 +151,24 @@ public final class WebGPUNativeModule: NSObject, LynxModule {
             provider: host.assetProvider,
             completion: callback
         )
+    }
+
+    /// `importSharedTexture()` — a process-wide shared texture, registered read-only under the JS handle.
+    ///
+    /// The image is decoded and uploaded once per (device, key) and handed to every view on that device
+    /// that asks for the key (`WebGPURuntime.importSharedTexture`). The url resolves through the same
+    /// `assetProvider` as `loadAsset`, on every call. Parsing lives in Core (`WGPUSharedTextureImport`)
+    /// so macOS tests cover it.
+    ///
+    /// - Parameter params: `{"id": Int, "key": String, "url": String, "resizeWidth"?: Int,
+    ///   "resizeHeight"?: Int, "label"?: String}`
+    /// - Returns: through the callback, `{"ok": true, "width": Int, "height": Int, "format": String}`.
+    public func importSharedTexture(_ params: [String: Any], callback: @escaping LynxCallbackBlock) {
+        guard let host else {
+            callback(Self.unavailable)
+            return
+        }
+        WGPUSharedTextureImport.start(params, runtime: host.runtime, provider: host.assetProvider, callback: callback)
     }
 
     // MARK: - Frame loop

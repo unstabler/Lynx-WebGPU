@@ -24,12 +24,22 @@ public final class LynxWebGPUContext: WebGPURuntime {
 
     private let backend: WGPUMetalBackend
     private let engine: WGPUBackendEngine<WGPUMetalBackend>
+    /// Where `importSharedTexture` finds and parks shared textures — `WGPUSharedTextureCache.shared`
+    /// outside tests.
+    private let sharedTextures: WGPUSharedTextureCache
 
     /// In-flight frame accounting — **backend-independent policy**, so it lives in Core (see
     /// `WGPUFrameCoordinator`). Exposed so a host driving the frame ticker its own way can inspect it.
     public var frameCoordinator: WGPUFrameCoordinator { engine.frameCoordinator }
 
-    public init(device: MTLDevice? = nil, frameCoordinator: WGPUFrameCoordinator = WGPUFrameCoordinator()) throws {
+    /// - Parameter device: the Metal device. **Pass the same one to every context** that should share
+    ///   textures (`importSharedTexture`) — shared textures are per device. Omitted, the system default.
+    public convenience init(device: MTLDevice? = nil, frameCoordinator: WGPUFrameCoordinator = WGPUFrameCoordinator()) throws {
+        try self.init(device: device, frameCoordinator: frameCoordinator, sharedTextures: .shared)
+    }
+
+    /// Tests inject their own shared texture cache.
+    init(device: MTLDevice?, frameCoordinator: WGPUFrameCoordinator, sharedTextures: WGPUSharedTextureCache) throws {
         guard let resolved = device ?? MTLCreateSystemDefaultDevice() else {
             throw WGPUError.backend("cannot create a Metal device (check simulator/device support)")
         }
@@ -40,6 +50,7 @@ public final class LynxWebGPUContext: WebGPURuntime {
         self.queue = queue
         self.backend = WGPUMetalBackend(device: resolved, queue: queue)
         self.engine = WGPUBackendEngine(backend: backend, frameCoordinator: frameCoordinator)
+        self.sharedTextures = sharedTextures
         WGPULog.device.info("WebGPU context started — \(resolved.name, privacy: .public)")
     }
 
@@ -132,6 +143,57 @@ public final class LynxWebGPUContext: WebGPURuntime {
             handle: handle, data: data, name: name,
             options: options, provider: provider, completion: completion
         )
+    }
+
+    /// `importSharedTexture()` — the process-wide shared texture for `request.key` on this device,
+    /// registered read-only under `handle` (see `WebGPURuntime.importSharedTexture`).
+    ///
+    /// `request.name` goes through `provider` on every call, before the cache is consulted: the
+    /// provider's access scope is this context's, and a cache hit must not skip it. On a miss those same
+    /// bytes are decoded (`WGPUSharedTextureUpload`); a file read is memory-mapped, so a hit costs a map.
+    public func importSharedTexture(
+        handle: Int,
+        request: WGPUSharedTextureRequest,
+        provider: WGPUAssetProvider?,
+        completion: @escaping ([String: Any]) -> Void
+    ) {
+        let fail = { (error: WGPUError) in completion(["ok": false, "errors": [error.payload]]) }
+        guard let provider else {
+            return fail(WGPUError.validation("no asset provider — importSharedTexture resolves its url through one"))
+        }
+        let device = self.device
+        let cache = sharedTextures
+        provider.loadAsset(named: request.name) { [weak self] loaded in
+            let data: Data
+            switch loaded {
+            case .success(let bytes): data = bytes
+            case .failure(let error): return fail(error)
+            }
+            cache.acquire(request, device: device, make: {
+                try WGPUSharedTextureUpload.makeTexture(from: data, request: request, device: device)
+            }) { outcome in
+                switch outcome {
+                case .failure(let error):
+                    fail(error)
+                case .success(let shared):
+                    // The callback fires exactly once even if the context went first — an unsettled
+                    // promise would stop the page without an error.
+                    guard let self else {
+                        return fail(WGPUError.validation(
+                            "the runtime has already been released — cannot register the importSharedTexture result"
+                        ))
+                    }
+                    self.engine.registerSharedTexture(
+                        WGPUTextureObject(shared: shared), at: handle, format: .rgba8unorm,
+                        size: WGPUExtent3D(width: shared.width, height: shared.height)
+                    )
+                    completion([
+                        "ok": true, "width": shared.width, "height": shared.height,
+                        "format": WGPUTextureFormat.rgba8unorm.rawValue,
+                    ])
+                }
+            }
+        }
     }
 
     /// `GPUShaderModule.getCompilationInfo()` — that module's compilation diagnostics.

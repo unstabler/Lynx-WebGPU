@@ -62,7 +62,7 @@ export const GPUMapMode = { READ: 0x1, WRITE: 0x2 };
 /**
  * One item in the command stream.
  *
- * The fields are read **by string key** by native's `WGPUCommandInterpreter`. A name mismatch is not
+ * The fields are read **by string key** by native's `WGPUBackendEngine`. A name mismatch is not
  * caught here, so when adding or changing an op be sure to fix both sides
  * (`.claude/skills/webgpu-command/SKILL.md`).
  * @typedef {Record<string, any>} GPUCommand
@@ -152,7 +152,13 @@ function toArrayBuffer(source, elementOffset, elementCount) {
   // copied"). Commands sit in the queue until submit, so putting one on by reference makes the last
   // value overwrite them all when the caller reuses the same array (the common pattern of filling
   // several buffers from one uniform array). The copy cost is negligible next to a bridge crossing (docs/ARCHITECTURE.md §3).
-  if (source instanceof ArrayBuffer) return source.slice(0);
+  const start = elementOffset || 0;
+  if (source instanceof ArrayBuffer) {
+    // Spec: for an `ArrayBuffer` (and a `DataView`) the offset and size are in **bytes**. They used
+    // to be ignored here, so a sub-range write uploaded the whole buffer.
+    const end = elementCount === undefined ? source.byteLength : start + elementCount;
+    return source.slice(start, end);
+  }
   if (ArrayBuffer.isView(source)) {
     // A DataView has no BYTES_PER_ELEMENT — in that case the offset is read as bytes.
     const elementSize = /** @type {{BYTES_PER_ELEMENT?: number}} */ (source).BYTES_PER_ELEMENT || 1;
@@ -163,7 +169,12 @@ function toArrayBuffer(source, elementOffset, elementCount) {
     const backing = /** @type {ArrayBuffer} */ (source.buffer);
     return backing.slice(start, start + length);
   }
-  if (Array.isArray(source)) return /** @type {ArrayBuffer} */ (new Uint8Array(source).buffer);
+  if (Array.isArray(source)) {
+    // A plain number array is this shim's extension — read as **bytes** (each element 0…255),
+    // the offset and size counting elements.
+    const end = elementCount === undefined ? source.length : start + elementCount;
+    return /** @type {ArrayBuffer} */ (new Uint8Array(source.slice(start, end)).buffer);
+  }
   throw new TypeError('data must be a TypedArray, an ArrayBuffer or a number array');
 }
 
@@ -220,10 +231,54 @@ function nativeModule() {
 let frameTickDepth = 0;
 
 /**
- * How many subscribers the frame ticker currently has. There is only one native ticker, so it stops only
- * when the last subscriber lets go — otherwise one side's `stop()` turns off the other (the rAF pump especially).
+ * One `startFrameLoop` subscription. (A class rather than a typedef so it stays out of the public `webgpu.d.ts`.)
  */
-let frameLoopSubscribers = 0;
+class FrameLoopSubscriber {
+  /**
+   * @param {(frame: {timestamp: number, delta: number}) => void} handler
+   * @param {number} fps
+   */
+  constructor(handler, fps) {
+    this.handler = handler;
+    this.fps = fps;
+    /**
+     * The timestamp of the tick this subscriber was last called with (`null` before the first call) — both
+     * its fps filter and its `delta` count from here, not from the driver's previous tick.
+     * @type {number | null}
+     */
+    this.lastDelivered = null;
+    /** Cleared by the stop function — a tick already iterating its snapshot skips it from then on. */
+    this.active = true;
+  }
+}
+
+/**
+ * Everyone subscribed to the frame loop — **one driver fans out to all of them.**
+ *
+ * There is only one native ticker per view and its rate is a single number. Letting each subscriber restart it
+ * at its own fps made the last caller win: a 30 fps background slowed a 60 fps burst on the same view down to 30,
+ * and a burst that started at 60 left the background at 60 after it ended. So the driver runs at the subscribers'
+ * **highest** fps, and each subscriber is called only once its own interval has passed (`frameLoopDue`).
+ *
+ * @type {FrameLoopSubscriber[]}
+ */
+let frameLoopSubscribers = [];
+
+/**
+ * What drives the ticks — the native ticker (through the `webgpu:frame` event) or the timer fallback — and the
+ * rate it runs at. `null` while nobody is subscribed: it stops only when the last subscriber lets go, so one
+ * side's `stop()` never turns off the other (the rAF pump especially).
+ *
+ * @type {{fps: number, retune: (fps: number) => void, stop: () => void} | null}
+ */
+let frameLoopDriver = null;
+
+/**
+ * How early a tick may land and still count as "the interval has passed" for a subscriber slower than the
+ * driver. Tick timestamps are not exact multiples of the interval — without it a 30 fps subscriber on a 60 fps
+ * link would miss the tick that lands a hair early and drop to 20. The browser preview uses the same 1 ms.
+ */
+const FRAME_INTERVAL_ALLOWANCE_MS = 1;
 
 /**
  * Whether the **native** ticker is driving the frames (as opposed to the timer fallback).
@@ -239,19 +294,55 @@ let nativeTickerActive = false;
 const framePresentDebt = new Set();
 
 /**
- * Wraps one frame loop callback. **The present goes out even if the callback throws** —
- * otherwise the screen stays frozen on that frame.
- * @param {(frame: {timestamp: number, delta: number}) => void} handler
- * @param {{timestamp: number, delta: number}} frame
+ * Whether `subscriber` is called on the tick at `timestamp`. The fastest subscribers (the driver runs at their
+ * fps) take every tick; a slower one waits until its own interval has passed since its last call.
+ *
+ * @param {FrameLoopSubscriber} subscriber
+ * @param {number} timestamp
+ * @param {number} driverFps
+ * @returns {boolean}
  */
-function runFrameTick(handler, frame) {
+function frameLoopDue(subscriber, timestamp, driverFps) {
+  if (subscriber.lastDelivered === null || subscriber.fps >= driverFps) return true;
+  return timestamp - subscriber.lastDelivered >= 1000 / subscriber.fps - FRAME_INTERVAL_ALLOWANCE_MS;
+}
+
+/**
+ * One driver tick, fanned out to every subscriber that is due.
+ *
+ * To native it stays **one** tick however many subscribers run in it: the deferred presents go out and the ack
+ * leaves once, at the end — on a tick nobody was due for too (the native gate waits for the ack either way).
+ * Each subscriber's `delta` counts from **its own** last call, so ticks skipped by the fps filter or by native
+ * backpressure are inside it.
+ *
+ * A subscriber added during the tick waits for the next one (as rAF does); one removed during the tick is not
+ * called. A throwing handler does not starve the others — **the present and the ack still go out**, and the
+ * first error is rethrown once the tick is wrapped up so it still surfaces.
+ *
+ * @param {number} timestamp the tick time in ms
+ * @returns {void}
+ */
+function dispatchFrameTick(timestamp) {
+  const driverFps = frameLoopDriver ? frameLoopDriver.fps : 0;
+  /** @type {{error: unknown} | null} */
+  let failure = null;
   frameTickDepth += 1;
   try {
-    handler(frame);
+    for (const subscriber of frameLoopSubscribers.slice()) {
+      if (!subscriber.active || !frameLoopDue(subscriber, timestamp, driverFps)) continue;
+      const delta = subscriber.lastDelivered === null ? 0 : timestamp - subscriber.lastDelivered;
+      subscriber.lastDelivered = timestamp;
+      try {
+        subscriber.handler({ timestamp, delta });
+      } catch (error) {
+        if (!failure) failure = { error };
+      }
+    }
   } finally {
     frameTickDepth -= 1;
     if (frameTickDepth === 0) endFrameTick();
   }
+  if (failure) throw failure.error;
 }
 
 /** The end of a tick — the deferred presents all go out here, then native is told the tick is done. */
@@ -765,12 +856,12 @@ class GPUBuffer extends GPUObjectBase {
   /**
    * Unmaps.
    *
-   * For `mappedAtCreation`, this is where the actual creation command (initial data included) is recorded;
-   * for something mapped by `mapAsync` it tells native "queue operations may use it now" —
-   * a buffer being mapped is rejected by queue operations per the spec, so **this must be called once you are done.**
+   * It tells native "queue operations may use it now" — a buffer being mapped is rejected by queue
+   * operations per the spec, so **this must be called once you are done.**
    *
-   * A `GPUMapMode.WRITE` mapping **carries its bytes back** here (`unmapBuffer`'s `offset` + `data`) —
-   * the mapping is a JS copy, so without that everything written into it would vanish silently.
+   * A write mapping — `mappedAtCreation` or `GPUMapMode.WRITE` — **carries its bytes back** here
+   * (`unmapBuffer`'s `offset` + `data`): the mapping is a JS copy, so without that everything
+   * written into it would vanish silently.
    *
    * @returns {void}
    */
@@ -778,17 +869,8 @@ class GPUBuffer extends GPUObjectBase {
     if (!this._mapped) return;
     // The writes into the range copies are put back into the mapping before sending — otherwise they vanish silently.
     this._flushMappedRanges();
-    if (this._mappedAtCreation) {
-      this._recorder.push({
-        op: 'createBuffer',
-        id: this.id,
-        size: this.size,
-        usage: this.usage,
-        label: this.label,
-        data: this._mapped,   // already an ArrayBuffer
-      });
+    if (this._mappedAtCreation || this._mapMode === GPUMapMode.WRITE) {
       this._mappedAtCreation = false;
-    } else if (this._mapMode === GPUMapMode.WRITE) {
       // The whole mapping goes back: it started as the buffer's current contents (spec), so bytes the
       // app did not touch are written back unchanged.
       this._recorder.push({
@@ -1079,14 +1161,26 @@ class GPUPassEncoderBase {
   /**
    * @param {number} index
    * @param {GPUBindGroup} bindGroup
-   * @param {number[]} [dynamicOffsets]
+   * @param {number[] | Uint32Array} [dynamicOffsets]
+   * @param {number} [dynamicOffsetsDataStart] with a `Uint32Array`: the first offset to use (spec overload)
+   * @param {number} [dynamicOffsetsDataLength] with a `Uint32Array`: how many offsets to use
    * @returns {void}
    */
-  setBindGroup(index, bindGroup, dynamicOffsets) {
+  setBindGroup(index, bindGroup, dynamicOffsets, dynamicOffsetsDataStart, dynamicOffsetsDataLength) {
     this._retain(bindGroup);
     /** @type {GPUCommand} */
     const command = { op: 'setBindGroup', index, bindGroup: bindGroup.id };
-    if (dynamicOffsets && dynamicOffsets.length) command.dynamicOffsets = Array.from(dynamicOffsets);
+    if (dynamicOffsets && dynamicOffsets.length) {
+      // The `(Uint32Array, start, length)` overload names a window of a larger array. It used to be
+      // flattened whole, so native saw too many offsets and reported a count mismatch.
+      let offsets = Array.from(dynamicOffsets);
+      if (dynamicOffsetsDataStart !== undefined || dynamicOffsetsDataLength !== undefined) {
+        const start = dynamicOffsetsDataStart || 0;
+        const end = dynamicOffsetsDataLength === undefined ? offsets.length : start + dynamicOffsetsDataLength;
+        offsets = offsets.slice(start, end);
+      }
+      if (offsets.length) command.dynamicOffsets = offsets;
+    }
     this._commands.push(command);
   }
 }
@@ -1103,22 +1197,30 @@ class GPURenderCommandsBase extends GPUPassEncoderBase {
    * @param {number} slot
    * @param {GPUBuffer} buffer
    * @param {number} [offset]
+   * @param {number} [size] the bytes bound from `offset` (spec: the rest of the buffer when omitted)
    * @returns {void}
    */
-  setVertexBuffer(slot, buffer, offset) {
+  setVertexBuffer(slot, buffer, offset, size) {
     this._retain(buffer);
-    this._commands.push({ op: 'setVertexBuffer', slot, buffer: buffer.id, offset: offset || 0 });
+    /** @type {GPUCommand} */
+    const command = { op: 'setVertexBuffer', slot, buffer: buffer.id, offset: offset || 0 };
+    if (size !== undefined) command.size = size;
+    this._commands.push(command);
   }
 
   /**
    * @param {GPUBuffer} buffer
    * @param {'uint16' | 'uint32'} format
    * @param {number} [offset]
+   * @param {number} [size] the bytes bound from `offset` — bounds what `drawIndexed` may read
    * @returns {void}
    */
-  setIndexBuffer(buffer, format, offset) {
+  setIndexBuffer(buffer, format, offset, size) {
     this._retain(buffer);
-    this._commands.push({ op: 'setIndexBuffer', buffer: buffer.id, format, offset: offset || 0 });
+    /** @type {GPUCommand} */
+    const command = { op: 'setIndexBuffer', buffer: buffer.id, format, offset: offset || 0 };
+    if (size !== undefined) command.size = size;
+    this._commands.push(command);
   }
 
   /**
@@ -1646,8 +1748,8 @@ class GPUQueue {
    * @param {GPUBuffer} buffer
    * @param {number} bufferOffset
    * @param {GPUDataSource} data
-   * @param {number} [dataOffset] the start position in elements
-   * @param {number} [size] the number of elements
+   * @param {number} [dataOffset] the start position — in elements of a TypedArray, in **bytes** of an `ArrayBuffer`/`DataView` (spec)
+   * @param {number} [size] the count — elements of a TypedArray, bytes of an `ArrayBuffer`/`DataView`
    * @returns {void}
    */
   writeBuffer(buffer, bufferOffset, data, dataOffset, size) {
@@ -1662,7 +1764,8 @@ class GPUQueue {
   /**
    * @param {{texture: GPUTexture, mipLevel?: number, origin?: GPUOrigin3DDict}} destination
    * @param {GPUDataSource} data
-   * @param {{bytesPerRow: number, rowsPerImage?: number}} dataLayout
+   * @param {{offset?: number, bytesPerRow?: number, rowsPerImage?: number}} dataLayout `offset` is the
+   *   byte the upload starts at inside `data` (spec `GPUTexelCopyBufferLayout.offset`)
    * @param {GPUExtent3D} size
    * @returns {void}
    */
@@ -1673,6 +1776,7 @@ class GPUQueue {
       mipLevel: destination.mipLevel || 0,
       origin: destination.origin,
       data: toArrayBuffer(data),
+      offset: dataLayout.offset || 0,
       bytesPerRow: dataLayout.bytesPerRow,
       rowsPerImage: dataLayout.rowsPerImage,
       size,
@@ -1690,9 +1794,18 @@ class GPUQueue {
    * and separate — turning both on flips twice and lands back where it started). Web libraries use this
    * one: three.js's `Texture.flipY` defaults to `true`.
    *
+   * `destination.premultipliedAlpha` (default `false`) is the alpha state **written into the texture**, as in
+   * the spec. The bitmap remembers its own state (`createImageBitmap`'s `premultiplyAlpha`), and the copy
+   * multiplies or divides when the two differ — so the default bitmap (premultiplied) copied with the default
+   * destination (straight) comes out un-premultiplied, the same as in a browser.
+   *
+   * `destination.colorSpace` (default `'srgb'`) is carried to native, which takes only `'srgb'` — the decoder
+   * does no color conversion. `'display-p3'` comes back as a `GPUValidationError` through the usual error
+   * channel (error scopes, `uncapturederror`), and the copy is not made.
+   *
    * @param {{source: GPUImageBitmap, origin?: GPUOrigin3DDict, flipY?: boolean}} source
    * @param {{texture: GPUTexture, mipLevel?: number, origin?: GPUOrigin3DDict,
-   *          premultipliedAlpha?: boolean, colorSpace?: string}} destination
+   *          premultipliedAlpha?: boolean, colorSpace?: 'srgb' | 'display-p3'}} destination
    * @param {GPUExtent3D} [copySize] omitted, the whole image
    * @returns {void}
    */
@@ -1708,6 +1821,8 @@ class GPUQueue {
         texture: destination.texture.id,
         mipLevel: destination.mipLevel || 0,
         origin: destination.origin,
+        premultipliedAlpha: !!destination.premultipliedAlpha,
+        colorSpace: destination.colorSpace === undefined ? 'srgb' : destination.colorSpace,
       },
       copySize,
     });
@@ -1725,7 +1840,13 @@ class GPUQueue {
     return this._recorder.flush();
   }
 
-  /** @returns {Promise<void>} */
+  /**
+   * **Resolves once the work has been handed to native, not when the GPU finishes it.** The command
+   * stream has no completion channel (`docs/COMMAND-STREAM.md`), so code pacing readbacks or frames
+   * on this promise runs earlier than in a browser — `mapAsync()` is the call that does wait for the
+   * GPU (`docs/WEBGPU-API.md` §8).
+   * @returns {Promise<void>}
+   */
   onSubmittedWorkDone() {
     this._recorder.flush();
     return Promise.resolve();
@@ -1736,10 +1857,21 @@ class GPUDevice {
   /**
    * @param {GPUAdapter} adapter
    * @param {string[]} [requiredFeatures] the feature names already validated in `requestDevice()`
+   * @param {Record<string, number>} [requiredLimits] the limits already validated in `requestDevice()`
    */
-  constructor(adapter, requiredFeatures) {
+  constructor(adapter, requiredFeatures, requiredLimits) {
     this.adapter = adapter;
-    this.limits = adapter.limits;
+    /** The runtime this device was created on — its registry is shared by every device on it. */
+    this._runtime = nativeModule();
+    /**
+     * The adapter's limits, overridden by what `requestDevice({requiredLimits})` asked for (already
+     * validated against the adapter there). The spec starts from the defaults instead; starting from
+     * the adapter's values keeps code written against this shim working.
+     */
+    this.limits = requiredLimits && Object.keys(requiredLimits).length
+      ? Object.assign({}, adapter.limits, requiredLimits) : adapter.limits;
+    this._destroyed = false;
+    liveDevices(this._runtime).add(this);
     /** The spec's `GPUDevice.adapterInfo` — it looks straight at the adapter's. */
     this.adapterInfo = adapter.info;
     /**
@@ -1748,15 +1880,18 @@ class GPUDevice {
      * as three.js uses the pattern of requesting exactly what it picked from the adapter and re-checking here.
      */
     this.features = makeFeatureSet(requiredFeatures || []);
+    /** @type {(info: GPUDeviceLostInfo) => void} */
+    this._resolveLost = () => {};
     /**
      * Device loss notification (the counterpart of `device.lost.then(...)`).
      *
-     * This implementation does not report loss, so it stays **pending forever** — the scenarios where a
-     * Metal device disappears (an eGPU being unplugged, say) do not exist on iOS, and when the process
-     * dies JS dies with it. The property has to exist for bootstraps like `WebGPUBackend.init()` to pass without a TypeError.
+     * This implementation does not report GPU loss, so it stays pending — the scenarios where a Metal
+     * device disappears (an eGPU being unplugged, say) do not exist on iOS, and when the process dies
+     * JS dies with it. It does settle with `reason: 'destroyed'` on `destroy()`, as the spec requires.
+     * The property has to exist for bootstraps like `WebGPUBackend.init()` to pass without a TypeError.
      * @type {Promise<GPUDeviceLostInfo>}
      */
-    this.lost = new Promise(() => {});
+    this.lost = new Promise((resolve) => { this._resolveLost = resolve; });
     /**
      * Errors uncaught by a scope (the spec's `GPUDevice.onuncapturederror`).
      *
@@ -1878,15 +2013,19 @@ class GPUDevice {
   createBuffer(descriptor) {
     const id = this._recorder.allocate();
     const buffer = new GPUBuffer(this, id, descriptor);
+    // Recorded **now**, mapped or not — in a browser the buffer exists from this call, so a
+    // `createBindGroup` referencing it before `unmap()` is legal (the map state is checked at submit,
+    // not at creation). Deferring the creation to `unmap()` ordered such a reference first in the
+    // stream, and native answered "GPUBuffer does not exist". The initial data follows on
+    // `unmap()` as a write-back (`unmapBuffer`), the same path a `GPUMapMode.WRITE` mapping takes.
+    this._recorder.push({
+      op: 'createBuffer', id,
+      size: descriptor.size, usage: descriptor.usage, label: descriptor.label,
+      mappedAtCreation: !!descriptor.mappedAtCreation,
+    });
     if (descriptor.mappedAtCreation) {
-      // The creation command is recorded in unmap(), together with the initial data.
       buffer._mapped = new ArrayBuffer(descriptor.size);
       buffer._mappedAtCreation = true;
-    } else {
-      this._recorder.push({
-        op: 'createBuffer', id,
-        size: descriptor.size, usage: descriptor.usage, label: descriptor.label,
-      });
     }
     return buffer;
   }
@@ -2098,16 +2237,50 @@ class GPUDevice {
     return new GPUQuerySet(this, id, descriptor);
   }
 
-  /** Throws away every GPU object (called when leaving the page). @returns {void} */
+  /**
+   * Destroys the device (called when leaving the page). `lost` settles with `reason: 'destroyed'`.
+   *
+   * The native registry is one per runtime, not per device (handles are issued module-wide), so it
+   * is cleared **only when no device remains** — destroying one of two devices used to erase the
+   * other's objects as well. A destroyed device's own objects stay native until the last device goes.
+   * @returns {void}
+   */
   destroy() {
+    if (this._destroyed) return;
+    this._destroyed = true;
+    const siblings = liveDevices(this._runtime);
+    siblings.delete(this);
     this._recorder.pending = [];
     // Leaving waiting popErrorScope Promises alone means they never resolve — they are closed with null.
     // As things stand `flush()` resolves the scopes however it ends (success or failure), so nothing gets
     // this far. It stays only as a last safety net.
     this._recorder.settleErrorScopes([]);
-    canvasSizeCache.clear();
-    nativeModule().reset();
+    this._resolveLost({ reason: 'destroyed', message: 'GPUDevice.destroy() was called' });
+    if (siblings.size === 0) {
+      canvasSizeCache.clear();
+      this._runtime.reset();
+    }
   }
+}
+
+/**
+ * Devices not yet destroyed, per runtime (the native module they were created on) — a runtime's
+ * registry is cleared when its last device goes.
+ * @type {WeakMap<object, Set<GPUDevice>>}
+ */
+const liveDevicesByRuntime = new WeakMap();
+
+/**
+ * @param {object} runtime
+ * @returns {Set<GPUDevice>}
+ */
+function liveDevices(runtime) {
+  let devices = liveDevicesByRuntime.get(runtime);
+  if (!devices) {
+    devices = new Set();
+    liveDevicesByRuntime.set(runtime, devices);
+  }
+  return devices;
 }
 
 /**
@@ -2288,17 +2461,58 @@ class GPUCanvasContext {
 // ---------------------------------------------------------------------------
 
 /**
- * A stand-in for `GPUSupportedFeatures` — all web code uses is `has()` and iteration.
+ * The spec's `GPUSupportedFeatures` — a read-only setlike.
+ *
+ * Web code iterates it (`for…of`, spread, `.forEach`, `.keys()`), which the earlier plain
+ * `{has, size, values}` object broke with a TypeError. Built without `Set` so it does not depend on
+ * the engine providing one.
+ */
+export class GPUSupportedFeatures {
+  /** @param {string[]} names */
+  constructor(names) {
+    /** @type {string[]} */
+    this._names = names.slice();
+  }
+
+  /** @returns {number} */
+  get size() { return this._names.length; }
+
+  /**
+   * @param {string} name
+   * @returns {boolean}
+   */
+  has(name) { return this._names.indexOf(name) >= 0; }
+
+  /** @returns {IterableIterator<string>} */
+  values() { return this._names.slice()[Symbol.iterator](); }
+
+  /** @returns {IterableIterator<string>} */
+  keys() { return this.values(); }
+
+  /** @returns {IterableIterator<[string, string]>} */
+  entries() {
+    return this._names.map((name) => /** @type {[string, string]} */ ([name, name]))[Symbol.iterator]();
+  }
+
+  /**
+   * @param {(value: string, key: string, set: GPUSupportedFeatures) => void} callback
+   * @param {any} [thisArg]
+   * @returns {void}
+   */
+  forEach(callback, thisArg) {
+    for (const name of this._names) callback.call(thisArg, name, name, this);
+  }
+
+  /** @returns {IterableIterator<string>} */
+  [Symbol.iterator]() { return this.values(); }
+}
+
+/**
  * @param {string[]} names
- * @returns {{has: (name: string) => boolean, size: number, values: () => string[]}}
+ * @returns {GPUSupportedFeatures}
  */
 function makeFeatureSet(names) {
-  const list = names.slice();
-  return {
-    has: (name) => list.indexOf(name) >= 0,
-    size: list.length,
-    values: () => list.slice(),
-  };
+  return new GPUSupportedFeatures(names);
 }
 
 /**
@@ -2356,11 +2570,31 @@ class GPUAdapter {
       if (!this.features.has(name)) {
         throw new Error(
           `requestDevice: this adapter does not support the '${name}' feature ` +
-            `(supported: ${this.features.values().join(', ') || 'none'})`
+            `(supported: ${Array.from(this.features).join(', ') || 'none'})`
         );
       }
     }
-    return new GPUDevice(this, required);
+    // Spec: a `requiredLimits` entry beyond the adapter rejects with an OperationError. They used to
+    // be ignored, so an over-budget request went through and `device.limits` never reflected it.
+    /** @type {Record<string, number>} */
+    const requestedLimits = (descriptor && descriptor.requiredLimits) || {};
+    for (const key of Object.keys(requestedLimits)) {
+      const requested = requestedLimits[key];
+      if (requested === undefined) continue;
+      const supported = /** @type {Record<string, number>} */ (this.limits)[key];
+      if (supported === undefined) {
+        throw new OperationError(`requestDevice: '${key}' is not a limit this adapter reports`);
+      }
+      // An alignment limit is better when **smaller** — a request may not go below the adapter's;
+      // every other limit may not exceed it.
+      const isAlignment = key.startsWith('min') && key.endsWith('Alignment');
+      if (isAlignment ? requested < supported : requested > supported) {
+        throw new OperationError(
+          `requestDevice: requiredLimits.${key} = ${requested} is beyond what the adapter supports (${supported})`
+        );
+      }
+    }
+    return new GPUDevice(this, required, requestedLimits);
   }
 }
 
@@ -2409,26 +2643,63 @@ export const gpu = {
  * A native CADisplayLink drives it, so frames are more even than with `setInterval`.
  * Calling the returned function stops the loop — it must be called when leaving the page.
  *
+ * Every subscriber keeps **its own** `fps`. The view has one display link, so it runs at the highest fps
+ * asked for and a slower subscriber skips ticks until its interval has passed — a 30 fps background and a
+ * 60 fps burst on the same view each get their own rate, and the link drops back to 30 when the burst stops.
+ * `delta` is the time since **this** subscriber was last called (0 on the first call), skipped ticks included.
+ *
  * @param {(frame: {timestamp: number, delta: number}) => void} handler
  * @param {{fps?: number}} [options]
  * @returns {() => void} the stop function
  */
 export function startFrameLoop(handler, options) {
-  const fps = (options && options.fps) || 60;
+  const fps = options && options.fps && options.fps > 0 ? options.fps : 60;
   const module = nativeModule();
-  // There is **only one** native ticker — without counting subscribers, one stopping kills the other with
-  // it. `installAnimationFrame`'s rAF pump sits on top of this, so a scene briefly running its own loop
-  // and turning it off silently stops rAF forever (experienced first hand).
-  frameLoopSubscribers += 1;
-  const releaseTicker = () => {
-    frameLoopSubscribers -= 1;
-    if (frameLoopSubscribers <= 0) {
-      frameLoopSubscribers = 0;
-      nativeTickerActive = false;
-      module.stopFrameLoop();
+  // There is **only one** native ticker — every subscriber shares it, and it stops only with the last one.
+  // `installAnimationFrame`'s rAF pump sits on top of this, so a scene briefly running its own loop and
+  // turning it off must not stop rAF with it (it once silently stopped rAF forever).
+  const subscriber = new FrameLoopSubscriber(handler, fps);
+  frameLoopSubscribers.push(subscriber);
+  if (frameLoopDriver) retuneFrameLoop(frameLoopDriver);
+  else frameLoopDriver = startFrameLoopDriver(module, fps);
+
+  return () => {
+    if (!subscriber.active) return;   // calling twice does not eat someone else's subscription
+    subscriber.active = false;
+    frameLoopSubscribers = frameLoopSubscribers.filter((entry) => entry !== subscriber);
+    const driver = frameLoopDriver;
+    if (!driver) return;
+    if (frameLoopSubscribers.length > 0) {
+      retuneFrameLoop(driver);
+    } else {
+      frameLoopDriver = null;
+      driver.stop();
     }
   };
+}
 
+/**
+ * Moves the driver to the subscribers' highest fps — **only when that changed**, since restarting the native
+ * ticker re-creates the display link.
+ *
+ * @param {{fps: number, retune: (fps: number) => void}} driver
+ * @returns {void}
+ */
+function retuneFrameLoop(driver) {
+  const fps = frameLoopSubscribers.reduce((highest, entry) => Math.max(highest, entry.fps), 0);
+  if (fps > 0 && fps !== driver.fps) driver.retune(fps);
+}
+
+/**
+ * Starts what drives the ticks: Lynx's `GlobalEventEmitter` carrying the native ticker's `webgpu:frame`, or
+ * a timer where there is no emitter (a test runner and the like). Either way **one** listener feeds
+ * `dispatchFrameTick`, whoever is subscribed.
+ *
+ * @param {WebGPUNativeModule} module
+ * @param {number} fps
+ * @returns {{fps: number, retune: (fps: number) => void, stop: () => void}}
+ */
+function startFrameLoopDriver(module, fps) {
   /** @type {LynxGlobalEventEmitter | null} */
   let emitter = null;
   try {
@@ -2440,34 +2711,46 @@ export function startFrameLoop(handler, options) {
   }
 
   if (emitter) {
+    const source = emitter;
+    // Only the timestamp is read — each subscriber measures its own delta.
     /** @param {{timestamp: number, delta: number} | undefined} frame */
-    const listener = (frame) => runFrameTick(handler, frame || { timestamp: 0, delta: 16 });
-    emitter.addListener('webgpu:frame', listener);
+    const listener = (frame) => dispatchFrameTick(frame ? frame.timestamp : 0);
+    source.addListener('webgpu:frame', listener);
     module.startFrameLoop({ fps });
     nativeTickerActive = true;
-    let stopped = false;
-    return () => {
-      if (stopped) return;   // calling twice does not eat someone else's subscription
-      stopped = true;
-      emitter.removeListener('webgpu:frame', listener);
-      releaseTicker();
+    const driver = {
+      fps,
+      /** @param {number} next */
+      retune(next) {
+        driver.fps = next;
+        // Restarting is safe — native swaps the link and drops the old tick's debt (`LynxWebGPUHost.startFrameLoop`).
+        module.startFrameLoop({ fps: next });
+      },
+      stop() {
+        source.removeListener('webgpu:frame', listener);
+        nativeTickerActive = false;
+        module.stopFrameLoop();
+      },
     };
+    return driver;
   }
 
-  // A fallback for environments with no GlobalEventEmitter (a test runner and the like).
-  let previous = Date.now();
-  const timer = setInterval(() => {
-    const now = Date.now();
-    runFrameTick(handler, { timestamp: now, delta: now - previous });
-    previous = now;
-  }, Math.max(1, Math.round(1000 / fps)));
-  let stopped = false;
-  return () => {
-    if (stopped) return;
-    stopped = true;
-    clearInterval(timer);
-    releaseTicker();
+  /** @param {number} rate */
+  const schedule = (rate) => setInterval(() => dispatchFrameTick(Date.now()), Math.max(1, Math.round(1000 / rate)));
+  let timer = schedule(fps);
+  const driver = {
+    fps,
+    /** @param {number} next */
+    retune(next) {
+      driver.fps = next;
+      clearInterval(timer);
+      timer = schedule(next);
+    },
+    stop() {
+      clearInterval(timer);
+    },
   };
+  return driver;
 }
 
 /**
@@ -2619,6 +2902,15 @@ class GPUImageBitmap {
  * bitmap.close()
  * ```
  *
+ * `premultiplyAlpha` follows Chromium: `'default'` (and leaving it out) is the same as `'premultiply'`, and
+ * only `'none'` keeps straight alpha. The HTML spec leaves `'default'` to the implementation; matching the
+ * browser keeps a scene's alpha the same here and in a browser preview.
+ *
+ * ImageIO only draws premultiplied, so straight alpha — `'none'` here, or a copy with the default
+ * `premultipliedAlpha: false` — is recovered by dividing, which loses color where alpha is low. Translucent
+ * art that must keep its edges goes premultiplied end to end: the default bitmap copied with
+ * `premultipliedAlpha: true` is a plain copy, blended with `one, one-minus-src-alpha`.
+ *
  * @param {ArrayBuffer | ArrayBufferView | string} source the image bytes, or an asset name
  * @param {{flipY?: boolean, premultiplyAlpha?: 'none' | 'premultiply' | 'default',
  *          resizeWidth?: number, resizeHeight?: number}} [options]
@@ -2638,7 +2930,8 @@ export async function createImageBitmap(source, options) {
   const params = {
     id,
     flipY: !!settings.flipY,
-    premultiplyAlpha: settings.premultiplyAlpha === 'premultiply',
+    // `'default'` premultiplies, as in Chromium (`ImageBitmap::ParseOptions`) — only `'none'` keeps straight alpha.
+    premultiplyAlpha: settings.premultiplyAlpha !== 'none',
     resizeWidth: settings.resizeWidth,
     resizeHeight: settings.resizeHeight,
   };
@@ -2657,12 +2950,85 @@ export async function createImageBitmap(source, options) {
   return new GPUImageBitmap(id, result.width, result.height, recorder);
 }
 
+/**
+ * Imports a **process-wide shared texture** — one GPU texture per key, shared by every page on the device.
+ *
+ * Each LynxView runs its own context and JS runtime, so an image several pages draw would otherwise sit in
+ * GPU memory once per page (and a large one decoded, cropped and staged once per page on the way). Here
+ * native decodes and uploads it once per key — straight at the requested size, with no pixels crossing the
+ * bridge, no `ImageBitmap` and no staging copy — and every page on the same Metal device that asks for the
+ * key gets the same texture.
+ *
+ * ```js
+ * const clouds = await importSharedTexture(device, {
+ *   key: 'clouds-v3@1024w', url: 'file:///…/clouds.png', resizeWidth: 1024,
+ * })
+ * const view = clouds.createView()   // sample it like any texture
+ * ```
+ *
+ * - **The key is your promise about the pixels.** The same key must always mean the same image at the same
+ *   size: a key already in use returns the existing texture whatever `url` and size say (debug builds log a
+ *   warning). Put the source's identity and version, and the resize, into the key.
+ * - `url` resolves like `loadAsset` (a registered name, a file path or `file://` URL, a bundle path), through
+ *   the host's asset provider — on every call, so its access scope holds for a cache hit too.
+ * - Size: `resizeWidth` and `resizeHeight` both given → exactly that; one given → the other follows the
+ *   image's aspect ratio; neither → the image's own size.
+ * - The texture is `rgba8unorm` with **premultiplied** alpha (blend with `one, one-minus-src-alpha`), usage
+ *   `TEXTURE_BINDING | COPY_SRC`, and **read-only**: writes, render attachments, write-access storage
+ *   bindings and format-changing views are validation errors.
+ * - `texture.destroy()`, `device.destroy()` and GC release only this page's reference — the texture lives
+ *   on for the other pages and goes when the last one lets go.
+ * - A runtime without shared textures rejects with its `unsupported` error (the default Metal runtime has them).
+ *
+ * @param {GPUDevice} device
+ * @param {{key: string, url: string, resizeWidth?: number, resizeHeight?: number, label?: string}} descriptor
+ * @returns {Promise<GPUTexture>}
+ */
+export async function importSharedTexture(device, descriptor) {
+  const settings = descriptor || /** @type {{key: string, url: string}} */ ({});
+  if (typeof settings.key !== 'string' || settings.key === '') {
+    throw new TypeError('importSharedTexture needs a non-empty key');
+  }
+  if (typeof settings.url !== 'string' || settings.url === '') {
+    throw new TypeError('importSharedTexture needs a non-empty url');
+  }
+  const module = nativeModule();
+  if (typeof module.importSharedTexture !== 'function') {
+    throw new Error('this host has no importSharedTexture — the native side of Lynx-WebGPU needs updating');
+  }
+  // The handle comes from the module-wide counter, as for every object; native registers the texture under it.
+  const id = allocateHandle();
+  /** @type {{id: number, key: string, url: string, resizeWidth?: number, resizeHeight?: number, label?: string}} */
+  const params = { id, key: settings.key, url: settings.url };
+  if (settings.resizeWidth !== undefined) params.resizeWidth = settings.resizeWidth;
+  if (settings.resizeHeight !== undefined) params.resizeHeight = settings.resizeHeight;
+  if (settings.label !== undefined) params.label = settings.label;
+
+  const result = await /** @type {Promise<WGPUSharedTextureResult | undefined>} */ (
+    new Promise((resolve) => {
+      module.importSharedTexture(params, resolve);
+    })
+  );
+  if (!result || result.ok === false) {
+    const errors = (result && result.errors) || [];
+    throw new Error(errors.length ? errors[0].message : `could not import the shared texture '${settings.key}'`);
+  }
+  return new GPUTexture(device, id, {
+    size: { width: result.width, height: result.height },
+    format: result.format,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
+    label: settings.label,
+  });
+}
+
 export {
   GPUImageBitmap,
   GPUBuffer, GPUTexture, GPUTextureView, GPUSampler, GPUDevice, GPUCanvasContext,
   GPURenderBundle, GPURenderBundleEncoder, GPUQuerySet,
   // The errors `uncapturederror` carries — used when telling the kinds apart with `instanceof`.
   GPUError, GPUValidationError, GPUOutOfMemoryError, GPUInternalError,
+  // The DOMException stand-ins promise rejections carry.
+  OperationError,
 };
 export default gpu;
 
