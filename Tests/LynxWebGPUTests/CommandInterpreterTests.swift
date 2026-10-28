@@ -1454,4 +1454,137 @@ final class CommandInterpreterTests: XCTestCase {
         XCTAssertLessThanOrEqual((limits["minUniformBufferOffsetAlignment"] as? Int) ?? 0, 256)
         XCTAssertLessThanOrEqual((limits["minStorageBufferOffsetAlignment"] as? Int) ?? 0, 256)
     }
+
+    // MARK: - Texel copy arithmetic and regions
+
+    /// `enforceRange` lets any 53-bit integer through, and the byte arithmetic multiplied two of them:
+    /// a 2^52 stride × 4096 rows is 2^64 — an `Int` overflow **trap**, not an error. Every value the
+    /// arithmetic touches is now bounded to 32 bits first, and the products are overflow-checked.
+    func test_aHugeStrideInWriteTextureIsAValidationErrorNotATrap() {
+        let result = harness.execute([
+            ["op": "createTexture", "id": 1, "size": ["width": 2, "height": 2, "depthOrArrayLayers": 2],
+             "format": "rgba8unorm", "usage": TestUsage.textureCopyDst],
+            // Past 32 bits — rejected before anything is multiplied.
+            ["op": "writeTexture", "texture": 1, "data": Data(count: 16).base64EncodedString(),
+             "size": ["width": 1, "height": 1], "bytesPerRow": 1 << 52, "rowsPerImage": 4096],
+            // Inside 32 bits each, but their product (bytesPerImage) is not — overflow-checked.
+            ["op": "writeTexture", "texture": 1, "data": Data(count: 16).base64EncodedString(),
+             "size": ["width": 1, "height": 1, "depthOrArrayLayers": 2],
+             "bytesPerRow": Int(UInt32.max), "rowsPerImage": Int(UInt32.max)],
+            ["op": "writeTexture", "texture": 1, "data": Data(count: 16).base64EncodedString(),
+             "size": ["width": 1, "height": 1], "bytesPerRow": -4],
+        ])
+        XCTAssertEqual(result["ok"] as? Bool, false)
+        XCTAssertEqual(errors(result).count, 3, harness.describeErrors(result))
+        for error in errors(result) { XCTAssertEqual(error["kind"] as? String, "validation") }
+    }
+
+    /// `copyTextureToTexture` used to reach the blit encoder with **no** validation — a region past
+    /// the texture, a negative origin, a mip level that does not exist or a slice beyond the layers
+    /// are all Metal assertions. They are the spec's validation errors.
+    func test_copyTextureToTextureOutsideTheTextureIsAValidationError() {
+        let result = harness.execute([
+            ["op": "createTexture", "id": 1, "size": ["width": 4, "height": 4], "format": "rgba8unorm",
+             "usage": TestUsage.textureCopySrc | TestUsage.textureCopyDst],
+            ["op": "createTexture", "id": 2, "size": ["width": 4, "height": 4], "format": "rgba8unorm",
+             "usage": TestUsage.textureCopySrc | TestUsage.textureCopyDst],
+            ["op": "createTexture", "id": 3, "size": ["width": 4, "height": 4], "format": "r8unorm",
+             "usage": TestUsage.textureCopySrc | TestUsage.textureCopyDst],
+            ["op": "copyTextureToTexture", "source": ["texture": 1, "origin": ["x": 3]],
+             "destination": ["texture": 2], "copySize": ["width": 2, "height": 2]],
+            ["op": "copyTextureToTexture", "source": ["texture": 1, "origin": ["x": -1]],
+             "destination": ["texture": 2], "copySize": ["width": 1, "height": 1]],
+            ["op": "copyTextureToTexture", "source": ["texture": 1, "mipLevel": 1],
+             "destination": ["texture": 2], "copySize": ["width": 1, "height": 1]],
+            ["op": "copyTextureToTexture", "source": ["texture": 1],
+             "destination": ["texture": 2, "origin": ["z": 1]], "copySize": ["width": 1, "height": 1]],
+            ["op": "copyTextureToTexture", "source": ["texture": 1],
+             "destination": ["texture": 3], "copySize": ["width": 1, "height": 1]],
+            // A valid copy between the two still runs.
+            ["op": "copyTextureToTexture", "source": ["texture": 1, "origin": ["x": 2, "y": 2]],
+             "destination": ["texture": 2], "copySize": ["width": 2, "height": 2]],
+        ])
+        XCTAssertEqual(errors(result).count, 5, harness.describeErrors(result))
+        for error in errors(result) { XCTAssertEqual(error["kind"] as? String, "validation") }
+    }
+
+    /// The buffer↔texture copies checked only block alignment and the 256-byte stride. A region past
+    /// the mip level, a mip level that does not exist, a buffer too small for the rows, or a negative
+    /// offset went to Metal as they were.
+    func test_bufferTextureCopiesPastTheTextureOrBufferAreValidationErrors() {
+        let result = harness.execute([
+            ["op": "createTexture", "id": 1, "size": ["width": 4, "height": 4], "format": "rgba8unorm",
+             "usage": TestUsage.textureCopySrc | TestUsage.textureCopyDst],
+            ["op": "createBuffer", "id": 2, "size": 64, "usage": TestUsage.copySrc | TestUsage.copyDst],
+            ["op": "copyTextureToBuffer", "source": ["texture": 1, "origin": ["x": 3]],
+             "destination": ["buffer": 2, "bytesPerRow": 256], "copySize": ["width": 2, "height": 1]],
+            ["op": "copyBufferToTexture", "source": ["buffer": 2, "bytesPerRow": 256],
+             "destination": ["texture": 1, "mipLevel": 1], "copySize": ["width": 1, "height": 1]],
+            // 4 rows at a 256 B stride need 3 × 256 + 16 = 784 B; the buffer has 64.
+            ["op": "copyBufferToTexture", "source": ["buffer": 2, "bytesPerRow": 256],
+             "destination": ["texture": 1], "copySize": ["width": 4, "height": 4]],
+            ["op": "copyTextureToBuffer", "source": ["texture": 1],
+             "destination": ["buffer": 2, "offset": -4], "copySize": ["width": 1, "height": 1]],
+            // A single texel at offset 60 fits exactly.
+            ["op": "copyTextureToBuffer", "source": ["texture": 1],
+             "destination": ["buffer": 2, "offset": 60], "copySize": ["width": 1, "height": 1]],
+        ])
+        XCTAssertEqual(errors(result).count, 4, harness.describeErrors(result))
+        for error in errors(result) { XCTAssertEqual(error["kind"] as? String, "validation") }
+    }
+
+    // MARK: - Frame boundary with bookkeeping commands
+
+    /// The tick's closing flush carries **whatever was recorded after the frame's last `submit()`** —
+    /// a `destroy()` of a temporary, next frame's bind group. None of it makes GPU work, and the
+    /// closing batch used to present only when it had *no* commands at all, so the frame the
+    /// mid-frame submit had already drawn was never put out and the next acquisition threw it away.
+    func test_aClosingBatchWithOnlyBookkeepingCommandsStillPresentsTheDrawnFrame() {
+        harness.executeExpectingSuccess([
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+        ])
+        let before = harness.liveObjects
+
+        let midFrame = harness.execute([
+            ["op": "getCurrentTexture", "id": 60, "canvas": "test"],
+            ["op": "createTextureView", "id": 61, "texture": 60],
+            ["op": "beginRenderPass", "colorAttachments": [[
+                "view": 61, "loadOp": "clear", "storeOp": "store",
+                "clearValue": ["r": 0, "g": 1, "b": 0, "a": 1],
+            ]]],
+            ["op": "endPass"],
+            ["op": "createBuffer", "id": 62, "size": 16, "usage": TestUsage.uniform],
+        ], present: false)
+        XCTAssertEqual(midFrame["ok"] as? Bool, true, harness.describeErrors(midFrame))
+        XCTAssertEqual(harness.liveObjects, before + 3, "still mid-frame")
+
+        // The end of the tick — one bookkeeping command, no GPU work of its own.
+        let closing = harness.execute([["op": "destroy", "id": 62]], present: true)
+        XCTAssertEqual(closing["ok"] as? Bool, true, harness.describeErrors(closing))
+        XCTAssertEqual(
+            harness.liveObjects, before,
+            "the frame-scoped handles go only with a present — the drawn frame must have been put out"
+        )
+    }
+
+    /// The other side of the rule: a present batch whose drawable was **never drawn on** (acquired,
+    /// then a validation error before the first encoder) must not go out as a blank frame. It is
+    /// held, and reclaimed by the canvas's next acquisition.
+    func test_aClosingBatchDoesNotPresentAFrameThatWasNeverDrawn() {
+        harness.executeExpectingSuccess([
+            ["op": "configureCanvas", "canvas": "test", "format": "rgba8unorm"],
+        ])
+        let before = harness.liveObjects
+
+        let result = harness.execute([
+            ["op": "getCurrentTexture", "id": 60, "canvas": "test"],
+            ["op": "createBuffer", "id": 62, "size": 16, "usage": TestUsage.uniform],
+        ], present: true)
+        XCTAssertEqual(result["ok"] as? Bool, true, harness.describeErrors(result))
+        XCTAssertEqual(harness.liveObjects, before + 2, "the undrawn frame is held, not presented")
+
+        // The next acquisition reclaims it.
+        harness.executeExpectingSuccess([["op": "getCurrentTexture", "id": 63, "canvas": "test"]])
+        XCTAssertEqual(harness.liveObjects, before + 2, "60 reclaimed, 63 acquired, 62 still alive")
+    }
 }
