@@ -58,7 +58,7 @@ public struct WGPUImageDecodeOptions {
 /// - `detachCanvas` can come from **any thread** — the element's deinit calls it. Protect the
 ///   surface registry with a lock (it can be entered concurrently with execute).
 /// - `reset` comes from the main thread (page exit, hot reload) and can race with execute.
-/// - The completion callbacks of `readBuffer` and `decodeImage` may be called **from any thread,
+/// - The completion callbacks of `readBuffer`, `decodeImage` and `importSharedTexture` may be called **from any thread,
 ///   even synchronously** — for already-finished work, arriving immediately on the calling thread
 ///   is not a contract violation. Callers are written to handle that.
 /// - Applying the command stream's `configureCanvas` to the layer **may be asynchronous**
@@ -128,6 +128,30 @@ public protocol WebGPURuntime: AnyObject {
         completion: @escaping ([String: Any]) -> Void
     )
 
+    /// `importSharedTexture()` — registers a **process-wide shared texture** under a JS-issued handle.
+    ///
+    /// The image is decoded and uploaded once per (device, `request.key`) and the same GPU texture is
+    /// handed to every context on that device that asks for the key (see `WGPUSharedTextureRequest`
+    /// for the key contract). The texture is `rgba8unorm`, alpha **premultiplied**, usage
+    /// `TEXTURE_BINDING | COPY_SRC`, and **read-only** in every context — register it with
+    /// `WGPUBackendEngine.registerSharedTexture`, which marks it so writes are rejected.
+    ///
+    /// The handle owns only this context's reference: `destroy`, `reset` (`device.destroy()`) and GC
+    /// release it here, and the texture lives on while another context still holds it.
+    ///
+    /// `request.name` goes through `provider` on **every** call, cache hit or not — the provider's
+    /// access scope applies to each context's own requests.
+    ///
+    /// - Returns: through `completion`, exactly once, `{"ok": true, "width": Int, "height": Int,
+    ///   "format": String}` or `{"ok": false, "errors": [...]}`. A runtime with no shared textures
+    ///   answers `unsupported` (the default implementation).
+    func importSharedTexture(
+        handle: Int,
+        request: WGPUSharedTextureRequest,
+        provider: WGPUAssetProvider?,
+        completion: @escaping ([String: Any]) -> Void
+    )
+
     // MARK: - Canvas
 
     /// Attaches an on-screen surface. JS names it with `configure({canvas: identifier})`.
@@ -188,6 +212,21 @@ public extension WebGPURuntime {
     /// handler) has nothing to pump. (It is paired with the protocol requirement: living only in the
     /// extension would bind protocol-typed calls here and never reach an implementation's pump.)
     func processEvents() {}
+
+    /// `unsupported` by default — sharing GPU memory across contexts is a backend's own feature (the
+    /// Metal runtime has it, `LynxWebGPUContext`). Paired with the protocol requirement for the same
+    /// reason as `processEvents`.
+    func importSharedTexture(
+        handle: Int,
+        request: WGPUSharedTextureRequest,
+        provider: WGPUAssetProvider?,
+        completion: @escaping ([String: Any]) -> Void
+    ) {
+        completion(["ok": false, "errors": [WGPUError.unsupported(
+            "this runtime has no shared textures (importSharedTexture) — load the image with "
+                + "createImageBitmap and copyExternalImageToTexture instead"
+        ).payload]])
+    }
 
     /// Convenience overload — reads the whole buffer.
     func readBuffer(handle: Int, completion: @escaping ([String: Any]) -> Void) {

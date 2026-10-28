@@ -498,6 +498,19 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         try registry.lookup(handle, as: WGPUEngineTextureView<B>.self, kind: "GPUTextureView", path: path)
     }
 
+    /// Shared textures (`importSharedTexture`) are **read-only**: the same pixels sit under every context
+    /// that imported the key, so a write here would change another page's picture. Checked whatever
+    /// `specValidation` says — it is a cross-context safety rule, not a spec check a native validator
+    /// would cover (the backend's usage is `TEXTURE_BINDING | COPY_SRC`, but Metal blits ignore usage).
+    private func requireWritable(_ isShared: Bool, _ operation: String, path: String?) throws {
+        guard !isShared else {
+            throw WGPUError.validation(
+                "\(operation) cannot write to a shared texture — it is read-only (importSharedTexture)",
+                path: path
+            )
+        }
+    }
+
     private func requireRenderPass() throws {
         guard passState == .render else {
             throw WGPUError.validation("no render pass has begun (call beginRenderPass first)")
@@ -719,6 +732,7 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
 
     private func writeTexture(_ command: WGPUWriteTextureCommand) throws {
         let target = try texture(command.texture, path: command.fieldPath("texture"))
+        try requireWritable(target.isShared, "writeTexture", path: command.fieldPath("texture"))
         let data = command.data
         let size = command.size
         let format = target.format
@@ -757,6 +771,7 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
             path: command.source.fieldPath("source")
         )
         let target = try texture(command.destination.texture, path: command.destination.fieldPath("texture"))
+        try requireWritable(target.isShared, "copyExternalImageToTexture", path: command.destination.fieldPath("texture"))
         guard !target.format.isCompressed else {
             throw WGPUError.validation(
                 "copyExternalImageToTexture cannot target a compressed texture (\(target.format.rawValue)) "
@@ -1002,9 +1017,20 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     private func createTextureView(_ command: WGPUCreateTextureViewCommand) throws {
         let source = try texture(command.texture, path: command.fieldPath("texture"))
         let format = command.descriptor.format ?? source.format
+        // A shared texture has no `viewFormats`, so the spec allows only its own format — and the
+        // backend texture was made without format reinterpretation.
+        if source.isShared, format != source.format {
+            throw WGPUError.validation(
+                "a view of a shared texture must keep its format \(source.format.rawValue) "
+                    + "(got \(format.rawValue)) — shared textures have no viewFormats",
+                path: command.fieldPath("format")
+            )
+        }
         let raw = try backend.makeTextureView(source.raw, descriptor: command.descriptor, format: format)
         registry.insert(
-            WGPUEngineTextureView<B>(raw: raw, format: format, sampleCount: source.sampleCount),
+            WGPUEngineTextureView<B>(
+                raw: raw, format: format, sampleCount: source.sampleCount, isShared: source.isShared
+            ),
             at: command.id
         )
         // Views of a drawable texture expire with the frame (the spec's "Expire the current texture") —
@@ -1104,6 +1130,17 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
                 let object = try registry.lookup(
                     handle, as: WGPUEngineTextureView<B>.self, kind: "GPUTextureView"
                 )
+                // A shared view may be sampled or read as storage, never written. The layout is
+                // consulted even without `specValidation` — on a layout with unknown entries (a
+                // natively validating backend) the backend's own usage check is what remains.
+                if object.isShared,
+                   case .storageTexture(let storage)? = (layoutEntry ?? layout.entry(binding: entry.binding))?.layout,
+                   storage.access != .readOnly {
+                    try requireWritable(
+                        true, "a \(storage.access.rawValue) storage texture binding",
+                        path: command.fieldPath("entries[\(index)]")
+                    )
+                }
                 resource = .textureView(object.raw)
             }
             return WGPUResolvedBindGroupEntry<B>(
@@ -1366,11 +1403,14 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
 
         for attachment in descriptor.colorAttachments {
             let view = try textureView(attachment.view)
+            try requireWritable(view.isShared, "a render pass color attachment", path: nil)
             colorFormats.append(view.format)
             sampleCount = max(sampleCount, view.sampleCount)
             var resolveTarget: B.TextureView?
             if let resolveHandle = attachment.resolveTarget {
-                resolveTarget = try textureView(resolveHandle).raw
+                let resolveView = try textureView(resolveHandle)
+                try requireWritable(resolveView.isShared, "a render pass resolveTarget", path: nil)
+                resolveTarget = resolveView.raw
             }
             colors.append(WGPUResolvedRenderPass<B>.ColorAttachment(
                 view: view.raw,
@@ -1387,6 +1427,7 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         var depthStencil: WGPUResolvedRenderPass<B>.DepthStencilAttachment?
         if let depth = descriptor.depthStencilAttachment {
             let view = try textureView(depth.view)
+            try requireWritable(view.isShared, "a render pass depthStencilAttachment", path: nil)
             depthStencilFormat = view.format
             // The depth view feeds the pass layout's sampleCount too — omit it and an MSAA pass with no
             // color attachment (a shadow map or depth prepass) rejects a correctly declared bundle.
@@ -2145,6 +2186,7 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         let destination = command.destination
         let buffer = try unmappedBuffer(source.buffer, path: source.fieldPath("buffer"))
         let texture = try self.texture(destination.texture, path: destination.fieldPath("texture"))
+        try requireWritable(texture.isShared, "copyBufferToTexture", path: destination.fieldPath("texture"))
         let size = command.copySize
         let format = texture.format
         let bytesPerRow = source.bytesPerRow ?? format.bytesPerRow(width: size.width)
@@ -2171,6 +2213,9 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
         let source = try texture(command.source.texture, path: command.source.fieldPath("texture"))
         let destination = try texture(
             command.destination.texture, path: command.destination.fieldPath("texture")
+        )
+        try requireWritable(
+            destination.isShared, "copyTextureToTexture", path: command.destination.fieldPath("texture")
         )
         try requireNoOpenPass()
         try backend.copyTextureToTexture(
@@ -2483,6 +2528,22 @@ public final class WGPUBackendEngine<B: WGPUBackend>: WebGPURuntime {
     private func noteReadbackFinished() {
         guard backend.capabilities.needsEventPump else { return }
         pendingReadbacks -= 1
+    }
+
+    /// Registers a texture made **outside the command stream** — a process-wide shared texture
+    /// (`importSharedTexture`) — under a JS-issued handle, the same way `decodeImage` registers its result.
+    ///
+    /// The entry is marked shared: every write to it (copies into it, `writeTexture`, render attachments,
+    /// write-access storage bindings, format-changing views) is a validation error. Its removal —
+    /// `destroy`, `reset`, GC — drops only this context's reference; the backend texture is shared and
+    /// outlives it while other contexts hold it, so a backend must not tear it down on release.
+    public func registerSharedTexture(_ raw: B.Texture, at handle: Int, format: WGPUTextureFormat, size: WGPUExtent3D) {
+        executionLock.lock()
+        registry.insert(
+            WGPUEngineTexture<B>(raw: raw, format: format, size: size, sampleCount: 1, isShared: true),
+            at: WGPUHandle(handle)
+        )
+        executionLock.unlock()
     }
 
     /// Decodes an encoded image and registers it as the object standing in for `ImageBitmap` (JS `createImageBitmap`).
