@@ -333,6 +333,43 @@ bitmap.close()   // 네이티브 픽셀을 놓아 준다
 `createSampler` 옵션: `addressModeU/V/W` `magFilter` `minFilter` `mipmapFilter` `lodMinClamp`
 `lodMaxClamp` `compare` `maxAnisotropy`.
 
+### 공유 텍스처 (`importSharedTexture`) — 이 구현의 확장
+
+큰 이미지를 여러 페이지(LynxView)가 함께 쓸 때 GPU 메모리에 한 번만 올리는 경로다. 브라우저
+WebGPU에는 없는 함수다. LynxView마다 컨텍스트와 JS 런타임이 따로라서, `createImageBitmap` +
+`copyExternalImageToTexture`로 올리면 페이지 수만큼 올라간다. 올리는 동안에도 디코드된 비트맵,
+잘라낸 사본, 스테이징 버퍼가 겹친다. 이 함수는 네이티브가 이미지를 **키마다 한 번** 디코드해서
+올리고, 같은 Metal 장치의 모든 페이지가 그 텍스처를 나눠 쓴다.
+
+```js
+import { importSharedTexture } from './webgpu.js'
+
+const clouds = await importSharedTexture(device, {
+  key: 'clouds-v3@1024w',             // 같은 키 = 같은 픽셀 (아래 계약)
+  url: 'file:///…/clouds.png',        // loadAsset과 같은 규칙으로 해석된다
+  resizeWidth: 1024,                  // 높이는 원본 비율로
+})
+const view = clouds.createView()      // 여느 텍스처처럼 샘플링한다
+```
+
+**키는 호출자가 픽셀을 보증하는 약속이다.** 같은 키는 언제나 같은 이미지, 같은 크기여야 한다.
+이미 쓰이는 키로 다시 부르면 `url`과 크기가 무엇이든 **처음 만든 텍스처**가 돌아온다(디버그 빌드는
+경고 로그를 남긴다). 그래서 픽셀을 바꾸는 것은 전부 키에 넣는다 — 원본의 식별자와 버전, 리사이즈.
+키 공간은 같은 장치를 쓰는 프로세스 전체에서 하나다. `url` 접근 검사는 요청한 `url`에만 걸리므로,
+다른 페이지가 만든 키를 아는 번들은 그 텍스처를 받는다 — 신뢰 범위가 다른 번들을 한 프로세스에서
+돌린다면 이 점을 감안한다.
+
+| 항목 | 동작 |
+|---|---|
+| `url` | `loadAsset`과 같은 규칙(등록한 이름 · 파일 경로·`file://` · 번들 경로)으로 호스트의 `assetProvider`가 해석한다. **캐시 히트여도 매번 거친다** — 그 페이지의 접근 범위를 지키려는 것이다 |
+| 크기 | `resizeWidth`·`resizeHeight` 둘 다 → 그 크기 그대로(비율은 호출자 몫). 하나만 → 나머지를 원본 비율로(반올림). 없음 → 원본 크기. `maxTextureDimension2D`를 넘으면 검증 오류 |
+| 디코드 | ImageIO 썸네일 API로 목표 크기에 맞춰 **바로** 디코드한다. 원본 크기의 비트맵을 거치지 않으므로 메모리 피크가 목표 크기 쪽에 붙는다. EXIF 방향은 적용하지 않는다(`createImageBitmap`과 같다) |
+| 형식 | `rgba8unorm`, 알파는 **premultiplied**(블렌드는 `one`, `one-minus-src-alpha`). 색은 `createImageBitmap`처럼 변환 없이 device RGB로 그린다 |
+| usage | `TEXTURE_BINDING \| COPY_SRC`. **읽기 전용**이다 — `writeTexture`, 복사의 대상, 렌더 패스 어태치먼트, write·read-write 스토리지 바인딩, 포맷을 바꾸는 뷰는 검증 오류다. 다른 페이지의 그림이 바뀌기 때문이다 |
+| 수명 | `texture.destroy()`, `device.destroy()`, GC는 **이 페이지의 참조만** 놓는다. 다른 페이지는 계속 샘플링하고, 마지막 참조가 사라지면 네이티브 캐시도 놓는다 |
+| 장치 | 텍스처는 장치마다 따로다. 페이지끼리 나눠 쓰려면 호스트가 모든 `LynxWebGPUContext`에 **같은 `MTLDevice`**를 넣는다 (`docs/LYNX-INTEGRATION.md` §3) |
+| 다른 런타임 | Dawn처럼 공유 텍스처가 없는 런타임은 `unsupported` 오류로 reject한다 — 그때는 `createImageBitmap` 경로로 올린다 |
+
 ### 셰이더 모듈
 
 ```js

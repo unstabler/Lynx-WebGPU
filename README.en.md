@@ -119,6 +119,10 @@ lifetimes. `submit()` returns a live-object count (`objects`) and the native sid
 catch missing destroys; when the engine supports `FinalizationRegistry`, a GC-driven auto-release safety net
 kicks in.
 
+**Large images are shared across pages** — `importSharedTexture` decodes and uploads an image once per key, and
+every LynxView on the same device shares that texture. The thumbnail API decodes straight to the target size, so
+no full-size bitmap ever sits in memory, and the texture is read-only, so no page can change another's picture.
+
 ## Compatibility with real-world WebGPU shaders
 
 We ran all 69 WGSL shaders from the official [webgpu-samples](https://github.com/webgpu/webgpu-samples)

@@ -203,6 +203,21 @@ device.queue.writeBuffer(uniformBuffer, 0, data)
 안전망이 켜진다. 단 PrimJS 지원 여부에 기대지 말 것 — **명시적 destroy가 정답**이고,
 자동 해제는 놓친 것을 주워 담는 보조 장치다.
 
+### 큰 이미지 — 페이지 사이에서 나눠 쓰기
+
+배경처럼 큰 이미지를 여러 페이지가 함께 그리면 `createImageBitmap` 경로는 페이지마다 따로 올린다.
+`importSharedTexture(device, {key, url, resizeWidth?, resizeHeight?})`는 네이티브가 키마다 한 번
+디코드·업로드하고 페이지끼리 나눠 쓴다 (`docs/WEBGPU-API.md` §3). 쓸 때 지킬 것은 셋이다:
+
+- **키에 픽셀을 바꾸는 것을 전부 넣는다** — 원본의 식별자·버전, 리사이즈. 같은 키는 처음 만든
+  텍스처를 돌려준다.
+- **읽기 전용이다.** 이 텍스처에 그리거나 복사해 넣고 싶으면 일반 텍스처를 따로 만들어
+  `copyTextureToTexture`로 옮긴다(`COPY_SRC`가 있다).
+- **알파는 premultiplied다.** 블렌드는 `one`, `one-minus-src-alpha`로 건다.
+
+해제는 다른 텍스처와 같다. `destroy()`나 `device.destroy()`는 이 페이지의 참조만 놓으므로,
+다른 페이지가 쓰는 중이어도 안심하고 부르면 된다.
+
 ### 렌더 번들이 참조하는 리소스
 
 번들은 **기록한 명령이 래퍼보다 오래 사는 유일한 구조**다. 그래서 번들 인코더는 기록 중

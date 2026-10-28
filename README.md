@@ -115,6 +115,10 @@ JS 스레드(터치·타이머 포함)로 번지지 않는다.
 `submit()` 반환의 `objects`(live 객체 수)와 네이티브 경고 로그(4096개 초과)로 destroy 누락을
 잡고, 엔진이 `FinalizationRegistry`를 지원하면 GC 자동 해제 안전망이 켜진다.
 
+**큰 이미지는 페이지 사이에서 나눠 쓴다** — `importSharedTexture`는 키마다 이미지를 한 번 디코드·업로드하고,
+같은 장치의 모든 LynxView가 그 텍스처를 나눠 쓴다. 썸네일 API로 목표 크기에 맞춰 바로 디코드하므로 원본
+크기의 비트맵이 메모리에 생기지 않는다. 텍스처는 읽기 전용이라 한 페이지가 다른 페이지의 그림을 바꿀 수 없다.
+
 ## 실제 WebGPU 셰이더 호환성
 
 공식 [webgpu-samples](https://github.com/webgpu/webgpu-samples)의 WGSL 69개를 **손대지 않고** 통과시켜

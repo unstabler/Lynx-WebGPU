@@ -346,6 +346,7 @@ uncaptured 콜백이 실패한 wgpu 호출 **안에서 동기로** 싱크를 채
 | `readBuffer({buffer, offset?, size?}, cb)` | `mapAsync` + `getMappedRange`. **`MAP_WRITE` 버퍼는 쓰기 매핑**으로 연다 — 명세가 `MAP_READ \| MAP_WRITE`를 금하므로 usage로 모드가 정해진다. 결과는 버퍼의 현재 내용이고(명세의 쓰기 매핑 초기값), offset은 8의 배수·size는 4의 배수여야 한다. 쓴 바이트는 `unmapBuffer`의 `data`로 돌아온다 |
 | `loadAsset({name}, cb)` | 브라우저 `fetch()` 자리. 해석은 `WGPUAssetProvider`가 한다 |
 | `decodeImage({id, data?/name?, flipY?, premultiplyAlpha?, resizeWidth?, resizeHeight?}, cb)` | `createImageBitmap()` |
+| `importSharedTexture({id, key, url, resizeWidth?, resizeHeight?, label?}, cb)` | `importSharedTexture()` — (장치, `key`)마다 한 번 디코드·업로드한 프로세스 전역 텍스처를 `id`에 **읽기 전용**으로 등록한다. 콜백은 `{ok, width, height, format}`. 파싱은 Core의 `WGPUSharedTextureImport`, 런타임 쪽은 `WebGPURuntime.importSharedTexture`(기본 구현은 `unsupported`). 등록은 `WGPUBackendEngine.registerSharedTexture`가 하고, 엔진이 그 텍스처와 뷰에 대한 쓰기를 전부 거부한다. `destroy`·`reset`은 그 컨텍스트의 참조만 놓는다 |
 | `startFrameLoop({fps})` / `stopFrameLoop()` | `webgpu:frame` 전역 이벤트 `{timestamp, delta}`(ms). 링크는 뷰에 하나라, 돌고 있을 때 다시 부르면 **fps만 바꿔 링크를 교체**한다. shim은 구독자 fps의 최댓값이 바뀔 때만 부른다. `delta`는 **직전에 JS로 보낸 틱부터** 잰다 — 게이트로 건너뛴 틱도 들어간다. start·stop에서 0부터 다시 잰다. shim은 이 delta를 쓰지 않고 구독자마다 직접 잰다 |
 | `frameHandled()` | 프레임 콜백 하나가 끝났다는 ack — 티커는 이걸 받아야 다음 틱을 보낸다 (rAF식 역압, `WGPUFrameTickGate`). shim이 틱 끝에 자동으로 부르므로 번들이 직접 부를 일은 없다. 유실 시 1초 타임아웃으로 풀린다 |
 | `reset()` | 모든 GPU 객체를 버린다 |
